@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { CommitResponse, Health, Intent, type CommitRequest } from "@pitstop/protocol";
 import { buildApp, type AppDeps } from "./app.js";
+import type { OAuthProvider, OAuthUser } from "./auth.js";
 import type { GitHubClient } from "./github.js";
 import { blobHash, MemoryStore } from "./store.js";
 
@@ -28,8 +29,8 @@ const start = async (dbUp = true, extra: Partial<AppDeps> = {}) => {
     store,
     ...extra,
   });
-  const commit = (key: string, extra?: Partial<CommitRequest>) =>
-    app.inject({ method: "POST", url: "/commit", payload: request(key, extra) });
+  const commit = (key: string, extra?: Partial<CommitRequest>, headers?: Record<string, string>) =>
+    app.inject({ method: "POST", url: "/commit", payload: request(key, extra), ...(headers === undefined ? {} : { headers }) });
   return { app, store, commit };
 };
 
@@ -383,6 +384,135 @@ describe("repair (PITSTOP_REPAIR)", () => {
     const { app, commit } = await start(true, { repair: "groq", repairer: { propose: async () => { throw new Error("must not be called"); } } });
     await commit("import", importRepo);
     expect((await commit("auth-fix", authFix)).statusCode).toBe(200);
+    await app.close();
+  });
+});
+
+describe("accounts", () => {
+  const people: Record<string, OAuthUser> = {
+    "code-alice": { githubId: 1001, login: "alice", name: "Alice", avatarUrl: "https://avatars.test/alice" },
+    "code-bob": { githubId: 1002, login: "bob" },
+  };
+  const oauth: OAuthProvider = {
+    authorizeUrl: (state, redirectUri) => `https://github.test/authorize?state=${state}&redirect_uri=${encodeURIComponent(redirectUri)}`,
+    exchange: async (code) => {
+      const user = people[code];
+      if (!user) throw new Error("bad code");
+      return user;
+    },
+  };
+  const accounts = (extra: Partial<AppDeps> = {}) => start(true, { oauth, sessionSecret: "a-cookie-secret-for-tests", webUrl: "https://web.test/", ...extra });
+  type App = Awaited<ReturnType<typeof buildApp>>;
+
+  /** The OAuth web flow through the routes: the session cookie that comes out. */
+  const signIn = async (app: App, code: string): Promise<string> => {
+    const begin = await app.inject({ method: "GET", url: "/auth/github", headers: { host: "pitstop.test", "x-forwarded-proto": "https" } });
+    expect(begin.statusCode).toBe(302);
+    const location = new URL(begin.headers.location as string);
+    expect(location.searchParams.get("redirect_uri")).toBe("https://pitstop.test/auth/github/callback");
+    const state = location.searchParams.get("state") as string;
+    const stateCookie = begin.cookies.find((c) => c.name === "pitstop_oauth_state") as { value: string };
+    const done = await app.inject({
+      method: "GET",
+      url: `/auth/github/callback?code=${code}&state=${state}`,
+      cookies: { pitstop_oauth_state: stateCookie.value },
+      headers: { host: "pitstop.test", "x-forwarded-proto": "https" },
+    });
+    expect(done.statusCode).toBe(302);
+    expect(done.headers.location).toBe("https://web.test/");
+    return (done.cookies.find((c) => c.name === "pitstop_session") as { value: string }).value;
+  };
+  /** A user with a personal token, made directly in the store: the daemon's situation. */
+  const tokenFor = async (store: MemoryStore, login: string, githubId: number): Promise<string> => {
+    const user = await store.upsertUser({ githubId, login });
+    return (await store.createToken(user.id, "laptop")).secret;
+  };
+  const bearer = (token: string) => ({ authorization: `Bearer ${token}` });
+
+  it("signs in with GitHub and knows who you are", async () => {
+    const { app } = await accounts();
+    expect((await app.inject({ method: "GET", url: "/me" })).statusCode).toBe(401);
+    const session = await signIn(app, "code-alice");
+    const me = await app.inject({ method: "GET", url: "/me", cookies: { pitstop_session: session } });
+    expect(me.statusCode).toBe(200);
+    expect(me.json()).toMatchObject({ login: "alice", name: "Alice", githubId: 1001 });
+    const out = await app.inject({ method: "POST", url: "/auth/logout", cookies: { pitstop_session: session } });
+    expect(out.statusCode).toBe(204);
+    await app.close();
+  });
+
+  it("refuses a callback whose state did not start here", async () => {
+    const { app } = await accounts();
+    const res = await app.inject({ method: "GET", url: "/auth/github/callback?code=code-alice&state=forged" });
+    expect(res.statusCode).toBe(400);
+    await app.close();
+  });
+
+  it("answers 501 to sign-in when accounts are off", async () => {
+    const { app } = await start();
+    expect((await app.inject({ method: "GET", url: "/auth/github" })).statusCode).toBe(501);
+    await app.close();
+  });
+
+  it("makes personal tokens that stand for the user until revoked", async () => {
+    const { app } = await accounts();
+    const session = await signIn(app, "code-alice");
+    const made = await app.inject({ method: "POST", url: "/tokens", payload: { name: "laptop" }, cookies: { pitstop_session: session } });
+    expect(made.statusCode).toBe(201);
+    const { id, secret } = made.json() as { id: string; secret: string };
+    expect(secret).toMatch(/^pst_[0-9a-f]{32}$/);
+    expect((await app.inject({ method: "GET", url: "/me", headers: bearer(secret) })).json()).toMatchObject({ login: "alice" });
+    const list = (await app.inject({ method: "GET", url: "/tokens", headers: bearer(secret) })).json() as { id: string; secret?: string }[];
+    expect(list.map((t) => t.id)).toEqual([id]);
+    expect(list[0]?.secret).toBeUndefined();
+    expect((await app.inject({ method: "DELETE", url: `/tokens/${id}`, headers: bearer(secret) })).statusCode).toBe(204);
+    expect((await app.inject({ method: "GET", url: "/me", headers: bearer(secret) })).statusCode).toBe(401);
+    expect((await app.inject({ method: "GET", url: "/me", headers: bearer("pst_" + "0".repeat(32)) })).statusCode).toBe(401);
+    await app.close();
+  });
+
+  it("owners, members and visibility decide who may do what", async () => {
+    const { app, store, commit } = await accounts();
+    const alice = await tokenFor(store, "alice", 1001);
+    const bob = await tokenFor(store, "bob", 1002);
+
+    expect((await app.inject({ method: "POST", url: "/repos", payload: { id: "acme/app" } })).statusCode).toBe(401);
+    expect((await app.inject({ method: "POST", url: "/repos", payload: { id: "acme/app" }, headers: bearer(alice) })).statusCode).toBe(201);
+    expect((await app.inject({ method: "GET", url: "/repos/acme/app/members", headers: bearer(alice) })).json()).toEqual([{ login: "alice", role: "owner" }]);
+
+    expect((await app.inject({ method: "POST", url: "/commit", payload: request("bob-1", { repo: "acme/app" }), headers: bearer(bob) })).statusCode).toBe(403);
+    expect((await app.inject({ method: "GET", url: "/repos/acme/app", headers: bearer(bob) })).statusCode).toBe(403);
+    expect((await app.inject({ method: "GET", url: "/log?repo=acme/app" })).statusCode).toBe(401);
+    expect((await app.inject({ method: "PUT", url: "/repos/acme/app/members/bob", payload: { role: "writer" }, headers: bearer(bob) })).statusCode).toBe(403);
+
+    expect((await app.inject({ method: "PUT", url: "/repos/acme/app/members/bob", payload: { role: "writer" }, headers: bearer(alice) })).statusCode).toBe(200);
+    expect((await app.inject({ method: "PUT", url: "/repos/acme/app/members/nobody", payload: { role: "writer" }, headers: bearer(alice) })).statusCode).toBe(404);
+    const landed = await app.inject({ method: "POST", url: "/commit", payload: request("bob-1", { repo: "acme/app" }), headers: bearer(bob) });
+    expect(landed.statusCode).toBe(200);
+    expect(CommitResponse.parse(landed.json())).toMatchObject({ status: "accepted", changeset: { author: { developer: "bob", agent: "agent-a" } } });
+    expect((await app.inject({ method: "GET", url: "/repos", headers: bearer(bob) })).json()).toEqual([expect.objectContaining({ id: "acme/app" }), expect.objectContaining({ id: "local/default" })]);
+
+    expect((await app.inject({ method: "PATCH", url: "/repos/acme/app", payload: { visibility: "public" }, headers: bearer(bob) })).statusCode).toBe(403);
+    expect((await app.inject({ method: "PATCH", url: "/repos/acme/app", payload: { visibility: "public" }, headers: bearer(alice) })).statusCode).toBe(200);
+    expect((await app.inject({ method: "GET", url: "/log?repo=acme/app" })).statusCode).toBe(200);
+    expect((await app.inject({ method: "POST", url: "/commit", payload: request("anon-1", { repo: "acme/app" }) })).statusCode).toBe(401);
+
+    expect((await app.inject({ method: "DELETE", url: "/repos/acme/app/members/bob", headers: bearer(alice) })).statusCode).toBe(204);
+    expect((await app.inject({ method: "POST", url: "/commit", payload: request("bob-2", { repo: "acme/app" }), headers: bearer(bob) })).statusCode).toBe(403);
+    expect((await app.inject({ method: "GET", url: "/repos/acme/app", headers: bearer(bob) })).statusCode).toBe(200); // public now
+
+    // The shared token stays the super-user; a repository with no members is open to any signed-in user.
+    expect((await commit("default-by-bob", { repo: "local/default" }, bearer(bob))).statusCode).toBe(200);
+    await app.close();
+  });
+
+  it("the shared token still does everything when accounts are on", async () => {
+    const { app, store, commit } = await accounts({ token: "the-shared-token-1234" });
+    const alice = await tokenFor(store, "alice", 1001);
+    await app.inject({ method: "POST", url: "/repos", payload: { id: "acme/app" }, headers: bearer(alice) });
+    expect((await commit("shared-1", { repo: "acme/app" }, bearer("the-shared-token-1234"))).statusCode).toBe(200);
+    expect((await app.inject({ method: "GET", url: "/repos/acme/app/mirror", headers: bearer("the-shared-token-1234") })).statusCode).toBe(404);
+    expect((await app.inject({ method: "GET", url: "/log" })).statusCode).toBe(401);
     await app.close();
   });
 });

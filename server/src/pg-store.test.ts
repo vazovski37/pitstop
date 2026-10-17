@@ -159,6 +159,39 @@ describe.skipIf(!url)("PgStore against a real Postgres", () => {
     expect(open.find((i) => i.id === a.id)).toMatchObject({ repo: DEFAULT_REPO, status: "open", declaredSymbols: ["src/a.ts#a"], text: "open one" });
   });
 
+  it("keeps users, their tokens and repository members", async () => {
+    await pool.query("delete from repo_members; delete from tokens; delete from users");
+    const alice = await store.upsertUser({ githubId: 1001, login: "alice", name: "Alice" });
+    expect(alice).toMatchObject({ githubId: 1001, login: "alice", name: "Alice" });
+    const again = await store.upsertUser({ githubId: 1001, login: "alice2", avatarUrl: "https://a" });
+    expect(again).toMatchObject({ id: alice.id, login: "alice2", avatarUrl: "https://a" });
+    expect(again.name).toBeUndefined();
+    expect(await store.getUserByLogin("alice2")).toMatchObject({ id: alice.id });
+
+    const { token, secret } = await store.createToken(alice.id, "laptop");
+    expect(secret).toMatch(/^pst_/);
+    expect(await store.userForToken(secret)).toMatchObject({ id: alice.id });
+    expect((await store.listTokens(alice.id)).map((t) => t.id)).toEqual([token.id]);
+    expect((await store.listTokens(alice.id))[0]?.lastUsedAt).toBeDefined();
+    expect(await store.revokeToken(alice.id, token.id)).toBe(true);
+    expect(await store.revokeToken(alice.id, token.id)).toBe(false);
+    expect(await store.userForToken(secret)).toBeUndefined();
+    expect(await store.userForToken("pst_nope")).toBeUndefined();
+
+    await store.createRepo("pg-test/members");
+    expect(await store.visibility("pg-test/members")).toBe("private");
+    await store.setMember("pg-test/members", alice.id, "owner");
+    await store.setMember("pg-test/members", alice.id, "writer"); // a second set replaces the role
+    expect(await store.roleOf("pg-test/members", alice.id)).toBe("writer");
+    expect(await store.listMembers("pg-test/members")).toEqual([{ repo: "pg-test/members", userId: alice.id, login: "alice2", role: "writer" }]);
+    await store.setVisibility("pg-test/members", "public");
+    expect(await store.visibility("pg-test/members")).toBe("public");
+    expect(await store.removeMember("pg-test/members", alice.id)).toBe(true);
+    expect(await store.removeMember("pg-test/members", alice.id)).toBe(false);
+    await expect(store.setMember("no/such", alice.id, "reader")).rejects.toThrow(/unknown repo/);
+    expect(await store.visibility("no/such")).toBeUndefined();
+  });
+
   it("keeps a mirror per repository", async () => {
     const config = { githubRepo: "vazovski37/pitstop", branch: "main", baseCommit: "a".repeat(40) };
     const mirror = await store.setMirror(DEFAULT_REPO, config);

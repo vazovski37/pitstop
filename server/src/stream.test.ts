@@ -163,6 +163,37 @@ describe("GET /stream", () => {
     inbox.close();
   });
 
+  it("with accounts on, a private repository streams only to its readers", async () => {
+    const oauth = { authorizeUrl: () => "https://github.test/authorize", exchange: async () => ({ githubId: 1, login: "alice" }) };
+    const store = new MemoryStore();
+    const app = await buildApp({ version: "test-sha", pingDb: async () => true, store, oauth, sessionSecret: "a-cookie-secret-for-tests" });
+    await app.listen({ host: "127.0.0.1", port: 0 });
+    cleanup = () => app.close();
+    const url = `ws://127.0.0.1:${(app.server.address() as AddressInfo).port}/stream`;
+    const alice = await store.upsertUser({ githubId: 1, login: "alice" });
+    const { secret } = await store.createToken(alice.id, "laptop");
+    await store.createRepo("acme/app");
+    await store.setMember("acme/app", alice.id, "reader");
+    const bob = await store.upsertUser({ githubId: 2, login: "bob" });
+    const stranger = (await store.createToken(bob.id, "laptop")).secret;
+
+    const anonymous = await connect(url);
+    await anonymous.next();
+    anonymous.send({ type: "subscribe", repo: "acme/app", fromLsn: 0 });
+    expect(await anonymous.closed).toBe(1008);
+
+    const outsider = await connect(url, { authorization: `Bearer ${stranger}` });
+    await outsider.next();
+    outsider.send({ type: "subscribe", repo: "acme/app", fromLsn: 0 });
+    expect(await outsider.closed).toBe(1008);
+
+    const reader = await connect(url, { authorization: `Bearer ${secret}` });
+    await reader.next();
+    reader.send({ type: "subscribe", repo: "acme/app", fromLsn: 0 });
+    expect(await reader.next()).toMatchObject({ type: "head", repo: "acme/app" });
+    reader.close();
+  });
+
   it("closes a socket that sends something other than a ClientMessage", async () => {
     const { url } = await listen();
     const inbox = await connect(url);

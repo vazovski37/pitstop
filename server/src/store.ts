@@ -53,7 +53,64 @@ export interface Store {
   deleteMirror(repo: RepoId): Promise<void>;
   updateMirror(repo: RepoId, patch: MirrorPatch): Promise<void>;
   listMirrors(): Promise<Mirror[]>;
+
+  // Accounts (migration 005): users, their personal tokens, repository members.
+  /** Creates the user on first sign-in, refreshes login, name and avatar on later ones. */
+  upsertUser(input: UserInput): Promise<User>;
+  getUser(id: string): Promise<User | undefined>;
+  getUserByLogin(login: string): Promise<User | undefined>;
+  /** A new personal token; the secret is returned once and stored only as its hash. */
+  createToken(userId: string, name: string): Promise<{ token: Token; secret: string }>;
+  /** The user behind a personal token, when it exists and is not revoked; records the use. */
+  userForToken(secret: string): Promise<User | undefined>;
+  listTokens(userId: string): Promise<Token[]>;
+  revokeToken(userId: string, tokenId: string): Promise<boolean>;
+  setMember(repo: RepoId, userId: string, role: Role): Promise<void>;
+  removeMember(repo: RepoId, userId: string): Promise<boolean>;
+  listMembers(repo: RepoId): Promise<Member[]>;
+  roleOf(repo: RepoId, userId: string): Promise<Role | undefined>;
+  visibility(repo: RepoId): Promise<Visibility | undefined>;
+  setVisibility(repo: RepoId, visibility: Visibility): Promise<void>;
 }
+
+export interface User {
+  id: string;
+  githubId: number;
+  /** The GitHub login; also `author.developer` on commits made with the user's tokens. */
+  login: string;
+  name?: string;
+  avatarUrl?: string;
+  createdAt: string;
+}
+export interface UserInput {
+  githubId: number;
+  login: string;
+  name?: string;
+  avatarUrl?: string;
+}
+export interface Token {
+  id: string;
+  userId: string;
+  name: string;
+  createdAt: string;
+  lastUsedAt?: string;
+  revokedAt?: string;
+}
+export type Role = "owner" | "writer" | "reader";
+export const ROLE_RANK: Record<Role, number> = { reader: 1, writer: 2, owner: 3 };
+export interface Member {
+  repo: RepoId;
+  userId: string;
+  login: string;
+  role: Role;
+}
+export type Visibility = "private" | "public";
+
+export const newUserId = (): string => `u_${randomBytes(4).toString("hex")}`;
+export const newTokenId = (): string => `t_${randomBytes(4).toString("hex")}`;
+/** What a daemon's `.env` holds: `pst_` and 32 hex characters. */
+export const newTokenSecret = (): string => `pst_${randomBytes(16).toString("hex")}`;
+export const tokenHash = (secret: string): string => createHash("sha256").update(secret, "utf8").digest("hex");
 
 /** Where a repository's entries are pushed as git commits (mirror.ts). */
 export interface MirrorConfig {
@@ -166,6 +223,10 @@ export class MemoryStore implements Store {
   private readonly byKey = new Map<string, Changeset>();
   private readonly intents = new Map<string, Intent>();
   private readonly mirrors = new Map<RepoId, Mirror>();
+  private readonly users = new Map<string, User>();
+  private readonly tokens = new Map<string, Token & { hash: string }>();
+  private readonly members = new Map<string, Member>(); // `${repo}\n${userId}`
+  private readonly visibilities = new Map<RepoId, Visibility>();
 
   async append(req: CommitRequest, decide?: Decide): Promise<Changeset> {
     const seen = this.byKey.get(req.idempotencyKey);
@@ -286,6 +347,86 @@ export class MemoryStore implements Store {
 
   async listMirrors(): Promise<Mirror[]> {
     return [...this.mirrors.values()].sort((a, b) => a.repo.localeCompare(b.repo));
+  }
+
+  async upsertUser(input: UserInput): Promise<User> {
+    const existing = [...this.users.values()].find((u) => u.githubId === input.githubId);
+    const user: User = {
+      id: existing?.id ?? newUserId(),
+      githubId: input.githubId,
+      login: input.login,
+      ...(input.name === undefined ? {} : { name: input.name }),
+      ...(input.avatarUrl === undefined ? {} : { avatarUrl: input.avatarUrl }),
+      createdAt: existing?.createdAt ?? new Date().toISOString(),
+    };
+    this.users.set(user.id, user);
+    return user;
+  }
+
+  async getUser(id: string): Promise<User | undefined> {
+    return this.users.get(id);
+  }
+
+  async getUserByLogin(login: string): Promise<User | undefined> {
+    return [...this.users.values()].find((u) => u.login === login);
+  }
+
+  async createToken(userId: string, name: string): Promise<{ token: Token; secret: string }> {
+    if (!this.users.has(userId)) throw new Error(`no user ${userId}`);
+    const secret = newTokenSecret();
+    const token: Token = { id: newTokenId(), userId, name, createdAt: new Date().toISOString() };
+    this.tokens.set(token.id, { ...token, hash: tokenHash(secret) });
+    return { token, secret };
+  }
+
+  async userForToken(secret: string): Promise<User | undefined> {
+    const hash = tokenHash(secret);
+    const token = [...this.tokens.values()].find((t) => t.hash === hash && t.revokedAt === undefined);
+    if (token === undefined) return undefined;
+    this.tokens.set(token.id, { ...token, lastUsedAt: new Date().toISOString() });
+    return this.users.get(token.userId);
+  }
+
+  async listTokens(userId: string): Promise<Token[]> {
+    return [...this.tokens.values()]
+      .filter((t) => t.userId === userId)
+      .map(({ hash: _hash, ...token }) => token)
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  }
+
+  async revokeToken(userId: string, tokenId: string): Promise<boolean> {
+    const token = this.tokens.get(tokenId);
+    if (token === undefined || token.userId !== userId || token.revokedAt !== undefined) return false;
+    this.tokens.set(tokenId, { ...token, revokedAt: new Date().toISOString() });
+    return true;
+  }
+
+  async setMember(repo: RepoId, userId: string, role: Role): Promise<void> {
+    if (!this.repos.has(repo)) throw unknownRepo(repo);
+    const user = this.users.get(userId);
+    if (user === undefined) throw new Error(`no user ${userId}`);
+    this.members.set(`${repo}\n${userId}`, { repo, userId, login: user.login, role });
+  }
+
+  async removeMember(repo: RepoId, userId: string): Promise<boolean> {
+    return this.members.delete(`${repo}\n${userId}`);
+  }
+
+  async listMembers(repo: RepoId): Promise<Member[]> {
+    return [...this.members.values()].filter((m) => m.repo === repo).sort((a, b) => a.login.localeCompare(b.login));
+  }
+
+  async roleOf(repo: RepoId, userId: string): Promise<Role | undefined> {
+    return this.members.get(`${repo}\n${userId}`)?.role;
+  }
+
+  async visibility(repo: RepoId): Promise<Visibility | undefined> {
+    return this.repos.has(repo) ? (this.visibilities.get(repo) ?? "private") : undefined;
+  }
+
+  async setVisibility(repo: RepoId, visibility: Visibility): Promise<void> {
+    if (!this.repos.has(repo)) throw unknownRepo(repo);
+    this.visibilities.set(repo, visibility);
   }
 
   /** For tests. */

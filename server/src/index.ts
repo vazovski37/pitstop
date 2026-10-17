@@ -3,6 +3,7 @@ import { buildApp } from "./app.js";
 import { createPool, ping } from "./db.js";
 import { migrate } from "./migrate.js";
 import { PgStore } from "./pg-store.js";
+import { GitHubOAuth } from "./auth.js";
 import { GitHubApi } from "./github.js";
 import { GroqClient } from "./groq.js";
 import { modelRepairer, parseRepairMode, type Repairer } from "./repair.js";
@@ -63,7 +64,34 @@ const mirrorToken = process.env.MIRROR_GITHUB_TOKEN || undefined;
 const github = mirrorToken === undefined ? undefined : new GitHubApi({ token: mirrorToken });
 console.log(`pitstop server: git mirror ${github === undefined ? "off (no MIRROR_GITHUB_TOKEN)" : "on"}`);
 
-const app = await buildApp({ version, pingDb, store, token, validation, check, repair, repairer, github, logger: true });
+// Phase 5: accounts. Sign in with GitHub needs an OAuth App and a cookie secret (SETUP.md, "Accounts").
+const clientId = process.env.GITHUB_OAUTH_CLIENT_ID || undefined;
+const clientSecret = process.env.GITHUB_OAUTH_CLIENT_SECRET || undefined;
+const sessionSecret = process.env.SESSION_SECRET || undefined;
+const oauth = clientId !== undefined && clientSecret !== undefined ? new GitHubOAuth({ clientId, clientSecret }) : undefined;
+if (oauth !== undefined && sessionSecret === undefined) {
+  console.error("GITHUB_OAUTH_CLIENT_ID is set but SESSION_SECRET is not; accounts need both");
+  process.exit(1);
+}
+console.log(`pitstop server: accounts ${oauth === undefined ? "off (no GITHUB_OAUTH_CLIENT_ID)" : "on"}`);
+
+const app = await buildApp({
+  version,
+  pingDb,
+  store,
+  token,
+  oauth,
+  sessionSecret,
+  webUrl: process.env.PITSTOP_WEB_URL || undefined,
+  publicUrl: process.env.PITSTOP_PUBLIC_URL || undefined,
+  secureCookies: process.env.NODE_ENV === "production",
+  validation,
+  check,
+  repair,
+  repairer,
+  github,
+  logger: true,
+});
 
 const shutdown = async (signal: string) => {
   app.log.info(`${signal} received, shutting down`);

@@ -36,6 +36,9 @@ jobs:
       GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
       PITSTOP_TOKEN: ${{ secrets.PITSTOP_TOKEN }}
       MIRROR_GITHUB_TOKEN: ${{ secrets.MIRROR_GITHUB_TOKEN }}
+      GITHUB_OAUTH_CLIENT_ID: ${{ vars.GITHUB_OAUTH_CLIENT_ID }}
+      GITHUB_OAUTH_CLIENT_SECRET: ${{ secrets.GITHUB_OAUTH_CLIENT_SECRET }}
+      SESSION_SECRET: ${{ secrets.SESSION_SECRET }}
     steps:
       - uses: actions/checkout@v5
 
@@ -71,7 +74,8 @@ jobs:
             -f infra/main.bicep \
             -p prefix="$PREFIX" location="$LOCATION" deployApp=true containerImage="$IMAGE" \
                pgAdminPassword="$PG_ADMIN_PASSWORD" groqApiKey="$GROQ_API_KEY" pitstopToken="$PITSTOP_TOKEN" \
-               mirrorGithubToken="$MIRROR_GITHUB_TOKEN" \
+               mirrorGithubToken="$MIRROR_GITHUB_TOKEN" githubOauthClientId="$GITHUB_OAUTH_CLIENT_ID" \
+               githubOauthClientSecret="$GITHUB_OAUTH_CLIENT_SECRET" sessionSecret="$SESSION_SECRET" \
             --query properties.outputs -o json)"
           echo "FQDN=$(echo "$OUT" | jq -r .appFqdn.value)" >> "$GITHUB_ENV"
 
