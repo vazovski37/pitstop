@@ -49,7 +49,7 @@ Pick the subscription with your credits, then run the bootstrap once:
 az account set --subscription "<your subscription name or id>"
 GITHUB_REPO=<your-github-user>/pitstop bash infra/bootstrap.sh
 ```
-Optional settings: `RG=pitstop-rg LOCATION=westeurope PREFIX=pitstop` (prefix: lowercase letters and digits, 3 to 12 characters).
+Optional settings: `RG=pitstop-rg LOCATION=germanywestcentral PREFIX=pitstop` (prefix: lowercase letters and digits, 3 to 12 characters).
 
 It registers the Azure resource providers, creates the resource group, creates a service principal that can act only on that group, trusts GitHub's OIDC tokens from this repo's `production` environment, and stores the IDs, a generated database password and the settings in GitHub.
 
@@ -107,6 +107,7 @@ Add a second Container App or an Azure Static Web App in `infra/main.bicep`, and
 | --- | --- |
 | `AADSTS700213: No matching federated identity record found` | The job's environment or repo name does not match the federated credential. New repositories use immutable subjects with numeric IDs: `repo:<owner>@<owner-id>/pitstop@<repo-id>:environment:production` (the error message shows the exact one). Re-run `bootstrap.sh` with the exact `GITHUB_REPO`; it builds that subject from the GitHub API. |
 | `AuthorizationFailed` on `roleAssignments/write` | The service principal lacks "Role Based Access Control Administrator" on the resource group. Re-run `bootstrap.sh`, or assign it in the portal (or "User Access Administrator"). |
+| `RequestDisallowedByAzure`: "The selected region is currently not accepting new customers" | That region is closed to new subscriptions (West Europe was in October 2026). Point the resources at another region: `gh variable set AZURE_LOCATION --repo <you>/pitstop --body swedencentral` (or `northeurope`, `francecentral`), then Provision. The resource group can stay where it is. |
 | Postgres: `LocationIsOfferRestricted` or capacity error | Some regions limit new database servers on credit-based subscriptions. Re-run `bootstrap.sh` with `RG=pitstop-rg2 LOCATION=germanywestcentral` (or `swedencentral`, `northeurope`), then Provision. |
 | `MissingSubscriptionRegistration` | Providers not registered yet. `bootstrap.sh` does it; wait a few minutes and re-run Provision. |
 | Deploy fails at "Smoke test" | The new revision did not report the new commit with a working database. The workflow already rolled back. Check logs: Azure portal → Container App → Log stream. |

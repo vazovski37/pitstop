@@ -13,7 +13,7 @@
 # Requirements: az CLI (logged in: `az login`), gh CLI (logged in: `gh auth login`), openssl.
 # Usage:
 #   GITHUB_REPO=owner/pitstop bash infra/bootstrap.sh
-# Optional: RG=pitstop-rg LOCATION=westeurope PREFIX=pitstop
+# Optional: RG=pitstop-rg LOCATION=germanywestcentral PREFIX=pitstop
 
 set -euo pipefail
 # Stops Git Bash (MSYS) on Windows rewriting Azure IDs like /subscriptions/... into Windows paths.
@@ -23,7 +23,7 @@ az() { command az "$@" | tr -d '\r'; }
 
 : "${GITHUB_REPO:?Set GITHUB_REPO=owner/repo}"
 RG="${RG:-pitstop-rg}"
-LOCATION="${LOCATION:-westeurope}"
+LOCATION="${LOCATION:-germanywestcentral}"
 PREFIX="${PREFIX:-pitstop}"
 APP_NAME="${APP_NAME:-pitstop-github-actions}"
 GH_ENV="production"
@@ -41,7 +41,10 @@ for ns in Microsoft.App Microsoft.ContainerRegistry Microsoft.DBforPostgreSQL Mi
 done
 
 echo "==> Resource group"
-az group create --name "$RG" --location "$LOCATION" >/dev/null
+# An existing group keeps its own region; the resources still go to $LOCATION (GitHub variable AZURE_LOCATION).
+if ! az group show --name "$RG" -o none 2>/dev/null; then
+  az group create --name "$RG" --location "$LOCATION" >/dev/null
+fi
 SCOPE="/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RG"
 
 echo "==> Entra ID app and service principal for GitHub Actions"
