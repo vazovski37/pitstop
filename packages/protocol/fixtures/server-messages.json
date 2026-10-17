@@ -18,5 +18,35 @@
       "status": "open",
       "heartbeatAt": "2026-10-17T14:18:00Z"
     }
+  },
+  {
+    "type": "entry",
+    "changeset": {
+      "lsn": 122,
+      "baseLsn": 120,
+      "author": { "developer": "teammate", "agent": "agent-b" },
+      "intent": "Show last-seen time on ProfilePage",
+      "files": [
+        {
+          "path": "src/pages/ProfilePage.tsx",
+          "op": "modify",
+          "blob": "sha256:70dbccb66b9ea16333f0c51c8c3d530881c3866f4db5a000ad966c42e0e29487",
+          "content": "import { getCurrentUser } from \"../auth/session\";\nimport { redirect } from \"../router\";\nimport { timeAgo } from \"../utils/timeAgo\";\n\nexport function ProfilePage() {\n  const user = getCurrentUser();\n  if (!user) return redirect(\"/login\");\n  return <p>Last seen {timeAgo(user.lastSeenAt)}</p>;\n}\n"
+        }
+      ],
+      "writeSet": ["src/pages/ProfilePage.tsx#ProfilePage"],
+      "sigWriteSet": [],
+      "readSet": ["src/auth/session.ts#getCurrentUser", "src/models/user.ts#User"],
+      "repairs": [
+        {
+          "againstLsn": 121,
+          "kind": "semantic",
+          "summary": "Added null check: redirect to login when the session has expired"
+        }
+      ],
+      "checks": { "typecheck": "pass", "tests": "pass", "adr": "pass", "details": "14 affected tests" },
+      "brainVersion": 37,
+      "createdAt": "2026-10-17T14:20:05Z"
+    }
   }
 ]
