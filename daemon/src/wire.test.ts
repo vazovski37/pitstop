@@ -35,7 +35,8 @@ describe("wiring Claude Code by command name", () => {
     const mcp = await readJson(at(".mcp.json"));
     expect(mcp).toEqual({ mcpServers: { pitstop: { command: "pitstop-mcp" } } });
     const settings = await readJson(at(".claude", "settings.local.json"));
-    expect(settings).toEqual({ hooks: { PostToolUse: [ourHook] }, enabledMcpjsonServers: ["pitstop"] });
+    // The pitstop tools are allowed, so Claude Code does not ask before each call.
+    expect(settings).toEqual({ hooks: { PostToolUse: [ourHook] }, enabledMcpjsonServers: ["pitstop"], permissions: { allow: ["mcp__pitstop"] } });
     // The team's settings file is not Pitstop's to write.
     expect(existsSync(at(".claude", "settings.json"))).toBe(false);
     for (const s of [...strings(mcp), ...strings(settings)]) expect(isAbsolute(s), s).toBe(false);
@@ -81,7 +82,7 @@ describe("wiring Claude Code by command name", () => {
     };
     expect(JSON.parse(once.mcp)).toEqual({ mcpServers: { other: { command: "other-mcp" }, pitstop: { command: "pitstop-mcp" } }, extra: 1 });
     expect(JSON.parse(once.settings)).toEqual({
-      permissions: { allow: ["Bash(npm test)"] },
+      permissions: { allow: ["Bash(npm test)", "mcp__pitstop"] },
       hooks: {
         PostToolUse: [userHook, { matcher: "", hooks: [{ type: "command", command: "npx prettier --write ." }] }, lookalike, ourHook],
         Stop: [userHook],
@@ -121,7 +122,7 @@ describe("wiring Claude Code by command name", () => {
     expect(await readFile(at(".mcp.json"), "utf8")).toBe(teamMcp);
     expect(await readFile(at("CLAUDE.local.md"), "utf8")).toBe("team notes\n");
     // The hook still goes in, but the team's .mcp.json servers are not pre-approved.
-    expect(await readJson(at(".claude", "settings.local.json"))).toEqual({ hooks: { PostToolUse: [ourHook] } });
+    expect(await readJson(at(".claude", "settings.local.json"))).toEqual({ hooks: { PostToolUse: [ourHook] }, permissions: { allow: ["mcp__pitstop"] } });
 
     // A tracked .mcp.json that holds exactly this entry needs nothing more, and is enabled.
     await writeFile(at(".mcp.json"), JSON.stringify({ mcpServers: { pitstop: mcpServerEntry("linux") } }));

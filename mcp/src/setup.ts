@@ -82,6 +82,11 @@ export async function setupWorktree(worktree: string, scriptsDir = dirname(fileU
   const hooks = asObject(current.hooks);
   hooks.PostToolUse = [...withoutPitstopHooks(hooks.PostToolUse, command), { matcher: "", hooks: [{ type: "command", command, timeout: 60 }] }];
   current.hooks = hooks;
+  // The pitstop tools run without Claude Code asking before each call, as daemon/src/wire.ts does.
+  const permissions = asObject(current.permissions);
+  const allow = (Array.isArray(permissions.allow) ? permissions.allow : []).filter((s): s is string => typeof s === "string");
+  permissions.allow = allow.includes("mcp__pitstop") ? allow : [...allow, "mcp__pitstop"];
+  current.permissions = permissions;
   await writeFile(settings, `${JSON.stringify(current, null, 2)}\n`);
 
   // An earlier version wrote the hook into the shared settings.json: once is enough.
