@@ -3,11 +3,13 @@
   "baseLsn": 120,
   "author": { "developer": "teammate", "agent": "agent-b" },
   "intent": "Show last-seen time on ProfilePage",
+  "intentId": "int_02",
   "files": [
     {
       "path": "src/pages/ProfilePage.tsx",
       "op": "modify",
-      "blob": "sha256:9f3c1e0a5b7d2c4e6f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6"
+      "blob": "sha256:7778df74dbc0f8138d626b74e441eff6703c4f429ae8f196d50d80df8005726d",
+      "content": "import { getCurrentUser } from \"../auth/session\";\nimport { timeAgo } from \"../utils/timeAgo\";\n\nexport function ProfilePage() {\n  const user = getCurrentUser();\n  return <p>Last seen {timeAgo(user.lastSeenAt)}</p>;\n}\n"
     }
   ],
   "writeSet": ["src/pages/ProfilePage.tsx#ProfilePage"],

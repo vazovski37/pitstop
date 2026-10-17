@@ -7,7 +7,8 @@
     {
       "path": "src/pages/ProfilePage.tsx",
       "op": "modify",
-      "blob": "sha256:9f3c1e0a5b7d2c4e6f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6"
+      "blob": "sha256:70dbccb66b9ea16333f0c51c8c3d530881c3866f4db5a000ad966c42e0e29487",
+      "content": "import { getCurrentUser } from \"../auth/session\";\nimport { redirect } from \"../router\";\nimport { timeAgo } from \"../utils/timeAgo\";\n\nexport function ProfilePage() {\n  const user = getCurrentUser();\n  if (!user) return redirect(\"/login\");\n  return <p>Last seen {timeAgo(user.lastSeenAt)}</p>;\n}\n"
     }
   ],
   "writeSet": ["src/pages/ProfilePage.tsx#ProfilePage"],

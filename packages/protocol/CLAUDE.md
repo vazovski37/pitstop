@@ -9,7 +9,7 @@ Owner: **both**. This package is the interface between the server (Vazovski) and
 - No runtime logic here beyond schemas. No imports from `server/` or `daemon/`.
 
 ## What lives here
-- `src/index.ts`: zod schemas and the types derived from them (`CommitRequest`, `Changeset`, `CommitResponse`, `Intent`, `ServerMessage`, `ClientMessage`, `Health`).
+- `src/index.ts`: zod schemas and the types derived from them (`CommitRequest`, `Changeset`, `CommitResponse`, `Intent`, `IntentRequest`, `ServerMessage`, `ClientMessage`, `Health`).
 - `fixtures/*.json`: one valid example of each message. Both halves use these in their own tests.
 
 Design reference: the technical design doc (written when the project was called Agent Git), sections 5.2 and 8.2.

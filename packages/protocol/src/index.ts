@@ -5,7 +5,7 @@
  * (checked at runtime) and the TypeScript type derived from it (checked at build time).
  * Change this file only when both owners agree: it is the interface between the two halves.
  *
- * Design reference: the technical design doc (written when the project was called Agent Git), sections 5.2 (changeset) and 8.2 (stream).
+ * Design reference: the technical design doc (written when the project was called Agent Git), sections 5.2 (changeset), 6.2 (intents and commits) and 8.2 (stream).
  */
 import { z } from "zod";
 
@@ -32,6 +32,12 @@ export const FileChange = z.object({
   op: z.enum(["add", "modify", "delete", "rename"]),
   /** Absent for deletes. */
   blob: BlobHash.optional(),
+  /**
+   * The file's text (utf-8), so a daemon can write a file it never had.
+   * Present on adds, modifies and renames that change content; absent for deletes.
+   * The server stores it in `blobs` under `blob`. Binary files come later through `GET /blobs/:hash`.
+   */
+  content: z.string().optional(),
   /** Only for renames. */
   fromPath: z.string().optional(),
 });
@@ -61,6 +67,8 @@ export const CommitRequest = z.object({
   baseLsn: Lsn,
   author: Author,
   intent: z.string().min(1),
+  /** The open intent this commit closes (from `POST /intents`). Absent when none was declared. */
+  intentId: z.string().optional(),
   files: z.array(FileChange).min(1),
   writeSet: z.array(SymbolId),
   /** Symbols whose public shape (parameters, return type) changed. Subset of writeSet. */
@@ -111,7 +119,23 @@ export const Intent = z.object({
 });
 export type Intent = z.infer<typeof Intent>;
 
-/** Messages the server pushes to daemons over the WebSocket (section 8.2). */
+/** What a daemon sends to open a transaction: `POST /intents`, answered with an `Intent` (section 6.2, step 1). */
+export const IntentRequest = z.object({
+  author: Author,
+  baseLsn: Lsn,
+  text: z.string().min(1),
+  /** Symbols the agent expects to touch; the server uses them for early warnings (section 9.3). */
+  declaredSymbols: z.array(SymbolId).default([]),
+});
+export type IntentRequest = z.infer<typeof IntentRequest>;
+
+/**
+ * Messages the server pushes to daemons over the WebSocket (section 8.2).
+ *
+ * Order on a connection: `hello` first; then, after `subscribe`, one `entry` per log position
+ * after `fromLsn`, in LSN order with no gaps; then live entries as they are appended.
+ * `intent` and `warning` can arrive at any time after `hello`.
+ */
 export const ServerMessage = z.discriminatedUnion("type", [
   z.object({ type: z.literal("hello"), serverVersion: z.string(), headLsn: Lsn }),
   z.object({ type: z.literal("entry"), changeset: Changeset }),
@@ -129,9 +153,18 @@ export type ServerMessage = z.infer<typeof ServerMessage>;
 
 /** Messages a daemon sends to the server over the WebSocket. */
 export const ClientMessage = z.discriminatedUnion("type", [
-  /** Start streaming every entry after `fromLsn`. */
+  /**
+   * Start streaming every entry after `fromLsn` (the worktree's applied LSN; 0 for an empty worktree).
+   * A daemon that sees a gap in LSNs subscribes again from its last applied LSN.
+   */
   z.object({ type: z.literal("subscribe"), fromLsn: Lsn }),
-  z.object({ type: z.literal("heartbeat"), intentId: z.string().optional() }),
+  z.object({
+    type: z.literal("heartbeat"),
+    /** The open intent to keep alive, if any. */
+    intentId: z.string().optional(),
+    /** The LSN this worktree has applied, so the live view can show it against the head. */
+    appliedLsn: Lsn.optional(),
+  }),
 ]);
 export type ClientMessage = z.infer<typeof ClientMessage>;
 

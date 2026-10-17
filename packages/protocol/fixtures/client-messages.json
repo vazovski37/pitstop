@@ -1,0 +1,4 @@
+[
+  { "type": "subscribe", "fromLsn": 120 },
+  { "type": "heartbeat", "intentId": "int_02", "appliedLsn": 121 }
+]
