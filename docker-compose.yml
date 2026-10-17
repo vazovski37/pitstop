@@ -1,0 +1,37 @@
+# Local development stack. Azure is only reached through GitHub Actions.
+#   npm run db:up            -> Postgres with pgvector only (run the server with `npm run dev:server`)
+#   docker compose up --build -> Postgres + the server image, same as production
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: pitstop
+      POSTGRES_PASSWORD: pitstop
+      POSTGRES_DB: pitstop
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pitstop -d pitstop"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  server:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+      args:
+        GIT_SHA: local
+    environment:
+      DATABASE_URL: postgresql://pitstop:pitstop@db:5432/pitstop
+      PORT: "8080"
+    ports:
+      - "8080:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:

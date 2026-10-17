@@ -1,0 +1,22 @@
+[
+  { "type": "hello", "serverVersion": "abc1234", "headLsn": 121 },
+  {
+    "type": "warning",
+    "agent": "agent-b",
+    "kind": "dependency_changed",
+    "message": "#121 changed getCurrentUser: now returns null for expired sessions (intent: fix session expiry).",
+    "symbols": ["src/auth/session.ts#getCurrentUser"]
+  },
+  {
+    "type": "intent",
+    "intent": {
+      "id": "int_01",
+      "author": { "developer": "vazovski", "agent": "agent-a" },
+      "baseLsn": 120,
+      "text": "Fix session expiry in getCurrentUser",
+      "declaredSymbols": ["src/auth/session.ts#getCurrentUser"],
+      "status": "open",
+      "heartbeatAt": "2026-10-17T14:18:00Z"
+    }
+  }
+]

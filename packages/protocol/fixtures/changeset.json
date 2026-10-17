@@ -1,0 +1,26 @@
+{
+  "lsn": 122,
+  "baseLsn": 120,
+  "author": { "developer": "teammate", "agent": "agent-b" },
+  "intent": "Show last-seen time on ProfilePage",
+  "files": [
+    {
+      "path": "src/pages/ProfilePage.tsx",
+      "op": "modify",
+      "blob": "sha256:9f3c1e0a5b7d2c4e6f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6"
+    }
+  ],
+  "writeSet": ["src/pages/ProfilePage.tsx#ProfilePage"],
+  "sigWriteSet": [],
+  "readSet": ["src/auth/session.ts#getCurrentUser", "src/models/user.ts#User"],
+  "repairs": [
+    {
+      "againstLsn": 121,
+      "kind": "semantic",
+      "summary": "Added null check: redirect to login when the session has expired"
+    }
+  ],
+  "checks": { "typecheck": "pass", "tests": "pass", "adr": "pass", "details": "14 affected tests" },
+  "brainVersion": 37,
+  "createdAt": "2026-10-17T14:20:05Z"
+}

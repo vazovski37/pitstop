@@ -1,0 +1,30 @@
+{
+  "name": "pitstop",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/protocol",
+    "server",
+    "daemon",
+    "mcp",
+    "web"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "build:protocol": "npm run build -w @pitstop/protocol",
+    "typecheck": "npm run build:protocol && npm run typecheck --workspaces --if-present",
+    "test": "vitest run",
+    "dev:server": "npm run dev -w @pitstop/server",
+    "db:up": "docker compose up -d db",
+    "db:down": "docker compose down"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0"
+  }
+}

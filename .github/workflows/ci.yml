@@ -1,0 +1,73 @@
+name: CI
+
+# Runs on every pull request and branch push, and is reused by the deploy workflow,
+# so nothing reaches Azure without passing these checks.
+on:
+  pull_request:
+  push:
+    branches-ignore: [main]
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    name: Typecheck and test
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: pitstop
+          POSTGRES_PASSWORD: pitstop
+          POSTGRES_DB: pitstop
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U pitstop -d pitstop"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+    env:
+      # Enables the migration tests against a real Postgres with pgvector.
+      DATABASE_URL: postgresql://pitstop:pitstop@localhost:5432/pitstop
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+
+  image:
+    name: Build and start the server image
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: pitstop
+          POSTGRES_PASSWORD: pitstop
+          POSTGRES_DB: pitstop
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U pitstop -d pitstop"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build image
+        run: docker build -f server/Dockerfile --build-arg GIT_SHA="${{ github.sha }}" -t pitstop-server:ci .
+      - name: Start it and check /healthz
+        run: |
+          docker run -d --name server --network host \
+            -e DATABASE_URL=postgresql://pitstop:pitstop@localhost:5432/pitstop \
+            -e PORT=8080 pitstop-server:ci
+          TRIES=12 bash infra/smoke.sh http://localhost:8080 "${{ github.sha }}" || { docker logs server; exit 1; }

@@ -1,0 +1,88 @@
+name: Deploy
+
+# Every push to main that touches the server ships it to Azure.
+# Laptops never deploy: this workflow is the only path to production.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "server/**"
+      - "packages/protocol/**"
+      - "package.json"
+      - "package-lock.json"
+      - "infra/smoke.sh"
+      - ".github/workflows/deploy.yml"
+      - ".github/workflows/ci.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write # OIDC: GitHub proves who it is to Azure; no Azure password is stored
+
+concurrency:
+  group: production
+  cancel-in-progress: false
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  deploy:
+    name: Deploy to Azure Container Apps
+    needs: ci
+    # Skipped until infra/bootstrap.sh has connected this repo to Azure.
+    if: vars.AZURE_RESOURCE_GROUP != ''
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: ${{ steps.smoke.outputs.url }}
+    env:
+      RG: ${{ vars.AZURE_RESOURCE_GROUP }}
+      APP: ${{ vars.APP_PREFIX }}-server
+      SHA: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Log in to Azure (OIDC)
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Find the registry and the app
+        run: |
+          az extension add --name containerapp --upgrade --only-show-errors
+          ACR="$(az acr list -g "$RG" --query '[0].name' -o tsv)"
+          if [ -z "$ACR" ] || ! az containerapp show -g "$RG" -n "$APP" -o none 2>/dev/null; then
+            echo "::error::Infrastructure not found in $RG. Run the 'Provision infrastructure' workflow first."
+            exit 1
+          fi
+          LOGIN_SERVER="$(az acr show -n "$ACR" --query loginServer -o tsv)"
+          {
+            echo "ACR=$ACR"
+            echo "IMAGE=$LOGIN_SERVER/server:$SHA"
+            echo "PREV_IMAGE=$(az containerapp show -g "$RG" -n "$APP" --query 'properties.template.containers[0].image' -o tsv)"
+          } >> "$GITHUB_ENV"
+
+      - name: Build and push image
+        run: |
+          az acr login --name "$ACR"
+          docker build -f server/Dockerfile --build-arg GIT_SHA="$SHA" -t "$IMAGE" .
+          docker push "$IMAGE"
+
+      - name: Deploy new revision
+        run: az containerapp update -g "$RG" -n "$APP" --image "$IMAGE" --only-show-errors -o none
+
+      - name: Smoke test
+        id: smoke
+        run: |
+          URL="https://$(az containerapp show -g "$RG" -n "$APP" --query properties.configuration.ingress.fqdn -o tsv)"
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+          bash infra/smoke.sh "$URL" "$SHA"
+
+      - name: Roll back to the previous image
+        if: failure() && env.PREV_IMAGE != ''
+        run: |
+          echo "Rolling back to $PREV_IMAGE"
+          az containerapp update -g "$RG" -n "$APP" --image "$PREV_IMAGE" --only-show-errors -o none

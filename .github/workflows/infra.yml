@@ -1,0 +1,79 @@
+name: Provision infrastructure
+
+# Creates or updates every Azure resource from infra/main.bicep.
+# Run it once by hand after infra/bootstrap.sh; it also runs when the Bicep changes on main.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "infra/main.bicep"
+      - ".github/workflows/infra.yml"
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: production
+  cancel-in-progress: false
+
+jobs:
+  provision:
+    name: Provision Azure resources
+    # Skipped until infra/bootstrap.sh has connected this repo to Azure.
+    if: vars.AZURE_RESOURCE_GROUP != ''
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: ${{ steps.smoke.outputs.url }}
+    env:
+      RG: ${{ vars.AZURE_RESOURCE_GROUP }}
+      LOCATION: ${{ vars.AZURE_LOCATION }}
+      PREFIX: ${{ vars.APP_PREFIX }}
+      SHA: ${{ github.sha }}
+      PG_ADMIN_PASSWORD: ${{ secrets.PG_ADMIN_PASSWORD }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Log in to Azure (OIDC)
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: "Pass 1: registry, database, Container Apps environment"
+        run: |
+          OUT="$(az deployment group create -g "$RG" -n "base-${{ github.run_number }}" \
+            -f infra/main.bicep \
+            -p prefix="$PREFIX" location="$LOCATION" deployApp=false pgAdminPassword="$PG_ADMIN_PASSWORD" \
+            --query properties.outputs -o json)"
+          {
+            echo "ACR=$(echo "$OUT" | jq -r .acrName.value)"
+            echo "LOGIN_SERVER=$(echo "$OUT" | jq -r .acrLoginServer.value)"
+          } >> "$GITHUB_ENV"
+
+      - name: Build and push the server image
+        run: |
+          IMAGE="$LOGIN_SERVER/server:$SHA"
+          az acr login --name "$ACR"
+          docker build -f server/Dockerfile --build-arg GIT_SHA="$SHA" -t "$IMAGE" .
+          docker push "$IMAGE"
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+
+      - name: "Pass 2: the Container App"
+        run: |
+          OUT="$(az deployment group create -g "$RG" -n "app-${{ github.run_number }}" \
+            -f infra/main.bicep \
+            -p prefix="$PREFIX" location="$LOCATION" deployApp=true containerImage="$IMAGE" \
+               pgAdminPassword="$PG_ADMIN_PASSWORD" anthropicApiKey="$ANTHROPIC_API_KEY" \
+            --query properties.outputs -o json)"
+          echo "FQDN=$(echo "$OUT" | jq -r .appFqdn.value)" >> "$GITHUB_ENV"
+
+      - name: Smoke test
+        id: smoke
+        run: |
+          echo "url=https://$FQDN" >> "$GITHUB_OUTPUT"
+          bash infra/smoke.sh "https://$FQDN" "$SHA"
