@@ -22,8 +22,8 @@ export const LOCK_FILE = "lock";
 
 export const statePath = (worktree: string): string => join(worktree, STATE_DIR, STATE_FILE);
 
-/** The daemon state directory, ignored by git and jj. */
-async function stateDir(worktree: string): Promise<string> {
+/** The daemon state directory, created on demand and ignored by git and jj. */
+export async function stateDir(worktree: string): Promise<string> {
   const dir = join(worktree, STATE_DIR);
   await mkdir(dir, { recursive: true });
   await writeFile(join(dir, ".gitignore"), "*\n");

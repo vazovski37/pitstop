@@ -2,6 +2,8 @@
 /**
  * Local daemon: one per worktree (design doc sections 6.3, 8 and 10).
  *
+ *   pitstop init <server-url> [--repo owner/name] [--token t] [--no-import]
+ *                                        remember the server, create the repository, import the worktree
  *   pitstop daemon                       keep this worktree in sync with the server's log; local API for the agent side
  *   pitstop commit -m "<intent>"         send the agent's unfinished work in @ as a commit
  *   pitstop import [-m "<why>"]          send every tracked file as the log's first entry
@@ -9,21 +11,23 @@
  *   pitstop safe-point                   tell the running daemon the agent is between tools (the hook's command)
  *   pitstop status                       what the running daemon knows
  *
- * Configuration comes from the environment; see config.ts.
+ * Configuration: .pitstop/config.json (written by init) under the environment; see config.ts.
  */
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { commit, CommitRejected, importWorktree } from "./commit.js";
-import { configFromEnv, type Config } from "./config.js";
+import { loadConfig, type Config } from "./config.js";
 import { Daemon } from "./daemon.js";
+import { init } from "./init.js";
 import { declareIntent } from "./intents.js";
 import { binariesFromEnv, JjWorktree } from "./jj.js";
 import { LocalClient } from "./local-client.js";
 
 export { describe } from "./messages.js";
 export { commit, CommitRejected, importWorktree } from "./commit.js";
-export { configFromEnv, streamUrl, type Config } from "./config.js";
+export { configFrom, configFromEnv, loadConfig, readFileConfig, streamUrl, writeFileConfig, type Config } from "./config.js";
 export { Daemon, readDaemonInfo, type SafePointResult, type Status } from "./daemon.js";
+export { init } from "./init.js";
 export { declareIntent } from "./intents.js";
 export { JjWorktree, type Applier, type ApplyResult } from "./jj.js";
 export { LocalClient, NoDaemon } from "./local-client.js";
@@ -32,6 +36,7 @@ export { readState, writeState } from "./state.js";
 export { symbolSets, type SymbolSets, type Tree } from "./symbols.js";
 
 const USAGE = `usage:
+  pitstop init <server-url> [--repo owner/name] [--token t] [--no-import]
   pitstop daemon                       sync this worktree with the server's log
   pitstop commit -m "<intent>"         commit the unfinished work in @
   pitstop import [-m "<why>"]          send every tracked file as the log's first entry
@@ -44,17 +49,40 @@ const flag = (args: string[], name: string): string | undefined => {
   return at === -1 ? undefined : args[at + 1];
 };
 
-export async function main(argv: string[], config: Config = configFromEnv()): Promise<number> {
+export async function main(argv: string[], config?: Config): Promise<number> {
   const [command, ...rest] = argv;
   const log = (line: string) => console.log(`[pitstop] ${line}`);
-  const applier = new JjWorktree(config.worktree, binariesFromEnv());
+  const cfg = config ?? (await loadConfig());
+  const applier = new JjWorktree(cfg.worktree, binariesFromEnv());
   const shared = {
-    serverUrl: config.serverUrl,
-    ...(config.token === undefined ? {} : { token: config.token }),
-    worktree: config.worktree,
-    author: config.author,
+    serverUrl: cfg.serverUrl,
+    ...(cfg.token === undefined ? {} : { token: cfg.token }),
+    ...(cfg.repo === undefined ? {} : { repo: cfg.repo }),
+    worktree: cfg.worktree,
+    author: cfg.author,
     log,
   };
+
+  if (command === "init") {
+    const serverUrl = rest.find((a) => !a.startsWith("-") && a !== flag(rest, "--repo") && a !== flag(rest, "--token"));
+    if (serverUrl === undefined) {
+      console.error(USAGE);
+      return 2;
+    }
+    const repo = flag(rest, "--repo");
+    const token = flag(rest, "--token") ?? cfg.token;
+    const result = await init({
+      ...shared,
+      serverUrl,
+      ...(token === undefined ? {} : { token }),
+      ...(repo === undefined ? {} : { repo }),
+      applier,
+      noImport: rest.includes("--no-import"),
+    });
+    if (result.importedAs !== undefined) log(`imported as #${result.importedAs}`);
+    log("now start `pitstop daemon` here");
+    return 0;
+  }
 
   if (command === "daemon") {
     const daemon = new Daemon({
@@ -66,7 +94,8 @@ export async function main(argv: string[], config: Config = configFromEnv()): Pr
       },
     });
     const port = await daemon.start();
-    log(`watching ${config.worktree} from #${daemon.stream.appliedLsn}; local API on 127.0.0.1:${port}; ctrl-c to stop`);
+    const where = cfg.repo === undefined ? cfg.serverUrl : `${cfg.serverUrl} (${cfg.repo})`;
+    log(`watching ${cfg.worktree} from #${daemon.stream.appliedLsn} on ${where}; local API on 127.0.0.1:${port}; ctrl-c to stop`);
     await new Promise<void>((done) => {
       const stop = () => void daemon.close().finally(done);
       process.once("SIGINT", stop);
@@ -110,7 +139,7 @@ export async function main(argv: string[], config: Config = configFromEnv()): Pr
   }
 
   if (command === "safe-point" || command === "status") {
-    const client = new LocalClient(config.worktree);
+    const client = new LocalClient(cfg.worktree);
     if (command === "status") {
       console.log(JSON.stringify(await client.status(), null, 2));
       return 0;
