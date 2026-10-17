@@ -1,9 +1,8 @@
 # Who must review a pull request that touches these paths (GitHub code owners).
 #
 # packages/protocol is owned by both developers (CLAUDE.md): a change by one needs the other's
-# approval. Add the teammate's GitHub handle on the line below, then turn on
-# "Require review from Code Owners" in the main branch rule. Until both handles are here the
-# rule would block the author's own protocol changes, so leave it off.
+# approval. GitHub asks both for review; nothing enforces it (no branch rule on this plan), so
+# never merge your own protocol change.
 #
 # No other folder is listed on purpose: a pull request inside your own folder merges on green CI.
-packages/protocol/ @vazovski37
+packages/protocol/ @vazovski37 @lbala23
