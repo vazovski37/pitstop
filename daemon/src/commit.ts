@@ -24,6 +24,12 @@ export interface CommitOptions {
 export interface ImportOptions extends Omit<CommitOptions, "intent"> {
   /** Defaults to `import <worktree name>`. */
   intent?: string;
+  /**
+   * Which tree to import: `@` (the default), the working copy as jj sees it, or `main`, the last
+   * commit, which `pitstop setup` uses so that only committed files, with the line endings git
+   * stores, become the log's first entry.
+   */
+  from?: "main" | "@";
 }
 
 export class CommitRejected extends Error {
@@ -75,7 +81,7 @@ export async function importWorktree(opts: ImportOptions): Promise<Changeset> {
     throw new Error(`this worktree is at #${state.appliedLsn}; import is only for a worktree that has applied nothing`);
   }
   const files: FileChange[] = [];
-  for (const [path, content] of await opts.applier.treeFiles("@")) {
+  for (const [path, content] of await opts.applier.treeFiles(opts.from ?? "@")) {
     if (content.includes("\0")) {
       opts.log?.(`skipped ${path}: binary files come later through GET /blobs`);
       continue;

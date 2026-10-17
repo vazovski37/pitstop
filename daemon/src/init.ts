@@ -1,6 +1,6 @@
 import { DEFAULT_REPO, Repo, type Author } from "@pitstop/protocol";
 import { importWorktree } from "./commit.js";
-import { serverHeaders, writeFileConfig } from "./config.js";
+import { readFileConfig, serverHeaders, writeFileConfig } from "./config.js";
 import type { Applier } from "./jj.js";
 import { readState } from "./state.js";
 
@@ -13,9 +13,16 @@ export interface InitOptions {
   author: Author;
   /** Skip the import of the worktree as the repository's first entry. */
   noImport?: boolean;
+  /** The tree the import sends (commit.ts, ImportOptions.from); default `@`. */
+  importFrom?: "main" | "@";
   fetch?: typeof fetch;
   log?: (line: string) => void;
 }
+
+/** A worktree already configured for another repository or server: init leaves it as it is. */
+export class OtherCheckout extends Error {}
+
+const sameServer = (a: string, b: string) => a.replace(/\/+$/, "") === b.replace(/\/+$/, "");
 
 export interface InitResult {
   /** The repository as the server knows it (the default one when none was named). */
@@ -32,7 +39,21 @@ export interface InitResult {
  */
 export async function init(opts: InitOptions): Promise<InitResult> {
   const serverUrl = opts.serverUrl.replace(/\/+$/, "");
+  // Never re-point a checkout of one repository at another: its state, its main and its daemon
+  // belong to the log it was set up for.
+  const current = await readFileConfig(opts.worktree);
+  if (current.serverUrl !== undefined) {
+    const was = current.repo ?? DEFAULT_REPO;
+    const wanted = opts.repo ?? DEFAULT_REPO;
+    if (was !== wanted || !sameServer(current.serverUrl, serverUrl)) {
+      throw new OtherCheckout(
+        `${opts.worktree} is already a Pitstop checkout of ${was} on ${current.serverUrl}; its .pitstop/config.json was left as it is. Set up ${wanted} on ${serverUrl} from a directory outside it.`,
+      );
+    }
+  }
+  // What else the file holds (the agent's name from setup) stays.
   await writeFileConfig(opts.worktree, {
+    ...current,
     serverUrl,
     ...(opts.token === undefined ? {} : { token: opts.token }),
     ...(opts.repo === undefined ? {} : { repo: opts.repo }),
@@ -61,6 +82,7 @@ export async function init(opts: InitOptions): Promise<InitResult> {
       worktree: opts.worktree,
       applier: opts.applier,
       author: opts.author,
+      ...(opts.importFrom === undefined ? {} : { from: opts.importFrom }),
       ...(opts.fetch === undefined ? {} : { fetch: opts.fetch }),
       ...(opts.log === undefined ? {} : { log: opts.log }),
     });

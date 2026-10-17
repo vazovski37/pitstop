@@ -15,6 +15,7 @@ Version control for teams where agents write the code. The codebase is treated a
 | `infra/`, `.github/` | Azure (Bicep), bootstrap, CI/CD |
 | `daemon/` | Local replica: stream, jj, read/write sets, the `pitstop` CLI ([guide for other teams](daemon/README.md)) |
 | `mcp/` | Agent tools and safe-point hook |
+| `packages/cli` | The client as one tarball (`pitstop`, `pitstop-mcp`, `pitstop-hook`), served by the server at `/pitstop-cli.tgz` |
 | `web/` | Live view, served by the server at `/` |
 | `demo/` | The demo slice, the scenario, the gates and the rehearsal |
 

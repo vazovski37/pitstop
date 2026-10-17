@@ -42,7 +42,8 @@ describe("pitstop commit", () => {
     expect(await readState(worktree)).toEqual({ appliedLsn: 123 });
   });
 
-  it("fills the symbol sets from the worktree's TypeScript project", async () => {
+  // The TypeScript compiler takes seconds on a busy laptop; vitest's 5 s default flakes there.
+  it("fills the symbol sets from the worktree's TypeScript project", { timeout: 30_000 }, async () => {
     const tsconfig = JSON.stringify({ compilerOptions: { strict: true }, include: ["src"] });
     const main: Tree = new Map([
       ["tsconfig.json", tsconfig],

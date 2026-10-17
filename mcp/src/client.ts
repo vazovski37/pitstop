@@ -7,7 +7,7 @@ import { join } from "node:path";
 
 export class NoDaemon extends Error {
   constructor(worktree: string) {
-    super(`No daemon is running in ${worktree}: start \`pitstop daemon\` there.`);
+    super(`No daemon is running in ${worktree}: run \`pitstop start\` there.`);
   }
 }
 

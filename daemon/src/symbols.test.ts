@@ -7,7 +7,9 @@ const ROUTER = "src/router.ts";
 const HOME = "src/pages/HomePage.ts";
 const PROFILE = "src/pages/ProfilePage.ts";
 
-describe("symbol sets on the demo slice (demo/scenario.md)", () => {
+// Each case builds two TypeScript programs; under a full parallel `npm test` the first, cold one
+// (lib.d.ts parsed from scratch) can take well over vitest's default 5 s.
+describe("symbol sets on the demo slice (demo/scenario.md)", { timeout: 30_000 }, () => {
   const base = demoTree();
 
   it("sees no change between identical trees", () => {
@@ -85,7 +87,7 @@ export function renderProfile(userId: string): string {
   });
 });
 
-describe("symbol sets on a small project", () => {
+describe("symbol sets on a small project", { timeout: 30_000 }, () => {
   const tsconfig = JSON.stringify({ compilerOptions: { strict: true, module: "NodeNext", moduleResolution: "NodeNext", target: "ES2022" }, include: ["src"] });
   const a = `export class Counter {
   private n = 0;

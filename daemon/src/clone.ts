@@ -11,7 +11,7 @@ import { z } from "zod";
 import { Changeset, DEFAULT_REPO, Repo } from "@pitstop/protocol";
 import { serverHeaders, writeFileConfig } from "./config.js";
 import { run } from "./exec.js";
-import { binariesFromEnv, JjWorktree, type Applier, type Binaries } from "./jj.js";
+import { binariesFromEnv, JjWorktree, jjInitColocated, type Applier, type Binaries } from "./jj.js";
 import { writeState } from "./state.js";
 
 /** The server's largest `GET /log` page. */
@@ -125,5 +125,7 @@ export async function prepareWorktree(dir: string, repo: Repo, bin: Binaries): P
   };
   const root = (await git(["commit-tree", tree, "-m", `pitstop clone ${repo.id}`], identity)).trim();
   await git(["update-ref", "refs/heads/main", root]);
-  await run(bin.jj, ["git", "init", "--colocate"], { cwd: dir });
+  // With git's line-ending conversion (core.autocrlf on Windows): files on disk get the platform's
+  // endings, and what an editor writes with CRLF is committed with LF.
+  await jjInitColocated(dir, bin);
 }
