@@ -8,6 +8,9 @@ on:
     paths:
       - "server/**"
       - "web/**" # the live view is built into the server image
+      - "daemon/**" # and so is the client the server hands out (/pitstop-cli.tgz)
+      - "mcp/**"
+      - "packages/cli/**"
       - "packages/protocol/**"
       - "package.json"
       - "package-lock.json"
