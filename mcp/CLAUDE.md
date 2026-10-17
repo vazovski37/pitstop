@@ -6,14 +6,19 @@ Owner: **Vazovski** (since 18 October 2026; built by the teammate through Phase 
 Connects coding agents (Claude Code for the hackathon) to the daemon: MCP tools the agent calls, and the hook that marks safe points. Design reference: the technical design doc (written when the project was called Agent Git), sections 8.3, 10 and 13.
 
 ## Pieces
-- `src/index.ts`: the MCP server over stdio. Tools `declare_intent`, `commit`, `why`, `callers`, `status`; `similar` waits for the server's semantic endpoint. The worktree is `PITSTOP_WORKTREE` or the current directory.
+- `src/index.ts`: the MCP server over stdio. Tools `declare_intent`, `commit`, `why`, `callers`, `status`; `similar` waits for the server's semantic endpoint. Its `instructions` (`INSTRUCTIONS`) carry the house rules, the same as the `CLAUDE.local.md` `pitstop setup` writes (daemon/src/wire.ts): declare an intent, commit only with the commit tool, never git commit/push, obey a refusal. The worktree is `PITSTOP_WORKTREE`, else the nearest directory with `.pitstop/config.json` at or above the current one (so `.mcp.json` needs no path). `startServer()` is what runs it.
 - `src/tools.ts`: each tool as a plain function returning the text the agent sees (tested without the transport). `src/client.ts`: finds the worktree's daemon through `.pitstop/daemon.json` and calls its local API.
-- `src/hook.ts`: the Claude Code `PostToolUse` hook. It posts a safe point to the daemon, which applies pending entries then, and returns the daemon's notes (entries that touched the agent's work, conflicts, warnings) as `additionalContext`. Without a daemon it prints nothing and exits 0.
-- `src/setup.ts`: `pitstop-agent-setup <worktree>` writes the MCP server into the worktree's `.mcp.json` and the hook into `.claude/settings.json`, keeping whatever else is there.
+- `src/hook.ts`: the Claude Code `PostToolUse` hook. It posts a safe point to the daemon, which applies pending entries then, and returns the daemon's notes (entries that touched the agent's work, conflicts, warnings) as `additionalContext`. Without a daemon it starts one (below), and on any failure it prints nothing and exits 0. `runHook()` is what runs it.
+- `src/autostart.ts`: when no daemon answers (daemon.json missing, its pid dead, or `/status` not that pid) in a Pitstop checkout, run `pitstop start` there, detached, its output appended to `.pitstop/daemon.log`, then wait for the daemon. The server does it at startup (in the background) and when a tool finds no daemon (then tries the tool once more); the hook waits 3 s at most. A start that brought nothing up is not retried for 30 s (`.pitstop/autostart`), so a broken setup costs a tool call nothing. The CLI is `pitstop.js` next to the bundle, else this repository's daemon (`src/index.ts` under tsx, `dist/index.js` otherwise).
+- `src/setup.ts`: `pitstop-agent-setup <worktree>` writes the MCP server into the worktree's `.mcp.json` and the hook into `.claude/settings.json` with absolute paths to this build, keeping whatever else is there; `pitstop setup` (daemon/src/wire.ts) writes them by command name instead, and each replaces the other's entries.
+- `src/build-info.ts`: `BUNDLED`, true inside packages/cli's bundle, where the isMain checks of `index.ts` and `hook.ts` are off and the bundle's entries call `startServer`/`runHook`.
 
-For a team that is not us: [daemon/README.md](../daemon/README.md) walks through install, `init` or `clone`, the Claude Code wiring and the daily loop.
+For a team that is not us: [daemon/README.md](../daemon/README.md) walks through the install from the server, `pitstop setup`, and the by-hand path.
 
-## Setup, per laptop and worktree
+## The bundle
+`packages/cli/` bundles `startServer` as `pitstop-mcp` and `runHook` as `pitstop-hook`, next to `pitstop`; `pitstop setup` wires them into a checkout. On Windows `.mcp.json` says `cmd /c pitstop-mcp`, because Claude Code starts an MCP server without a shell and npm's bin there is a `.cmd` shim; the hook runs through a shell, so plain `pitstop-hook` works everywhere.
+
+## Setup from source, per laptop and worktree
 1. From the pitstop repo, once: `npm run build` (the daemon's and this package's `dist/`).
 2. In the worktree the agent will edit (for the demo, the slice from `demo/scripts/reset.sh`): `node <pitstop>/mcp/dist/setup.js .` Then check `.mcp.json` and `.claude/settings.json` in that worktree.
 3. Start the daemon there: `node <pitstop>/daemon/dist/index.js daemon` with `PITSTOP_SERVER`, `PITSTOP_TOKEN`, `PITSTOP_DEVELOPER` and `PITSTOP_AGENT` set (the demo's `agent-a` / `agent-b`). It prints the local API port and writes `.pitstop/daemon.json`.
@@ -22,4 +27,4 @@ For a team that is not us: [daemon/README.md](../daemon/README.md) walks through
 ## Rules
 - Tools talk to the local daemon, not directly to the server, so there is one connection per worktree.
 - Keep tool outputs short and actionable; they land in the agent's context.
-- The hook never fails a tool and never blocks: an unreachable daemon means silence.
+- The hook never fails a tool and never blocks for long: starting a missing daemon is capped at about 3 s, and an unreachable daemon means silence.

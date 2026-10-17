@@ -12,6 +12,7 @@ Since 18 October 2026 Vazovski works alone and owns every folder. The table reco
 | `packages/protocol` | Both, changed only together |
 | `server/`, `infra/`, `.github/`, `web/` | Vazovski |
 | `daemon/`, `mcp/` | Teammate (until 18 October 2026), now Vazovski |
+| `packages/cli` | Vazovski (the bundled client, since 18 October 2026) |
 | `demo/` | Both |
 
 **Rule for Claude:** read the `CLAUDE.md` in a folder before editing it; `daemon/` and `mcp/` carry conventions (the jj apply sequence, Windows gotchas, tool output rules) that are easy to break. Keep `daemon/README.md` in step with the daemon's CLI.
@@ -29,6 +30,7 @@ Since 18 October 2026 Vazovski works alone and owns every folder. The table reco
 - `npm run dev:server`: server on http://localhost:8080 (`/healthz`, `/stream`).
 - `npm test`: all tests. Migration tests run when `DATABASE_URL` is set.
 - `npm run typecheck`, `npm run build`.
+- `npm run pack:cli`: the client tarball at `web/dist/pitstop-cli.tgz` (`packages/cli/CLAUDE.md`); with `web/` built, the local server serves it at `/pitstop-cli.tgz`.
 
 ## Stack
 Node.js 22 + TypeScript (ESM), Fastify, Postgres 16 + pgvector, zod, Vitest. Local version control: Jujutsu colocated with git. Hosting: Azure Container Apps + Azure Database for PostgreSQL, deployed by GitHub Actions with OIDC (no stored Azure passwords).
