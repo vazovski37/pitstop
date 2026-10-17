@@ -44,7 +44,7 @@ import {
   type Store,
   type User,
 } from "./store.js";
-import { Stream } from "./stream.js";
+import { Stream, type Worktree } from "./stream.js";
 import { decideCommit, describeSkew, overlapWarnings, type SkewVerdict, type ValidationMode } from "./validate.js";
 
 export interface AppDeps {
@@ -104,6 +104,16 @@ const MemberBody = z.object({ role: z.enum(["owner", "writer", "reader"]) });
 const RepoPatch = z.object({ visibility: z.enum(["private", "public"]) });
 
 type RepoParams = { Params: { owner: string; name: string } };
+
+/**
+ * Answer of `GET /repos/:owner/:name/worktrees`: each connected worktree's applied LSN against the
+ * head, for the live view. `agent` comes from the open intent the worktree last heartbeated, so a
+ * worktree between tasks has no name. A server query, not a protocol message: the shape lives here.
+ */
+export interface WorktreesResponse {
+  headLsn: number;
+  worktrees: (Worktree & { agent?: string })[];
+}
 
 /**
  * Builds the HTTP and WebSocket server without starting it,
@@ -360,6 +370,22 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     if (!parsed.success) return reply.code(400).send({ error: "invalid_request", message: issues(parsed.error) });
     await deps.store.setVisibility(repo.id, parsed.data.visibility);
     return { ...repo, visibility: parsed.data.visibility };
+  });
+
+  // The replicas: what each connected daemon has applied, from its heartbeats (stream.ts), against the head.
+  app.get<RepoParams>("/repos/:owner/:name/worktrees", async (req, reply) => {
+    const repo = repoParam(req);
+    if ((await deps.store.getRepo(repo)) === undefined) return reply.code(404).send({ error: "unknown_repo" });
+    if (!(await guard(req, reply, repo, "reader"))) return reply;
+    const intents = new Map((await deps.store.openIntents(repo)).map((i) => [i.id, i]));
+    const body: WorktreesResponse = {
+      headLsn: await deps.store.headLsn(repo),
+      worktrees: stream.worktrees(repo).map((w) => {
+        const agent = w.intentId === undefined ? undefined : intents.get(w.intentId)?.author.agent;
+        return { ...w, ...(agent === undefined ? {} : { agent }) };
+      }),
+    };
+    return body;
   });
 
   app.get<RepoParams>("/repos/:owner/:name/members", async (req, reply) => {

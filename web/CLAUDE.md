@@ -5,13 +5,14 @@ Owner: **Vazovski** (moved from the teammate in the build plan, Phase 5). Teamma
 ## What it shows (the screen judges look at during the demo)
 - The log, newest first: LSN, agent, intent, files, checks; repairs highlighted, with the repair's summary under the entry.
 - Open intents: agent, text, declared symbols, base LSN, last heartbeat.
+- Worktrees: one line per connected daemon, `agent-b · applied #3 of #4`, a green mark at the head and a red one with the lag when behind. The name comes from the worktree's open intent; between tasks it is just "worktree".
 - "As it happens": entries landing, repairs, write skew the validator reported, warnings between agents, intents opening and closing.
 - Click an entry for its files, read/write/signature sets, repairs and check details.
 
 ## How it is built
 No framework and no bundler: `public/index.html` + `public/style.css`, and `src/app.ts` compiled by `tsc` to one ES module (`npm run build` → `dist/`). It imports only *types* from `@pitstop/protocol`, so nothing from `node_modules` reaches the browser. The server serves `dist/` at `/` (`server/src/app.ts`, `webDir`; `server/src/index.ts` finds it at `web/dist` or `PITSTOP_WEB_DIR`), so the page is same-origin with the API: the session cookie from sign in with GitHub just works, and a shared-token server takes the token from the page's field (kept in `localStorage`, sent as `Authorization: Bearer` and as `?token=` on the stream).
 
-Data: `GET /version`, `GET /me`, `GET /repos`, then one WebSocket to `/stream` subscribed from LSN 0, which replays the whole log and then stays live (`head`, `entry`, `intent`, `warning`). Switching repositories reconnects; a dropped socket reconnects from the last LSN seen. The Dockerfile builds this workspace into the server image.
+Data: `GET /version`, `GET /me`, `GET /repos`, then one WebSocket to `/stream` subscribed from LSN 0, which replays the whole log and then stays live (`head`, `entry`, `intent`, `warning`). Switching repositories reconnects; a dropped socket reconnects from the last LSN seen. The worktrees are not on the stream: the page reads `GET /repos/:owner/:name/worktrees` (`WorktreesResponse` in `server/src/app.ts`, a server query rather than a protocol message) on `head`, after every live entry and every 3 s while the socket is up. The Dockerfile builds this workspace into the server image.
 
 ## Rules
 - Read-only client of the server's `/stream` and query API. It never writes.
@@ -20,4 +21,5 @@ Data: `GET /version`, `GET /me`, `GET /repos`, then one WebSocket to `/stream` s
 - `npm run typecheck` covers it (the root script builds the protocol first).
 
 ## Not yet
-Each worktree's applied LSN against head: daemons heartbeat it on the stream, but the server does not expose it to a query yet.
+- A worktree's name while it has no open intent: the heartbeat carries only `appliedLsn` and `intentId`, so naming it needs a field in `@pitstop/protocol` (both owners).
+- A daemon that connects already at the head shows up only after its first heartbeat (after an apply, or the 30 s interval in `daemon/src/stream.ts`).

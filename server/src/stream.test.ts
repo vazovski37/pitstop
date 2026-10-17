@@ -1,8 +1,8 @@
 import type { AddressInfo } from "node:net";
 import { afterEach, describe, expect, it } from "vitest";
 import { WebSocket } from "ws";
-import { ServerMessage, type CommitRequest } from "@pitstop/protocol";
-import { buildApp, type AppDeps } from "./app.js";
+import { Intent, ServerMessage, type CommitRequest } from "@pitstop/protocol";
+import { buildApp, type AppDeps, type WorktreesResponse } from "./app.js";
 import { MemoryStore } from "./store.js";
 
 const request = (key: string): CommitRequest => ({
@@ -53,6 +53,16 @@ const connect = (url: string, headers: Record<string, string> = {}): Promise<Inb
     socket.once("unexpected-response", (_req, res) => reject(new Error(`http ${res.statusCode}`)));
     socket.once("error", (err) => reject(err));
   });
+
+/** A heartbeat has no reply, so a test re-reads until the server shows it (or gives up and lets the assertion say why). */
+const eventually = async <T>(read: () => Promise<T>, ok: (value: T) => boolean): Promise<T> => {
+  for (let i = 0; i < 100; i++) {
+    const value = await read();
+    if (ok(value)) return value;
+    await new Promise((wake) => setTimeout(wake, 10));
+  }
+  return read();
+};
 
 describe("GET /stream", () => {
   let cleanup: (() => Promise<void>) | undefined;
@@ -233,6 +243,64 @@ describe("GET /stream", () => {
     const withQuery = await connect(`${url}?token=${token}`);
     expect(await withQuery.next()).toMatchObject({ type: "hello" });
     withQuery.close();
+  });
+
+  it("GET /repos/:owner/:name/worktrees reports what each connected worktree heartbeated, named by its open intent", async () => {
+    const { app, commit, url } = await listen();
+    await commit("one");
+    await commit("two");
+    const opened = await app.inject({
+      method: "POST",
+      url: "/intents",
+      payload: { author: { developer: "teammate", agent: "agent-b" }, baseLsn: 1, text: "Show last-seen" },
+    });
+    const intent = Intent.parse(opened.json());
+    const worktrees = async (): Promise<WorktreesResponse> => (await app.inject({ method: "GET", url: "/repos/local/default/worktrees" })).json();
+
+    // Nobody has heartbeated yet: a subscriber that never does (the live view) is not a worktree.
+    const viewer = await connect(url);
+    await viewer.next(); // hello
+    viewer.send({ type: "subscribe", fromLsn: 0 });
+    expect(await worktrees()).toEqual({ headLsn: 2, worktrees: [] });
+
+    const a = await connect(url);
+    await a.next(); // hello
+    a.send({ type: "subscribe", fromLsn: 2 });
+    a.send({ type: "heartbeat", appliedLsn: 2 });
+    const b = await connect(url);
+    await b.next(); // hello
+    b.send({ type: "subscribe", fromLsn: 1 });
+    b.send({ type: "heartbeat", appliedLsn: 1, intentId: intent.id });
+    expect(await eventually(worktrees, (r) => r.worktrees.length === 2)).toEqual({
+      headLsn: 2,
+      worktrees: [{ appliedLsn: 2 }, { appliedLsn: 1, intentId: intent.id, agent: "agent-b" }],
+    });
+
+    // The next heartbeat moves it; one without an intent drops the name (the task is over).
+    b.send({ type: "heartbeat", appliedLsn: 2 });
+    expect(await eventually(worktrees, (r) => r.worktrees.every((w) => w.appliedLsn === 2))).toEqual({
+      headLsn: 2,
+      worktrees: [{ appliedLsn: 2 }, { appliedLsn: 2 }],
+    });
+
+    // A worktree that disconnects is gone; another repository sees none of them.
+    a.close();
+    await a.closed;
+    expect(await eventually(worktrees, (r) => r.worktrees.length === 1)).toMatchObject({ worktrees: [{ appliedLsn: 2 }] });
+    await app.inject({ method: "POST", url: "/repos", payload: { id: "acme/app" } });
+    expect((await app.inject({ method: "GET", url: "/repos/acme/app/worktrees" })).json()).toEqual({ headLsn: 0, worktrees: [] });
+    expect((await app.inject({ method: "GET", url: "/repos/no/such/worktrees" })).statusCode).toBe(404);
+    viewer.close();
+    b.close();
+  });
+
+  it("the worktrees of a repository are read like its log: with the token when one is set", async () => {
+    const token = "s3cret-token-for-tests";
+    const { app } = await listen({ token });
+    expect((await app.inject({ method: "GET", url: "/repos/local/default/worktrees" })).statusCode).toBe(401);
+    const ok = await app.inject({ method: "GET", url: "/repos/local/default/worktrees", headers: { authorization: `Bearer ${token}` } });
+    expect(ok.statusCode).toBe(200);
+    expect(ok.json()).toEqual({ headLsn: 0, worktrees: [] });
   });
 
   it("warns every socket when a commit lands with write skew", async () => {
