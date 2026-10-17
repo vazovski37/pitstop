@@ -109,6 +109,16 @@ To see what is running in Azure: Actions → latest `Deploy` run → the `produc
 ## The live view
 The server's root URL (`http://localhost:8080/` on a laptop, the Container App's URL on Azure) is the page the judges watch: the log as it grows, open intents, repairs and warnings as they happen. It is built from `web/` into the server image, so it deploys with the server. On a server with `PITSTOP_TOKEN` set, paste that token into the field at the top right once; with accounts on, sign in with GitHub instead. Locally, `npm run build -w @pitstop/web` once, then `npm run dev:server` serves it.
 
+## Joining the hosted service
+Pitstop is a hosted service: one server, run by us on Azure, that any team signs in to. Nobody installs a server; developers install only the client (the daemon and the agent tools, `daemon/README.md`). Joining, once accounts are on (see "Accounts" below):
+
+1. Open the server's URL in a browser and sign in with GitHub.
+2. Create a personal token on the page (it starts with `pst_` and is shown once) and keep it in `PITSTOP_TOKEN` on your machine.
+3. In a checkout of your repository: `pitstop init <server-url> --repo <owner>/<name>` creates the repository on the server and imports the checkout as the log's first entry; your teammates build their worktrees from the log with `pitstop clone <server-url> <owner>/<name>`.
+4. Add them as members of the repository (`PUT /repos/<owner>/<name>/members/<login>`; a page for it is on the plan) and start the daemon; everything else is in the guide.
+
+The local stack (`npm run dev:server`, `docker compose up --build`) exists for developing Pitstop itself, not as a way to run it.
+
 ## Later
 
 **Server token (Phase 2)**

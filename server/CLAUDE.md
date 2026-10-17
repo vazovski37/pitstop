@@ -1,6 +1,6 @@
 # server/ — log, validator, AI repair
 
-Owner: **Vazovski**. Teammate's Claude does not edit this folder (except `server/semantic/`, which the teammate owns).
+Owner: **Vazovski** (since 18 October 2026, every folder is; `server/semantic/` was going to be the teammate's and does not exist).
 
 ## What this folder does
 The single source of truth: the write-ahead log, the commit API, the WebSocket stream, the commit validator, structural merge, AI repair and constraint checks. Design reference: the technical design doc (written when the project was called Agent Git), sections 4 to 7 and 11.
