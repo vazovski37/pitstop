@@ -78,7 +78,8 @@ describe("GET /stream", () => {
     expect(await inbox.next()).toMatchObject({ type: "hello", serverVersion: "test-sha", headLsn: 1 });
 
     inbox.send({ type: "subscribe", fromLsn: 0 });
-    expect(await inbox.next()).toMatchObject({ type: "entry", changeset: { lsn: 1, intent: "change one" } });
+    expect(await inbox.next()).toMatchObject({ type: "head", repo: "local/default", headLsn: 1 });
+    expect(await inbox.next()).toMatchObject({ type: "entry", changeset: { lsn: 1, intent: "change one", repo: "local/default" } });
 
     await commit("two");
     await commit("three");
@@ -94,9 +95,18 @@ describe("GET /stream", () => {
     const inbox = await connect(url);
     expect(await inbox.next()).toMatchObject({ type: "hello", headLsn: 2 });
     inbox.send({ type: "subscribe", fromLsn: 2 });
+    expect(await inbox.next()).toMatchObject({ type: "head", headLsn: 2 });
     await commit("three");
     expect(await inbox.next()).toMatchObject({ type: "entry", changeset: { lsn: 3 } });
     inbox.close();
+  });
+
+  it("refuses a subscription to a repository this server does not have yet", async () => {
+    const { url } = await listen();
+    const inbox = await connect(url);
+    await inbox.next(); // hello
+    inbox.send({ type: "subscribe", repo: "someone/else", fromLsn: 0 });
+    expect(await inbox.closed).toBe(1008);
   });
 
   it("broadcasts opened intents", async () => {
@@ -139,6 +149,7 @@ describe("GET /stream", () => {
     const inbox = await connect(url);
     await inbox.next(); // hello
     inbox.send({ type: "subscribe", fromLsn: 0 });
+    expect(await inbox.next()).toMatchObject({ type: "head", headLsn: 0 });
     await commit("one");
     expect(await inbox.next()).toMatchObject({ type: "entry", changeset: { lsn: 1 } });
 

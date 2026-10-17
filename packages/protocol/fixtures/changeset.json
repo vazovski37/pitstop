@@ -1,4 +1,5 @@
 {
+  "repo": "teamdb/demo",
   "lsn": 122,
   "baseLsn": 120,
   "author": { "developer": "teammate", "agent": "agent-b" },

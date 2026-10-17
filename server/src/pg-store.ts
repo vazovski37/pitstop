@@ -1,5 +1,15 @@
 import type pg from "pg";
-import type { Changeset, Checks, CommitRequest, FileChange, Intent, IntentRequest, Lsn, Repair } from "@pitstop/protocol";
+import {
+  DEFAULT_REPO,
+  type Changeset,
+  type Checks,
+  type CommitRequest,
+  type FileChange,
+  type Intent,
+  type IntentRequest,
+  type Lsn,
+  type Repair,
+} from "@pitstop/protocol";
 import {
   GAP_LIMIT,
   gapStart,
@@ -172,6 +182,7 @@ export class PgStore implements Store {
     );
     return {
       id,
+      repo: DEFAULT_REPO, // until migration 003 stores repositories
       author: req.author,
       baseLsn: req.baseLsn,
       text: req.text,
@@ -213,6 +224,7 @@ export class PgStore implements Store {
       const own = <T extends { lsn: number }>(rows: T[]): T[] => rows.filter((r) => r.lsn === row.lsn);
       const syms = own(symbols.rows);
       return {
+        repo: DEFAULT_REPO, // until migration 003 stores repositories
         lsn: row.lsn,
         baseLsn: row.base_lsn,
         author: { developer: row.developer, agent: row.agent },

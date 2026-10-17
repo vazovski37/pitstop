@@ -1,14 +1,15 @@
 import { createHash, randomBytes } from "node:crypto";
-import type {
-  Changeset,
-  Checks,
-  CommitRequest,
-  CommitResponse,
-  FileChange,
-  Intent,
-  IntentRequest,
-  Lsn,
-  Repair,
+import {
+  DEFAULT_REPO,
+  type Changeset,
+  type Checks,
+  type CommitRequest,
+  type CommitResponse,
+  type FileChange,
+  type Intent,
+  type IntentRequest,
+  type Lsn,
+  type Repair,
 } from "@pitstop/protocol";
 
 /**
@@ -126,6 +127,7 @@ export class MemoryStore implements Store {
     const gap = this.entries.filter((e) => e.lsn > gapStart(req)).slice(0, GAP_LIMIT + 1);
     const decision = decide ? await decide(gap, lsn - 1) : {};
     const changeset: Changeset = {
+      repo: req.repo ?? DEFAULT_REPO,
       lsn,
       baseLsn: req.baseLsn,
       author: req.author,
@@ -163,6 +165,7 @@ export class MemoryStore implements Store {
   async openIntent(req: IntentRequest): Promise<Intent> {
     const intent: Intent = {
       id: newIntentId(),
+      repo: req.repo ?? DEFAULT_REPO,
       author: req.author,
       baseLsn: req.baseLsn,
       text: req.text,

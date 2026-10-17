@@ -2,6 +2,7 @@
   { "type": "hello", "serverVersion": "abc1234", "headLsn": 121 },
   {
     "type": "warning",
+    "repo": "teamdb/demo",
     "agent": "agent-b",
     "kind": "dependency_changed",
     "message": "#121 changed getCurrentUser: now returns null for expired sessions (intent: fix session expiry).",
@@ -11,6 +12,7 @@
     "type": "intent",
     "intent": {
       "id": "int_01",
+      "repo": "teamdb/demo",
       "author": { "developer": "vazovski", "agent": "agent-a" },
       "baseLsn": 120,
       "text": "Fix session expiry in getCurrentUser",
@@ -22,6 +24,7 @@
   {
     "type": "entry",
     "changeset": {
+      "repo": "teamdb/demo",
       "lsn": 122,
       "baseLsn": 120,
       "author": { "developer": "teammate", "agent": "agent-b" },

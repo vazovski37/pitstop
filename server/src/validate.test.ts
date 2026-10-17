@@ -6,6 +6,7 @@ import { decideCommit, validate } from "./validate.js";
 // The demo scenario (demo/scenario.md): #121 fixes auth and changes getCurrentUser's signature;
 // the profile commit, begun at #120, read getCurrentUser.
 const entry = (lsn: number, over: Partial<Changeset>): Changeset => ({
+  repo: "teamdb/demo",
   lsn,
   baseLsn: lsn - 1,
   author: { developer: "vazovski", agent: "agent-a" },

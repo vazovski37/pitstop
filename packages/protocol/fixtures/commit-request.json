@@ -1,5 +1,6 @@
 {
   "idempotencyKey": "agent-b-7f3a91c2",
+  "repo": "teamdb/demo",
   "baseLsn": 120,
   "readBaseLsn": 120,
   "author": { "developer": "teammate", "agent": "agent-b" },

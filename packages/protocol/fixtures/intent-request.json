@@ -1,4 +1,5 @@
 {
+  "repo": "teamdb/demo",
   "author": { "developer": "teammate", "agent": "agent-b" },
   "baseLsn": 120,
   "text": "Show last-seen time on ProfilePage",
