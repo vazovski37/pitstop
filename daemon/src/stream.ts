@@ -2,7 +2,7 @@ import WebSocket from "ws";
 import { ServerMessage, type Changeset, type ClientMessage } from "@pitstop/protocol";
 import type { Applier } from "./jj.js";
 import { describe } from "./messages.js";
-import { readState, writeState } from "./state.js";
+import { readState, withWorktreeLock, writeState } from "./state.js";
 
 export interface StreamOptions {
   /** The server's `/stream` endpoint, `ws://` or `wss://`. */
@@ -119,32 +119,9 @@ export class StreamClient {
       for (;;) {
         const changeset = this.queue.shift();
         if (changeset === undefined) return;
-        // `pitstop commit` runs in its own process and may have applied its own entry meanwhile.
-        const state = await readState(this.opts.worktree);
-        if (state.appliedLsn > this.applied) this.applied = state.appliedLsn;
-        if (changeset.lsn <= this.applied) continue;
-        if (changeset.lsn !== this.applied + 1) {
-          this.opts.onGap?.(this.applied + 1, changeset.lsn);
-          if (++this.gaps >= GAP_RETRIES) throw new GapError(this.applied + 1, changeset.lsn);
-          this.log(`gap: expected #${this.applied + 1}, got #${changeset.lsn}; subscribing again`);
-          this.subscribe();
-          return;
-        }
-        // Unfinished work in @ began at or before the current applied LSN: the server must check
-        // its reads from there, not from the LSN this entry moves the worktree to.
-        const readBaseLsn =
-          state.readBaseLsn ?? ((await this.opts.applier.hasChanges()) ? this.applied : undefined);
-        const result = await this.opts.applier.apply(changeset);
-        this.gaps = 0;
-        this.applied = changeset.lsn;
-        await writeState(this.opts.worktree, {
-          appliedLsn: this.applied,
-          ...(readBaseLsn === undefined ? {} : { readBaseLsn }),
-        });
-        const note = result.conflicted.length === 0 ? "" : ` (conflicts in ${result.conflicted.join(", ")})`;
-        this.log(`applied #${changeset.lsn} ${changeset.intent}${note}`);
-        this.send({ type: "heartbeat", appliedLsn: this.applied });
-        this.opts.onApplied?.(changeset.lsn);
+        // On a gap, applyOne has dropped the queue and subscribed again; the replay that follows
+        // lands in the queue while this loop runs, so it just carries on.
+        await withWorktreeLock(this.opts.worktree, () => this.applyOne(changeset));
       }
     } catch (err) {
       const what = err instanceof GapError ? "gave up" : "apply failed";
@@ -155,6 +132,36 @@ export class StreamClient {
     } finally {
       this.draining = false;
     }
+  }
+
+  /** One entry, under the worktree lock. */
+  private async applyOne(changeset: Changeset): Promise<"skipped" | "gap" | "applied"> {
+    // `pitstop commit` runs in its own process and may have applied this very entry meanwhile.
+    const state = await readState(this.opts.worktree);
+    if (state.appliedLsn > this.applied) this.applied = state.appliedLsn;
+    if (changeset.lsn <= this.applied) return "skipped";
+    if (changeset.lsn !== this.applied + 1) {
+      this.opts.onGap?.(this.applied + 1, changeset.lsn);
+      if (++this.gaps >= GAP_RETRIES) throw new GapError(this.applied + 1, changeset.lsn);
+      this.log(`gap: expected #${this.applied + 1}, got #${changeset.lsn}; subscribing again`);
+      this.subscribe();
+      return "gap";
+    }
+    // Unfinished work in @ began at or before the current applied LSN: the server must check
+    // its reads from there, not from the LSN this entry moves the worktree to.
+    const readBaseLsn = state.readBaseLsn ?? ((await this.opts.applier.hasChanges()) ? this.applied : undefined);
+    const result = await this.opts.applier.apply(changeset);
+    this.gaps = 0;
+    this.applied = changeset.lsn;
+    await writeState(this.opts.worktree, {
+      appliedLsn: this.applied,
+      ...(readBaseLsn === undefined ? {} : { readBaseLsn }),
+    });
+    const note = result.conflicted.length === 0 ? "" : ` (conflicts in ${result.conflicted.join(", ")})`;
+    this.log(`applied #${changeset.lsn} ${changeset.intent}${note}`);
+    this.send({ type: "heartbeat", appliedLsn: this.applied });
+    this.opts.onApplied?.(changeset.lsn);
+    return "applied";
   }
 
   private log(line: string): void {

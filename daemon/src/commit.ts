@@ -2,7 +2,7 @@ import { randomBytes } from "node:crypto";
 import { basename } from "node:path";
 import { CommitResponse, type Author, type Changeset, type CommitRequest, type FileChange } from "@pitstop/protocol";
 import { blobHash, type Applier } from "./jj.js";
-import { readState, writeState } from "./state.js";
+import { readState, withWorktreeLock, writeState } from "./state.js";
 import { EMPTY_SETS, hasTsProject, symbolSets, type SymbolSets } from "./symbols.js";
 
 export interface CommitOptions {
@@ -51,17 +51,13 @@ export async function commit(opts: CommitOptions): Promise<Changeset> {
   const sets = await setsOf(opts);
   const readBaseLsn =
     state.readBaseLsn !== undefined && state.readBaseLsn < state.appliedLsn ? state.readBaseLsn : undefined;
-  return send(
-    opts,
-    {
-      baseLsn: state.appliedLsn,
-      ...(readBaseLsn === undefined ? {} : { readBaseLsn }),
-      intent: opts.intent,
-      files,
-      ...sets,
-    },
-    state.appliedLsn,
-  );
+  return send(opts, {
+    baseLsn: state.appliedLsn,
+    ...(readBaseLsn === undefined ? {} : { readBaseLsn }),
+    intent: opts.intent,
+    files,
+    ...sets,
+  });
 }
 
 /**
@@ -84,7 +80,7 @@ export async function importWorktree(opts: ImportOptions): Promise<Changeset> {
   }
   if (files.length === 0) throw new Error("nothing to import: the worktree has no text files");
   const intent = opts.intent ?? `import ${basename(opts.worktree)}`;
-  return send(opts, { baseLsn: 0, intent, files, ...EMPTY_SETS }, 0);
+  return send(opts, { baseLsn: 0, intent, files, ...EMPTY_SETS });
 }
 
 async function setsOf(opts: CommitOptions): Promise<SymbolSets> {
@@ -102,7 +98,7 @@ async function setsOf(opts: CommitOptions): Promise<SymbolSets> {
 
 type Body = Omit<CommitRequest, "idempotencyKey" | "author" | "intentId">;
 
-async function send(opts: Omit<CommitOptions, "intent">, body: Body, appliedLsn: number): Promise<Changeset> {
+async function send(opts: Omit<CommitOptions, "intent">, body: Body): Promise<Changeset> {
   const request: CommitRequest = {
     idempotencyKey: `${opts.author.agent}-${randomBytes(8).toString("hex")}`,
     author: opts.author,
@@ -122,16 +118,24 @@ async function send(opts: Omit<CommitOptions, "intent">, body: Body, appliedLsn:
     throw new CommitRejected(answer.data.reason, answer.data.message, answer.data.conflictsWith);
   }
   const changeset = answer.data.changeset;
-  // Either way the transaction is over, so the state drops readBaseLsn.
-  if (changeset.lsn === appliedLsn + 1) {
-    await opts.applier.apply(changeset);
-    await writeState(opts.worktree, { appliedLsn: changeset.lsn });
-    opts.log?.(`accepted as #${changeset.lsn}; main moved to it`);
-  } else {
-    await writeState(opts.worktree, { appliedLsn });
-    opts.log?.(
-      `accepted as #${changeset.lsn}; entries #${appliedLsn + 1}..#${changeset.lsn - 1} come first, the daemon applies them in order`,
-    );
-  }
+  // The server has already pushed the entry to the stream, so a running daemon may be applying it
+  // right now: take the lock and look at the state again. Either way the transaction is over, so
+  // the state drops readBaseLsn.
+  await withWorktreeLock(opts.worktree, async () => {
+    const now = await readState(opts.worktree);
+    if (now.appliedLsn >= changeset.lsn) {
+      await writeState(opts.worktree, { appliedLsn: now.appliedLsn });
+      opts.log?.(`accepted as #${changeset.lsn}; the daemon applied it`);
+    } else if (changeset.lsn === now.appliedLsn + 1) {
+      await opts.applier.apply(changeset);
+      await writeState(opts.worktree, { appliedLsn: changeset.lsn });
+      opts.log?.(`accepted as #${changeset.lsn}; main moved to it`);
+    } else {
+      await writeState(opts.worktree, { appliedLsn: now.appliedLsn });
+      opts.log?.(
+        `accepted as #${changeset.lsn}; entries #${now.appliedLsn + 1}..#${changeset.lsn - 1} come first, the daemon applies them in order`,
+      );
+    }
+  });
   return changeset;
 }

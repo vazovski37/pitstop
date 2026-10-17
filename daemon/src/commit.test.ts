@@ -1,11 +1,10 @@
-import { rm } from "node:fs/promises";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { CommitRequest, type Author } from "@pitstop/protocol";
 import { commit, CommitRejected, importWorktree } from "./commit.js";
 import { startFakeServer, type FakeServer } from "./fake-server.js";
 import { readState, writeState } from "./state.js";
 import type { Tree } from "./symbols.js";
-import { FakeApplier, fixtureCommitFiles, fixtureMessages, tempDir } from "./test-support.js";
+import { FakeApplier, fixtureCommitFiles, fixtureMessages, removeDir, tempDir } from "./test-support.js";
 
 const author: Author = { developer: "teammate", agent: "agent-b" };
 
@@ -23,7 +22,7 @@ describe("pitstop commit", () => {
   });
   afterEach(async () => {
     await server.close();
-    await rm(worktree, { recursive: true, force: true });
+    await removeDir(worktree);
   });
 
   const send = (intent = "Show last-seen time on ProfilePage", extra: Partial<Parameters<typeof commit>[0]> = {}) =>
@@ -61,6 +60,20 @@ describe("pitstop commit", () => {
     await writeState(worktree, { appliedLsn: 122, readBaseLsn: 120 });
     await send();
     expect(server.commits[0]).toMatchObject({ baseLsn: 122, readBaseLsn: 120 });
+    expect(await readState(worktree)).toEqual({ appliedLsn: 123 });
+  });
+
+  it("does not apply an entry the daemon applied while the server was answering", async () => {
+    await writeState(worktree, { appliedLsn: 122, readBaseLsn: 121 });
+    // The server pushes the entry before it answers: here the daemon wins the race.
+    const racing: typeof fetch = async (url, init) => {
+      const res = await fetch(url, init);
+      await writeState(worktree, { appliedLsn: 123, readBaseLsn: 121 });
+      return res;
+    };
+    const changeset = await send(undefined, { fetch: racing });
+    expect(changeset.lsn).toBe(123);
+    expect(applier.lsns).toEqual([]);
     expect(await readState(worktree)).toEqual({ appliedLsn: 123 });
   });
 
@@ -113,7 +126,7 @@ describe("pitstop import", () => {
   });
   afterEach(async () => {
     await server.close();
-    await rm(worktree, { recursive: true, force: true });
+    await removeDir(worktree);
   });
 
   it("sends every text file as an add at base LSN 0 and applies the first entry", async () => {
