@@ -13,7 +13,7 @@
 # Requirements: az CLI (logged in: `az login`), gh CLI (logged in: `gh auth login`), openssl.
 # Usage:
 #   GITHUB_REPO=owner/pitstop bash infra/bootstrap.sh
-# Optional: RG=pitstop-rg LOCATION=germanywestcentral PREFIX=pitstop
+# Optional: RG=pitstop-rg LOCATION=swedencentral PREFIX=pitstop
 
 set -euo pipefail
 # Stops Git Bash (MSYS) on Windows rewriting Azure IDs like /subscriptions/... into Windows paths.
@@ -23,7 +23,7 @@ az() { command az "$@" | tr -d '\r'; }
 
 : "${GITHUB_REPO:?Set GITHUB_REPO=owner/repo}"
 RG="${RG:-pitstop-rg}"
-LOCATION="${LOCATION:-germanywestcentral}"
+LOCATION="${LOCATION:-swedencentral}"
 PREFIX="${PREFIX:-pitstop}"
 APP_NAME="${APP_NAME:-pitstop-github-actions}"
 GH_ENV="production"
