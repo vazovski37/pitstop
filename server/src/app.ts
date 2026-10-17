@@ -24,7 +24,6 @@ import {
   SESSION_SECONDS,
   STATE_COOKIE,
   type AuthConfig,
-  type Identity,
   type OAuthProvider,
 } from "./auth.js";
 import { typecheckGate } from "./checks.js";
@@ -131,9 +130,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     app.addHook("onClose", async () => mirrors.stop());
   }
 
-  // Who is calling (auth.ts). Runs on the /stream upgrade request too. Fastify wants a null initial
-  // value for a reference-typed request property; the hook below sets it before any handler runs.
-  app.decorateRequest("identity", null as unknown as Identity);
+  // Who is calling (auth.ts): set on every request, the /stream upgrade included, before any handler runs.
   app.addHook("onRequest", async (req, reply) => {
     if (OPEN_ROUTES.has(req.routeOptions.url ?? "")) {
       req.identity = { kind: "anonymous" };
