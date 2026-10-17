@@ -9,6 +9,8 @@ export interface CommitOptions {
   /** The server's base URL, `http://` or `https://`. */
   serverUrl: string;
   token?: string;
+  /** The repository on the server; absent means its default one. */
+  repo?: string;
   worktree: string;
   applier: Applier;
   intent: string;
@@ -104,6 +106,7 @@ async function send(opts: Omit<CommitOptions, "intent">, body: Body): Promise<Ch
   const request: CommitRequest = {
     idempotencyKey: `${opts.author.agent}-${randomBytes(8).toString("hex")}`,
     author: opts.author,
+    ...(opts.repo === undefined ? {} : { repo: opts.repo }),
     ...(opts.intentId === undefined ? {} : { intentId: opts.intentId }),
     ...body,
   };

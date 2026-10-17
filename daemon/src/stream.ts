@@ -11,6 +11,8 @@ export interface StreamOptions {
   url: string;
   /** `PITSTOP_TOKEN`, sent as `Authorization: Bearer`. */
   token?: string;
+  /** The repository to follow; absent means the server's default one. */
+  repo?: string;
   worktree: string;
   applier: Applier;
   log?: (line: string) => void;
@@ -155,7 +157,7 @@ export class StreamClient {
 
   private subscribe(): void {
     this.queue = [];
-    this.send({ type: "subscribe", fromLsn: this.applied });
+    this.send({ type: "subscribe", ...(this.opts.repo === undefined ? {} : { repo: this.opts.repo }), fromLsn: this.applied });
   }
 
   private send(message: ClientMessage): void {

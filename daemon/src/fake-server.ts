@@ -18,9 +18,11 @@ import {
   DEFAULT_REPO,
   IntentRequest,
   ServerMessage,
+  RepoId,
   type Changeset,
   type CommitResponse,
   type Intent,
+  type Repo,
 } from "@pitstop/protocol";
 
 /** A scripted answer for the next `POST /commit`. */
@@ -51,6 +53,8 @@ export interface FakeServer {
   commits: CommitRequest[];
   /** Every intent opened through `POST /intents`, in order. */
   intents: Intent[];
+  /** Every repository created through `POST /repos`, in order (one log serves them all here). */
+  repos: Repo[];
   /** Appends an entry as if another worktree had committed it, and pushes it to subscribers. */
   append(changeset: Changeset): void;
   /** Makes the next `POST /commit` answer `rejected` with this, like the validator or repair would. */
@@ -74,6 +78,7 @@ export async function startFakeServer(opts: FakeServerOptions = {}): Promise<Fak
   const received: ClientMessage[] = [];
   const commits: CommitRequest[] = [];
   const intents: Intent[] = [];
+  const repos: Repo[] = [];
   const subscribers = new Map<WebSocket, { lastSentLsn: number | null }>();
   let dropped = false;
   let rejectNext: Rejection | undefined;
@@ -164,6 +169,15 @@ export async function startFakeServer(opts: FakeServerOptions = {}): Promise<Fak
       for (const socket of subscribers.keys()) sendTo(socket, { type: "intent", intent });
       return json(res, 201, intent);
     }
+    if (req.method === "POST" && req.url === "/repos") {
+      const id = RepoId.safeParse((await readJson(req) as { id?: unknown } | undefined)?.id);
+      if (!id.success) return json(res, 400, { error: "invalid_request", message: "expected owner/name in lowercase" });
+      const existing = repos.find((r) => r.id === id.data);
+      if (existing) return json(res, 200, { ...existing, headLsn: headLsn() });
+      const repo: Repo = { id: id.data, headLsn: headLsn(), createdAt: new Date().toISOString() };
+      repos.push(repo);
+      return json(res, 201, repo);
+    }
     if (req.method === "GET" && req.url?.startsWith("/log")) {
       const query = new URL(req.url, "http://fake").searchParams;
       const fromLsn = Number(query.get("fromLsn") ?? 0);
@@ -208,6 +222,7 @@ export async function startFakeServer(opts: FakeServerOptions = {}): Promise<Fak
     received,
     commits,
     intents,
+    repos,
     append,
     rejectNextCommit: (rejection) => {
       rejectNext = rejection;

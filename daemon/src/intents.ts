@@ -5,6 +5,8 @@ import { readState, writeState } from "./state.js";
 export interface IntentOptions {
   serverUrl: string;
   token?: string;
+  /** The repository on the server; absent means its default one. */
+  repo?: string;
   worktree: string;
   author: Author;
   text: string;
@@ -22,6 +24,7 @@ export interface IntentOptions {
 export async function declareIntent(opts: IntentOptions): Promise<Intent> {
   const state = await readState(opts.worktree);
   const request: IntentRequest = {
+    ...(opts.repo === undefined ? {} : { repo: opts.repo }),
     author: opts.author,
     baseLsn: state.appliedLsn,
     text: opts.text,

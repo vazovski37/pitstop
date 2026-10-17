@@ -53,6 +53,8 @@ export async function readDaemonInfo(worktree: string): Promise<DaemonInfo | und
 export interface DaemonOptions {
   serverUrl: string;
   token?: string;
+  /** The repository on the server; absent means its default one. */
+  repo?: string;
   worktree: string;
   applier: Applier;
   author: Author;
@@ -84,6 +86,7 @@ export interface Status {
   intent: { id: string; text: string } | null;
   openIntents: { id: string; agent: string; text: string }[];
   worktree: string;
+  repo: string | null;
   pid: number;
 }
 
@@ -103,6 +106,7 @@ export class Daemon {
     this.stream = new StreamClient({
       url: streamUrl(opts.serverUrl),
       ...(opts.token === undefined ? {} : { token: opts.token }),
+      ...(opts.repo === undefined ? {} : { repo: opts.repo }),
       worktree: opts.worktree,
       applier: opts.applier,
       ...(opts.log === undefined ? {} : { log: opts.log }),
@@ -167,6 +171,7 @@ export class Daemon {
       intent,
       openIntents: [...this.intents.values()].map((i) => ({ id: i.id, agent: i.author.agent, text: i.text })),
       worktree: this.opts.worktree,
+      repo: this.opts.repo ?? null,
       pid: process.pid,
     };
   }
@@ -175,6 +180,7 @@ export class Daemon {
     const intent = await declareIntent({
       serverUrl: this.opts.serverUrl,
       ...(this.opts.token === undefined ? {} : { token: this.opts.token }),
+      ...(this.opts.repo === undefined ? {} : { repo: this.opts.repo }),
       worktree: this.opts.worktree,
       author: this.opts.author,
       text,
@@ -192,6 +198,7 @@ export class Daemon {
       const changeset = await commit({
         serverUrl: this.opts.serverUrl,
         ...(this.opts.token === undefined ? {} : { token: this.opts.token }),
+        ...(this.opts.repo === undefined ? {} : { repo: this.opts.repo }),
         worktree: this.opts.worktree,
         applier: this.opts.applier,
         intent,
@@ -212,6 +219,7 @@ export class Daemon {
   /** The log from the server, oldest first. */
   async log(limit = 500): Promise<Changeset[]> {
     const url = new URL("/log", this.opts.serverUrl);
+    if (this.opts.repo !== undefined) url.searchParams.set("repo", this.opts.repo);
     url.searchParams.set("fromLsn", "0");
     url.searchParams.set("limit", String(limit));
     const res = await (this.opts.fetch ?? fetch)(url, { headers: serverHeaders(this.opts.token) });
