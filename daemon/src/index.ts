@@ -2,6 +2,8 @@
 /**
  * Local daemon: one per worktree (design doc sections 6.3, 8 and 10).
  *
+ *   pitstop clone <server-url> <owner/name> [dir] [--token t]
+ *                                        a fresh worktree of a repository on the server, built from its log
  *   pitstop init <server-url> [--repo owner/name] [--token t] [--no-import]
  *                                        remember the server, create the repository, import the worktree
  *   pitstop daemon                       keep this worktree in sync with the server's log; local API for the agent side
@@ -15,6 +17,8 @@
  */
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
+import { resolve as resolvePath } from "node:path";
+import { cloneRepository } from "./clone.js";
 import { commit, CommitRejected, importWorktree } from "./commit.js";
 import { loadConfig, type Config } from "./config.js";
 import { Daemon } from "./daemon.js";
@@ -24,6 +28,7 @@ import { binariesFromEnv, JjWorktree } from "./jj.js";
 import { LocalClient } from "./local-client.js";
 
 export { describe } from "./messages.js";
+export { cloneRepository } from "./clone.js";
 export { commit, CommitRejected, importWorktree } from "./commit.js";
 export { configFrom, configFromEnv, loadConfig, readFileConfig, streamUrl, writeFileConfig, type Config } from "./config.js";
 export { Daemon, readDaemonInfo, type SafePointResult, type Status } from "./daemon.js";
@@ -36,6 +41,7 @@ export { readState, writeState } from "./state.js";
 export { symbolSets, type SymbolSets, type Tree } from "./symbols.js";
 
 const USAGE = `usage:
+  pitstop clone <server-url> <owner/name> [dir] [--token t]
   pitstop init <server-url> [--repo owner/name] [--token t] [--no-import]
   pitstop daemon                       sync this worktree with the server's log
   pitstop commit -m "<intent>"         commit the unfinished work in @
@@ -62,6 +68,28 @@ export async function main(argv: string[], config?: Config): Promise<number> {
     author: cfg.author,
     log,
   };
+
+  if (command === "clone") {
+    const token = flag(rest, "--token") ?? cfg.token;
+    const positional = rest.filter((a, i) => !a.startsWith("--") && rest[i - 1] !== "--token");
+    const [serverUrl, repo, dir] = positional;
+    if (serverUrl === undefined || repo === undefined || !repo.includes("/")) {
+      console.error(USAGE);
+      return 2;
+    }
+    const target = resolvePath(dir ?? repo.split("/")[1] ?? repo);
+    const result = await cloneRepository({
+      serverUrl,
+      ...(token === undefined ? {} : { token }),
+      repo,
+      dir: target,
+      author: cfg.author,
+      bin: binariesFromEnv(),
+      log,
+    });
+    log(`cloned ${result.repo.id} (${result.entries} entries) into ${result.dir}`);
+    return 0;
+  }
 
   if (command === "init") {
     const serverUrl = rest.find((a) => !a.startsWith("-") && a !== flag(rest, "--repo") && a !== flag(rest, "--token"));
@@ -169,7 +197,11 @@ if (isMain) {
     },
     (err: unknown) => {
       console.error(`[pitstop] ${err instanceof Error ? err.message : String(err)}`);
-      process.exit(1); // not exitCode: a stream socket or server would keep the process alive
+      process.exitCode = 1;
+      // Exit naturally once nothing holds the loop; a stream socket or server left half-started
+      // would keep the process alive, so force it after a moment (an immediate exit trips a libuv
+      // assertion on Windows while a request handle is still closing).
+      setTimeout(() => process.exit(1), 2_000).unref();
     },
   );
 }
