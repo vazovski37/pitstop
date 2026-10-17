@@ -5,14 +5,16 @@ Version control where the codebase is treated as a database: one server keeps an
 Full design: the technical design doc (written when the project was called Agent Git), a Claude doc. Sections are referenced by number in the folder `CLAUDE.md` files.
 
 ## Who owns what
-| Folder | Owner |
+Since 18 October 2026 Vazovski works alone and owns every folder. The table records how the work was split while two developers built it (the teammate, `lbala23`, built `daemon/` and `mcp/` through Phase 4); it no longer restricts anything.
+
+| Folder | Built by |
 | --- | --- |
 | `packages/protocol` | Both, changed only together |
 | `server/`, `infra/`, `.github/`, `web/` | Vazovski |
-| `daemon/`, `mcp/`, `server/semantic/` | Teammate |
+| `daemon/`, `mcp/` | Teammate (until 18 October 2026), now Vazovski |
 | `demo/` | Both |
 
-**Rule for Claude:** edit only files in folders your developer owns. If a change is needed elsewhere, stop and describe it instead. Read the `CLAUDE.md` in a folder before editing it.
+**Rule for Claude:** read the `CLAUDE.md` in a folder before editing it; `daemon/` and `mcp/` carry conventions (the jj apply sequence, Windows gotchas, tool output rules) that are easy to break. Keep `daemon/README.md` in step with the daemon's CLI.
 
 ## Rules
 - Every message between server and daemon is defined in `@pitstop/protocol`. Never redefine a shape locally.

@@ -1,9 +1,9 @@
 # server/ — log, validator, AI repair
 
-Owner: **Vazovski**. Teammate's Claude does not edit this folder (except `server/semantic/`, which the teammate owns).
+Owner: **Vazovski** (since 18 October 2026, every folder is; `server/semantic/` was going to be the teammate's and does not exist).
 
 ## What this folder does
-The single source of truth: the write-ahead log, the commit API, the WebSocket stream, the commit validator, structural merge, AI repair and constraint checks. Design reference: the technical design doc (written when the project was called Agent Git), sections 4 to 7 and 11.
+The single source of truth: the write-ahead log, the commit API, the WebSocket stream, the commit validator, AI repair and the type-check gate. Structural merge (jj + Mergiraf) happens in the daemon (`daemon/src/jj.ts`), never here: a write-write conflict is `rejected constraint_failed` and the daemon rebases. Design reference: the technical design doc (written when the project was called Agent Git), sections 4 to 7 and 11.
 
 ## Rules
 - Every message in or out matches a schema in `@pitstop/protocol`. Validate input with `CommitRequest.parse(...)` etc. Never invent a field locally.
@@ -44,4 +44,4 @@ The stream keeps subscribers in memory, so the Container App runs exactly one re
 - `npm test` (repo root): unit tests; migration tests run when `DATABASE_URL` is set.
 
 ## Phases owned here
-1: `POST /commit` fast path + stream. 2: Azure. 4: validator, Mergiraf, AI repair, type-check gate. 5: one ADR rule, early warnings, git mirror.
+1: `POST /commit` fast path + stream. 2: Azure. 4: validator, AI repair, type-check gate (Mergiraf is the daemon's, `daemon/src/jj.ts`). 5: early warnings, git mirror, accounts, the live view. The ADR rule is cut unless time remains: `checks.adr` is always `skipped` (`SKIPPED_CHECKS` in `src/store.ts`); the `adrs` table from migration 001 stays, applied migrations are never edited.

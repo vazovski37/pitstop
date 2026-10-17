@@ -109,6 +109,16 @@ To see what is running in Azure: Actions → latest `Deploy` run → the `produc
 ## The live view
 The server's root URL (`http://localhost:8080/` on a laptop, the Container App's URL on Azure) is the page the judges watch: the log as it grows, open intents, repairs and warnings as they happen. It is built from `web/` into the server image, so it deploys with the server. On a server with `PITSTOP_TOKEN` set, paste that token into the field at the top right once; with accounts on, sign in with GitHub instead. Locally, `npm run build -w @pitstop/web` once, then `npm run dev:server` serves it.
 
+## Joining the hosted service
+Pitstop is a hosted service: one server, run by us on Azure, that any team signs in to. Nobody installs a server; developers install only the client (the daemon and the agent tools, `daemon/README.md`). Joining, once accounts are on (see "Accounts" below):
+
+1. Open the server's URL in a browser and sign in with GitHub.
+2. Create a personal token on the page (it starts with `pst_` and is shown once) and keep it in `PITSTOP_TOKEN` on your machine.
+3. In a checkout of your repository: `pitstop init <server-url> --repo <owner>/<name>` creates the repository on the server and imports the checkout as the log's first entry; your teammates build their worktrees from the log with `pitstop clone <server-url> <owner>/<name>`.
+4. Add them as members of the repository (`PUT /repos/<owner>/<name>/members/<login>`; a page for it is on the plan) and start the daemon; everything else is in the guide.
+
+The local stack (`npm run dev:server`, `docker compose up --build`) exists for developing Pitstop itself, not as a way to run it.
+
 ## Later
 
 **Server token (Phase 2)**
@@ -144,11 +154,11 @@ curl -X PUT "$SERVER/repos/<owner>/<name>/mirror" -H "authorization: Bearer $PIT
 
 **AI repair (Phase 4)**
 
-Write skew is resolved by whoever `PITSTOP_REPAIR` names. The default, `agent`, needs nothing: the coding agent that committed is told what changed and commits again. For the server to repair with a model, get a free key at console.groq.com and store it:
+Write skew is resolved by whoever `PITSTOP_REPAIR` names. Unset, it is `off`: the validator alone handles skew (`PITSTOP_VALIDATE`, `warn` by default, lands it with a warning). `.env.example` and `infra/main.bicep` set `agent`, which needs nothing: the coding agent that committed is told what changed and commits again; that is what a laptop with `.env` and the Azure server run. For the server to repair with a model, get a free key at console.groq.com and store it:
 ```bash
 gh secret set GROQ_API_KEY --repo <you>/pitstop
 ```
-Then run **Provision infrastructure** with `repairMode=groq` (edit the default in `infra/main.bicep`, or pass it when running the deployment by hand). Locally, set `PITSTOP_REPAIR=groq` and `GROQ_API_KEY` in `.env`. Your Claude Max plan covers Claude Code on the laptops; the server's own model calls go to Groq.
+Then change the `repairMode` default in `infra/main.bicep` from `'agent'` to `'groq'` (and `groqModel` there for another model) and merge it to `main`: that push runs **Provision infrastructure**, which is the only way the mode reaches Azure. The workflow passes no `repairMode` of its own and takes no inputs when run by hand, a plain **Deploy** keeps whatever the last Provision set, and laptops never run `az deployment` (`CLAUDE.md`). Locally, set `PITSTOP_REPAIR=groq` and `GROQ_API_KEY` in `.env`. Your Claude Max plan covers Claude Code on the laptops; the server's own model calls go to Groq.
 
 **Live view (Phase 5)**
 Add a second Container App or an Azure Static Web App in `infra/main.bicep`, and a deploy job for `web/` in `deploy.yml`.

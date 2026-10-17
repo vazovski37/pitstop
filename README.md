@@ -8,14 +8,17 @@ Version control for teams where agents write the code. The codebase is treated a
 
 ## Layout
 
-| Folder | What | Owner |
-| --- | --- | --- |
-| `packages/protocol` | Shared message schemas and fixtures: the contract | Both |
-| `server/` | Log, commit API, stream, validator, AI repair | Vazovski |
-| `infra/`, `.github/` | Azure (Bicep), bootstrap, CI/CD | Vazovski |
-| `daemon/` | Local replica: stream, jj, read/write sets | Teammate |
-| `mcp/` | Agent tools and safe-point hook | Teammate |
-| `web/` | Live view | Teammate |
+| Folder | What |
+| --- | --- |
+| `packages/protocol` | Shared message schemas and fixtures: the contract |
+| `server/` | Log, commit API, stream, validator, AI repair |
+| `infra/`, `.github/` | Azure (Bicep), bootstrap, CI/CD |
+| `daemon/` | Local replica: stream, jj, read/write sets, the `pitstop` CLI ([guide for other teams](daemon/README.md)) |
+| `mcp/` | Agent tools and safe-point hook |
+| `web/` | Live view, served by the server at `/` |
+| `demo/` | The demo slice, the scenario, the gates and the rehearsal |
+
+Built by two developers until 18 October 2026 (see [CLAUDE.md](CLAUDE.md)); maintained by Vazovski since.
 
 ## Quick start
 ```bash

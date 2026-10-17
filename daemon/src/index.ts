@@ -17,10 +17,9 @@
  */
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
-import { resolve as resolvePath } from "node:path";
 import { cloneRepository } from "./clone.js";
 import { commit, CommitRejected, importWorktree } from "./commit.js";
-import { loadConfig, type Config } from "./config.js";
+import { configFromEnv, loadConfig, type Config } from "./config.js";
 import { Daemon } from "./daemon.js";
 import { init } from "./init.js";
 import { declareIntent } from "./intents.js";
@@ -70,20 +69,21 @@ export async function main(argv: string[], config?: Config): Promise<number> {
   };
 
   if (command === "clone") {
-    const token = flag(rest, "--token") ?? cfg.token;
+    // The flag or the environment only: the cwd's .pitstop/config.json belongs to another checkout,
+    // possibly of another server, and its token must not be sent to the one named here.
+    const token = flag(rest, "--token") ?? (config === undefined ? configFromEnv().token : config.token);
     const positional = rest.filter((a, i) => !a.startsWith("--") && rest[i - 1] !== "--token");
     const [serverUrl, repo, dir] = positional;
     if (serverUrl === undefined || repo === undefined || !repo.includes("/")) {
       console.error(USAGE);
       return 2;
     }
-    const target = resolvePath(dir ?? repo.split("/")[1] ?? repo);
+    const target = resolve(dir ?? repo.split("/")[1] ?? repo);
     const result = await cloneRepository({
       serverUrl,
       ...(token === undefined ? {} : { token }),
       repo,
       dir: target,
-      author: cfg.author,
       bin: binariesFromEnv(),
       log,
     });

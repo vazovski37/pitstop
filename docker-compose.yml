@@ -27,6 +27,14 @@ services:
     environment:
       DATABASE_URL: postgresql://pitstop:pitstop@db:5432/pitstop
       PORT: "8080"
+      # The rest comes from .env next to this file (for developing Pitstop itself); empty means off/open.
+      PITSTOP_TOKEN: ${PITSTOP_TOKEN:-}
+      PITSTOP_REPAIR: ${PITSTOP_REPAIR:-}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      GROQ_MODEL: ${GROQ_MODEL:-}
+      PITSTOP_VALIDATE: ${PITSTOP_VALIDATE:-}
+      PITSTOP_CHECK: ${PITSTOP_CHECK:-}
+      MIRROR_GITHUB_TOKEN: ${MIRROR_GITHUB_TOKEN:-}
     ports:
       - "8080:8080"
     depends_on:

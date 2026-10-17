@@ -1,6 +1,6 @@
 # web/ — live view
 
-Owner: **Vazovski** (moved from the teammate in the build plan, Phase 5). Teammate's Claude does not edit this folder.
+Owner: **Vazovski** (since 18 October 2026, every folder is).
 
 ## What it shows (the screen judges look at during the demo)
 - The log, newest first: LSN, agent, intent, files, checks; repairs highlighted, with the repair's summary under the entry.

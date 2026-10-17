@@ -8,7 +8,7 @@
  */
 import { mkdir, readdir } from "node:fs/promises";
 import { z } from "zod";
-import { Changeset, DEFAULT_REPO, Repo, type Author } from "@pitstop/protocol";
+import { Changeset, DEFAULT_REPO, Repo } from "@pitstop/protocol";
 import { serverHeaders, writeFileConfig } from "./config.js";
 import { run } from "./exec.js";
 import { binariesFromEnv, JjWorktree, type Applier, type Binaries } from "./jj.js";
@@ -23,7 +23,6 @@ export interface CloneOptions {
   repo: string;
   /** The directory to create; it must not exist or must be empty. */
   dir: string;
-  author: Author;
   bin?: Binaries;
   fetch?: typeof fetch;
   log?: (line: string) => void;
