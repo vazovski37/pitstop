@@ -2,26 +2,30 @@
  * `pitstop setup <server-url> <owner/name> [--token t] [--dir d] [--agent name]`: one command from
  * "Node, git and jj are installed" to "Claude Code can work here":
  *   a. checks Node 22+, git and jj (with install hints), and jj's identity (taken from git when missing);
- *   b. asks the server for the repository: an empty log is filled from the git checkout here
- *      (`jj git init --colocate` when needed, then init.ts's import); a log with entries is cloned
- *      (clone.ts) into --dir or ./<name>; a checkout already set up for it is reused;
- *   c. wires Claude Code there by command name (wire.ts) and records the agent's name;
- *   d. starts the daemon in the background (processes.ts) and says where everything is.
+ *   b. asks the server for the repository: an empty log is filled from the git checkout here, as
+ *      `main` holds it (`jj git init --colocate` when needed, then init.ts's import), and only from
+ *      a checkout with nothing uncommitted that is no checkout of another repository; a log with
+ *      entries is cloned (clone.ts) into --dir or ./<name>; a checkout already set up for it is reused;
+ *   c. wires Claude Code there by command name (wire.ts), leaving files git tracks alone, and
+ *      records the agent's name;
+ *   d. starts the daemon in the background (processes.ts), restarting a running one whose settings
+ *      changed, and says where everything is.
  * The token comes from --token or PITSTOP_TOKEN only, never from the cwd's .pitstop/config.json,
  * which may belong to another checkout of another server.
  */
 import { existsSync } from "node:fs";
+import { utimes } from "node:fs/promises";
 import { userInfo } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { RepoId, Repo, type Author } from "@pitstop/protocol";
 import { cloneRepository, defaultHooks as defaultCloneHooks, type CloneHooks } from "./clone.js";
-import { readFileConfig, serverHeaders, writeFileConfig } from "./config.js";
+import { findWorktree, readFileConfig, serverHeaders, writeFileConfig, type FileConfig } from "./config.js";
 import { run } from "./exec.js";
-import { init } from "./init.js";
-import { binariesFromEnv, JjWorktree, type Applier, type Binaries } from "./jj.js";
-import { startDaemon, type Started } from "./processes.js";
+import { init, OtherCheckout } from "./init.js";
+import { binariesFromEnv, eolConversionFor, JjWorktree, jjInitColocated, type Applier, type Binaries } from "./jj.js";
+import { startDaemon, stopDaemon, type Started } from "./processes.js";
 import { readState } from "./state.js";
-import { excludeFromGit, trackedWiring, wireClaudeCode, WIRING_EXCLUDES } from "./wire.js";
+import { excludeFromGit, SHARED_SETTINGS, trackedWiring, wireClaudeCode, WIRING_EXCLUDES, WIRING_FILES } from "./wire.js";
 
 /** Setup cannot go on until the user does something; the message says what. */
 export class SetupStopped extends Error {}
@@ -40,6 +44,8 @@ export interface SetupHooks {
   clone: CloneHooks;
   applierFor: (dir: string, bin: Binaries) => Applier;
   start: (dir: string, env: NodeJS.ProcessEnv) => Promise<Started>;
+  /** Stops the daemon running in `dir`: its pid, or undefined when none was running. */
+  stop: (dir: string) => Promise<number | undefined>;
 }
 
 export const defaultSetupHooks: SetupHooks = {
@@ -47,6 +53,7 @@ export const defaultSetupHooks: SetupHooks = {
   clone: defaultCloneHooks,
   applierFor: (dir, bin) => new JjWorktree(dir, bin),
   start: (dir, env) => startDaemon(dir, { env }),
+  stop: (dir) => stopDaemon(dir),
 };
 
 export interface SetupOptions {
@@ -74,8 +81,10 @@ export interface SetupResult {
   appliedLsn: number;
   agent: string;
   daemon: Started;
-  /** Wiring files git tracks in this checkout: changes to them would be committed. */
+  /** Wiring files git tracks in this checkout: setup left them as they are. */
   tracked: string[];
+  /** What the user still has to do by hand, one line each (e.g. register the MCP server when the team tracks .mcp.json). */
+  todo: string[];
 }
 
 const HINTS: Record<"jj" | "git", Partial<Record<NodeJS.Platform, string>> & { other: string }> = {
@@ -98,6 +107,8 @@ const output = (bin: string, args: string[], cwd: string): Promise<string | unde
     (out) => out.trim(),
     () => undefined,
   );
+
+const trimUrl = (url: string) => url.replace(/\/+$/, "");
 
 /** (a) Node 22+, git and jj runnable, and jj knowing who the user is. */
 export async function checkTools({ bin, cwd, platform, nodeVersion, log }: ToolCheck): Promise<void> {
@@ -144,7 +155,12 @@ export async function findRepository(serverUrl: string, id: string, token: strin
   } catch (err) {
     throw new SetupStopped(`cannot reach ${serverUrl}: ${err instanceof Error ? err.message : String(err)}`);
   }
-  if (res.status === 404) throw new SetupStopped(`there is no repository ${id} on ${serverUrl}. Create it on the website (${serverUrl}), then run setup again.`);
+  // The server answers 404 as well for a repository the token may not read, so strangers cannot learn names.
+  if (res.status === 404) {
+    throw new SetupStopped(
+      `${serverUrl} has no repository ${id} that this token can read: check the name, and that the repository's owner has added your GitHub login as a member (or create it on the website if it is new).`,
+    );
+  }
   if (res.status === 401 || res.status === 403) {
     throw new SetupStopped(
       `${serverUrl} answered ${res.status} for ${id}: ${token === undefined ? "pass a token with --token or PITSTOP_TOKEN" : "check the token; with accounts on, the repository's owner adds you as a member"}.`,
@@ -167,8 +183,42 @@ const warnLongPath = (dir: string, platform: NodeJS.Platform, log: (line: string
 const isPitstopCheckoutOf = async (dir: string, repo: string, serverUrl: string): Promise<boolean> => {
   if (!existsSync(join(dir, ".pitstop", "config.json"))) return false;
   const file = await readFileConfig(dir);
-  return file.repo === repo && file.serverUrl?.replace(/\/+$/, "") === serverUrl;
+  return file.repo === repo && file.serverUrl !== undefined && trimUrl(file.serverUrl) === serverUrl;
 };
+
+/** Whether a running daemon set up from `before` would act on something else than setup is about to write. */
+const settingsChanged = (before: FileConfig, after: { serverUrl: string; repo: string; token: string | undefined; agent: string }): boolean =>
+  before.serverUrl === undefined ||
+  trimUrl(before.serverUrl) !== after.serverUrl ||
+  before.repo !== after.repo ||
+  (after.token !== undefined && before.token !== after.token) ||
+  before.agent !== after.agent;
+
+const isWiring = (path: string) => WIRING_FILES.includes(path);
+
+/** Paths `git status` reports in `top`: modified, staged, deleted or untracked (not ignored). */
+async function gitChanges(top: string, bin: Binaries): Promise<string[]> {
+  const out = await run(bin.git, ["status", "--porcelain=v1", "-z", "--untracked-files=all"], { cwd: top });
+  const fields = out.split("\0");
+  const paths: string[] = [];
+  for (let i = 0; i < fields.length; i++) {
+    const entry = fields[i] ?? "";
+    if (entry.length < 4) continue;
+    paths.push(entry.slice(3));
+    if (entry[0] === "R" || entry[0] === "C") i++; // the next field is where it came from
+  }
+  return paths;
+}
+
+/** Paths that differ between `main` and jj's working copy `@` in `top`. */
+async function jjChanges(top: string, bin: Binaries): Promise<string[]> {
+  const out = await run(bin.jj, ["diff", "--summary", "--from", "main", "--to", "@"], { cwd: top });
+  return out
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0)
+    .map((l) => l.replace(/^[A-Z] /, "").replace(/\\/g, "/"));
+}
 
 export async function setup(opts: SetupOptions): Promise<SetupResult> {
   const log = opts.log ?? (() => undefined);
@@ -178,7 +228,7 @@ export async function setup(opts: SetupOptions): Promise<SetupResult> {
   const platform = opts.platform ?? process.platform;
   const hooks: SetupHooks = { ...defaultSetupHooks, ...opts.hooks };
   const fetchImpl = opts.fetch ?? fetch;
-  const serverUrl = opts.serverUrl.replace(/\/+$/, "");
+  const serverUrl = trimUrl(opts.serverUrl);
   if (!/^https?:\/\/[^/]/.test(serverUrl)) throw new SetupStopped(`the server is a URL like https://pitstop.example.com (got ${opts.serverUrl})`);
   const id = RepoId.safeParse(opts.repo.toLowerCase());
   if (!id.success) throw new SetupStopped(`a repository is owner/name, like myteam/my-repo (got ${opts.repo})`);
@@ -208,6 +258,12 @@ export async function setup(opts: SetupOptions): Promise<SetupResult> {
   const agent = opts.agent ?? previous?.agent ?? defaultAgent();
   const author: Author = { developer: env.PITSTOP_DEVELOPER ?? userInfo().username, agent };
 
+  /** A stop for a directory that is a Pitstop checkout of something else. */
+  const otherCheckout = (dir: string, file: FileConfig) =>
+    new SetupStopped(
+      `${dir} is already a Pitstop checkout of ${file.repo ?? "the default repository"} on ${file.serverUrl ?? "a server"}; run setup for ${repo.id} on ${serverUrl} from a directory outside it.`,
+    );
+
   let dir: string;
   let how: SetupResult["how"];
   if (existing !== undefined && repo.headLsn > 0) {
@@ -219,6 +275,9 @@ export async function setup(opts: SetupOptions): Promise<SetupResult> {
     how = "imported";
   } else {
     dir = resolve(cwd, opts.dir ?? name);
+    // Not inside another checkout unless asked: its jj would see the clone's files as its own work.
+    const around = opts.dir === undefined ? findWorktree(cwd) : undefined;
+    if (around !== undefined) throw otherCheckout(around, await readFileConfig(around));
     warnLongPath(dir, platform, log);
     // clone.ts speaks to someone who runs `pitstop daemon` next; setup starts it below.
     const cloneLog = (line: string) => {
@@ -235,12 +294,22 @@ export async function setup(opts: SetupOptions): Promise<SetupResult> {
         `${repo.id} has no entries yet, and ${start} is not a git checkout. Run setup inside the git checkout whose files should become the repository's first entry.`,
       );
     }
+    // A checkout of another repository or server stays one: its config, state and daemon belong to that log.
+    const configured = await readFileConfig(top);
+    if (configured.serverUrl !== undefined && (configured.repo !== repo.id || trimUrl(configured.serverUrl) !== serverUrl)) {
+      throw otherCheckout(top, configured);
+    }
+    const { appliedLsn } = await readState(top);
+    if (appliedLsn > 0) {
+      throw new SetupStopped(
+        `${top} has applied #${appliedLsn} of ${repo.id} already, but ${repo.id} on ${serverUrl} has no entries (was the server reset?). Import from a fresh git checkout of these files instead, one without .pitstop/ and .jj/.`,
+      );
+    }
     const files = (await output(bin.git, ["ls-files", "--cached", "--others", "--exclude-standard"], top)) ?? "";
     if (files === "") throw new SetupStopped(`${repo.id} has no entries yet, and ${top} has no files to import.`);
     warnLongPath(top, platform, log);
-    // Before jj's first snapshot: an excluded file never enters `@`, so the import does not carry it.
-    await excludeFromGit(top, WIRING_EXCLUDES, bin);
-    if (!existsSync(join(top, ".jj"))) {
+    const hasJj = existsSync(join(top, ".jj"));
+    if (!hasJj) {
       const branch = (await output(bin.git, ["symbolic-ref", "--short", "-q", "HEAD"], top)) ?? "";
       if (branch === "") throw new SetupStopped(`${top} has no branch checked out (detached HEAD). Check out main (git switch main), then run setup again.`);
       if (branch !== "main") {
@@ -248,37 +317,93 @@ export async function setup(opts: SetupOptions): Promise<SetupResult> {
           `${top} is on branch ${branch}; Pitstop follows a branch named main. Rename it with \`git branch -m ${branch} main\` (a GitHub remote renames its default branch under Settings > Branches), then run setup again.`,
         );
       }
-      if ((await output(bin.git, ["rev-parse", "--verify", "-q", "refs/heads/main"], top)) === undefined) {
-        throw new SetupStopped(`main in ${top} has no commit yet. Make one (git add -A, then git commit -m "first commit"), then run setup again.`);
-      }
-      await run(bin.jj, ["git", "init", "--colocate"], { cwd: top });
-      log(`jj git init --colocate in ${top}`);
-    } else if ((await output(bin.git, ["rev-parse", "--verify", "-q", "refs/heads/main"], top)) === undefined) {
-      throw new SetupStopped(`${top} has no branch named main, which Pitstop follows. Create or rename one, then run setup again.`);
     }
-    const result = await init({
-      serverUrl,
-      ...(token === undefined ? {} : { token }),
-      repo: repo.id,
-      worktree: top,
-      applier: hooks.applierFor(top, bin),
-      author,
-      fetch: fetchImpl,
-      log,
-    });
+    if ((await output(bin.git, ["rev-parse", "--verify", "-q", "refs/heads/main"], top)) === undefined) {
+      throw new SetupStopped(
+        hasJj
+          ? `${top} has no branch named main, which Pitstop follows. Create or rename one, then run setup again.`
+          : `main in ${top} has no commit yet. Make one (git add -A, then git commit -m "first commit"), then run setup again.`,
+      );
+    }
+
+    // The first entry is what main holds. Anything else here (edits, untracked files, secrets
+    // among them) jj would carry into the agent's first commit, and the log keeps it forever.
+    let eolNote = "";
+    if (hasJj) {
+      // A jj that never converted line endings holds CRLF where git holds LF: set it as git has
+      // it, and touch what differs so jj reads it again; line endings alone then stop counting.
+      const eol = await eolConversionFor(top, bin);
+      if (eol !== undefined && (await output(bin.jj, ["config", "get", "working-copy.eol-conversion"], top)) !== eol) {
+        await run(bin.jj, ["config", "set", "--repo", "working-copy.eol-conversion", eol], { cwd: top });
+        log(`set jj's working-copy.eol-conversion to ${eol} in ${top}, as git converts line endings here`);
+        const now = new Date();
+        for (const path of await jjChanges(top, bin)) await utimes(join(top, path), now, now).catch(() => undefined);
+        eolNote = " (line endings alone do not count)";
+      }
+    }
+    const changed = (hasJj ? await jjChanges(top, bin) : await gitChanges(top, bin)).filter((p) => !isWiring(p));
+    if (changed.length > 0) {
+      const shown = changed.slice(0, 20).map((p) => `  ${p}`);
+      if (changed.length > shown.length) shown.push(`  … and ${changed.length - shown.length} more`);
+      throw new SetupStopped(
+        [
+          `${top} has changes that are not committed to main${eolNote}; the repository's first entry is main as it is, and Pitstop would carry these into the agent's first commit:`,
+          ...shown,
+          `Commit them, add them to .gitignore, or ${hasJj ? "move them off the working copy (`jj new main` keeps them in a change of their own)" : "stash them (git stash -u)"}, then run setup again.`,
+        ].join("\n"),
+      );
+    }
+
+    // Before jj's first snapshot (and only once the checks passed): an excluded file never enters `@`.
+    await excludeFromGit(top, WIRING_EXCLUDES, bin);
+    if (!hasJj) {
+      const eol = await jjInitColocated(top, bin);
+      log(`jj git init --colocate in ${top}${eol === undefined ? "" : ` (working-copy.eol-conversion ${eol}, as git converts line endings here)`}`);
+    } else {
+      // Wiring an earlier jj snapshotted, before it was excluded, leaves @ now.
+      const snapped = (await jjChanges(top, bin).catch(() => [])).filter(isWiring);
+      if (snapped.length > 0) await run(bin.jj, ["file", "untrack", ...snapped], { cwd: top });
+    }
+    let result;
+    try {
+      result = await init({
+        serverUrl,
+        ...(token === undefined ? {} : { token }),
+        repo: repo.id,
+        worktree: top,
+        applier: hooks.applierFor(top, bin),
+        author,
+        importFrom: "main",
+        fetch: fetchImpl,
+        log,
+      });
+    } catch (err) {
+      if (err instanceof OtherCheckout) throw new SetupStopped(err.message);
+      throw err;
+    }
     if (result.importedAs !== undefined) log(`imported ${basename(top)} as #${result.importedAs}`);
     return top;
   }
 
-  // c. Claude Code, by command name; the agent's name for the daemon.
+  // c. Claude Code, by command name; the agent's name for the daemon. Files git tracks are the
+  //    team's: looked at before anything is written, and left alone.
   const file = await readFileConfig(dir);
   await writeFileConfig(dir, { ...file, serverUrl, ...(token === undefined ? {} : { token }), repo: repo.id, agent });
+  const trackedHere = await trackedWiring(dir, bin, [...WIRING_FILES, SHARED_SETTINGS]);
   await excludeFromGit(dir, WIRING_EXCLUDES, bin);
-  await wireClaudeCode(dir, { repo: repo.id, serverUrl, platform });
-  const tracked = await trackedWiring(dir, bin);
-  if (tracked.length > 0) log(`warning: git tracks ${tracked.join(", ")} here, so changes setup made to them can end up in a commit`);
+  const wired = await wireClaudeCode(dir, { repo: repo.id, serverUrl, platform, tracked: trackedHere });
+  const todo: string[] = [];
+  for (const path of wired.skipped) log(`warning: git tracks ${path} here, so setup left it as it is`);
+  if (wired.localMcp !== undefined) {
+    todo.push(`register the pitstop MCP server for yourself (git tracks this checkout's .mcp.json, so setup did not touch it): ${wired.localMcp}`);
+  }
 
-  // d. The daemon, with what setup was told winning over whatever this shell carries.
+  // d. The daemon, with what setup was told winning over whatever this shell carries. One that
+  //    runs with other settings (a new agent name, a new token) is restarted: it read them once.
+  if (how === "existing" && previous !== undefined && settingsChanged(previous, { serverUrl, repo: repo.id, token, agent })) {
+    const pid = await hooks.stop(dir);
+    if (pid !== undefined) log(`stopped the daemon (pid ${pid}) to start it with the new settings`);
+  }
   const daemon = await hooks.start(dir, {
     ...env,
     PITSTOP_SERVER: serverUrl,
@@ -287,5 +412,5 @@ export async function setup(opts: SetupOptions): Promise<SetupResult> {
     ...(token === undefined ? {} : { PITSTOP_TOKEN: token }),
   });
   const appliedLsn = (await readState(dir)).appliedLsn;
-  return { dir, repo, how, appliedLsn, agent, daemon, tracked };
+  return { dir, repo, how, appliedLsn, agent, daemon, tracked: wired.skipped, todo };
 }

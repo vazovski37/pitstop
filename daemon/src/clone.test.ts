@@ -86,6 +86,19 @@ const available = await Promise.all([run(bin.jj, ["--version"], { cwd: tmpdir() 
   () => false,
 );
 
+/** Git's core.autocrlf for every git this process runs (Git for Windows sets it in its system config); undefined unpins it. */
+const autocrlf = (value: "true" | "false" | undefined) => {
+  if (value === undefined) {
+    delete process.env.GIT_CONFIG_COUNT;
+    delete process.env.GIT_CONFIG_KEY_0;
+    delete process.env.GIT_CONFIG_VALUE_0;
+    return;
+  }
+  process.env.GIT_CONFIG_COUNT = "1";
+  process.env.GIT_CONFIG_KEY_0 = "core.autocrlf";
+  process.env.GIT_CONFIG_VALUE_0 = value;
+};
+
 describe.skipIf(!available)("pitstop clone into a real colocated worktree", { timeout: 60_000 }, () => {
   let server: FakeServer;
   let base: string;
@@ -94,8 +107,10 @@ describe.skipIf(!available)("pitstop clone into a real colocated worktree", { ti
     base = await tempDir();
     process.env.JJ_USER = "agent";
     process.env.JJ_EMAIL = "agent@test";
+    autocrlf("false");
   });
   afterEach(async () => {
+    autocrlf(undefined);
     await server.close();
     await removeDir(base);
   });
@@ -118,6 +133,19 @@ describe.skipIf(!available)("pitstop clone into a real colocated worktree", { ti
     const other = join(base, "two");
     await cloneRepository({ serverUrl: server.url, repo: "teamdb/demo", dir: other, bin });
     expect((await run(bin.git, ["rev-parse", "main"], { cwd: other })).trim()).toBe((await git("rev-parse", "main")).trim());
+  });
+
+  it("converts line endings the way git does here (core.autocrlf): CRLF on disk, LF in every commit", async () => {
+    autocrlf("true");
+    const dir = join(base, "crlf");
+    await cloneRepository({ serverUrl: server.url, repo: "teamdb/demo", dir, bin });
+    expect(await readFile(join(dir, "a.txt"), "utf8")).toBe("a1\r\na3\r\n");
+    expect((await run(bin.jj, ["config", "get", "working-copy.eol-conversion"], { cwd: dir })).trim()).toBe("input-output");
+    const wt = new JjWorktree(dir, bin);
+    expect(await wt.hasChanges()).toBe(false);
+    // An editor's CRLF file is committed with LF.
+    await writeFile(join(dir, "src", "c.ts"), "export const c = 1;\r\n");
+    expect(await wt.diffAgainstMain()).toEqual([{ path: "src/c.ts", op: "add", content: "export const c = 1;\n", blob: blobHash("export const c = 1;\n") }]);
   });
 
   it("prepares an empty worktree with a main bookmark jj knows", async () => {

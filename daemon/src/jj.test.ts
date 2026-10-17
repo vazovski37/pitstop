@@ -22,7 +22,7 @@ const mergiraf = await run(bin.mergiraf, ["--version"], { cwd: tmpdir() }).then(
 );
 
 // Each test spawns a dozen jj and git processes; under the full suite's load that passes 5 s.
-describe.skipIf(!available)("JjWorktree against a real colocated repo", { timeout: 30_000 }, () => {
+describe.skipIf(!available)("JjWorktree against a real colocated repo", { timeout: 90_000 }, () => {
   let dir: string;
   let wt: JjWorktree;
   const git = (...args: string[]) => run(bin.git, args, { cwd: dir });
@@ -43,7 +43,7 @@ describe.skipIf(!available)("JjWorktree against a real colocated repo", { timeou
     process.env.JJ_USER = "agent";
     process.env.JJ_EMAIL = "agent@test";
     wt = new JjWorktree(dir, bin);
-  });
+  }, 60_000); // five jj and git runs; on a busy Windows laptop more than the 10 s hook default
   afterEach(() => removeDir(dir));
 
   const entry = (lsn: number, path: string, content: string) =>

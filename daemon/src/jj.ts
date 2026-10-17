@@ -46,6 +46,40 @@ export const binariesFromEnv = (env: NodeJS.ProcessEnv = process.env): Binaries 
   mergiraf: env.PITSTOP_MERGIRAF_BIN ?? "mergiraf",
 });
 
+/** jj's `working-copy.eol-conversion` values that convert anything. */
+export type EolConversion = "input-output" | "input";
+
+/**
+ * The line-ending conversion jj needs to see this checkout the way git does. Git for Windows sets
+ * `core.autocrlf=true` in its system config, so a Windows checkout holds CRLF while the commits
+ * hold LF; jj's default (`none`) would snapshot the CRLF bytes into `@` and every line of every
+ * text file would look changed. `true` (or `core.eol=crlf`) is jj's `input-output`, `input` is `input`.
+ */
+export async function eolConversionFor(dir: string, bin: Pick<Binaries, "git">): Promise<EolConversion | undefined> {
+  const get = (key: string) =>
+    run(bin.git, ["config", "--get", key], { cwd: dir }).then(
+      (out) => out.trim().toLowerCase(),
+      () => "",
+    );
+  const autocrlf = await get("core.autocrlf");
+  if (["true", "yes", "on", "1"].includes(autocrlf)) return "input-output";
+  if (autocrlf === "input") return "input";
+  return (await get("core.eol")) === "crlf" ? "input-output" : undefined;
+}
+
+/**
+ * `jj git init --colocate` in `dir`, with line endings converted the way git converts them here
+ * (eolConversionFor), from the first snapshot on, and remembered in the repository's jj config so
+ * the daemon's snapshots convert too. Returns the conversion, if any.
+ */
+export async function jjInitColocated(dir: string, bin: Binaries): Promise<EolConversion | undefined> {
+  const eol = await eolConversionFor(dir, bin);
+  const setting = eol === undefined ? [] : ["--config", `working-copy.eol-conversion=${eol}`];
+  await run(bin.jj, [...setting, "git", "init", "--colocate"], { cwd: dir });
+  if (eol !== undefined) await run(bin.jj, ["config", "set", "--repo", "working-copy.eol-conversion", eol], { cwd: dir });
+  return eol;
+}
+
 /** Git-style (diff3) conflict markers, which Mergiraf and most tools understand; jj's default is its own style. */
 const GIT_MARKERS = "ui.conflict-marker-style=git";
 

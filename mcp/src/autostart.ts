@@ -15,7 +15,11 @@ import { BUNDLED } from "./build-info.js";
 const PITSTOP = ".pitstop";
 const configFile = (worktree: string) => join(worktree, PITSTOP, "config.json");
 
-/** The checkout `start` is in: the nearest directory at or above it with `.pitstop/config.json`, else `start`. */
+/**
+ * The checkout `start` is in: the nearest directory at or above it with `.pitstop/config.json`, else
+ * `start`. The CLI walks the same way (daemon/src/config.ts, findWorktree), so `pitstop start`, which
+ * ensureDaemon runs in the checkout, starts the same checkout's daemon.
+ */
 export function findWorktree(start: string): string {
   const from = resolve(start);
   for (let dir = from; ; ) {

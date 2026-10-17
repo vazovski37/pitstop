@@ -23,7 +23,7 @@ import { pathToFileURL } from "node:url";
 import { BUNDLED, VERSION } from "./build-info.js";
 import { cloneRepository } from "./clone.js";
 import { commit, CommitRejected, importWorktree } from "./commit.js";
-import { configFromEnv, loadConfig, type Config } from "./config.js";
+import { configFromEnv, daemonEnv, findWorktree, loadConfig, readFileConfig, type Config } from "./config.js";
 import { Daemon } from "./daemon.js";
 import { init } from "./init.js";
 import { declareIntent } from "./intents.js";
@@ -35,7 +35,7 @@ import { setup, SetupStopped } from "./setup.js";
 export { describe } from "./messages.js";
 export { cloneRepository } from "./clone.js";
 export { commit, CommitRejected, importWorktree } from "./commit.js";
-export { configFrom, configFromEnv, loadConfig, readFileConfig, streamUrl, writeFileConfig, type Config } from "./config.js";
+export { configFrom, configFromEnv, daemonEnv, findWorktree, loadConfig, readFileConfig, streamUrl, writeFileConfig, type Config } from "./config.js";
 export { Daemon, readDaemonInfo, type SafePointResult, type Status } from "./daemon.js";
 export { init } from "./init.js";
 export { declareIntent } from "./intents.js";
@@ -107,6 +107,7 @@ export async function main(argv: string[], config?: Config): Promise<number> {
       console.log("");
       log(`ready: ${result.dir} is a checkout of ${result.repo.id} at #${result.appliedLsn}; the agent there commits as "${result.agent}"`);
       log(`daemon ${daemon.started ? "started" : "already running"} (pid ${daemon.info.pid}); its log: ${daemon.log}`);
+      for (const step of result.todo) log(`to do first: ${step}`);
       log(`next: open Claude Code in that directory (cd "${result.dir}" && claude): the pitstop tools, the hook and CLAUDE.local.md are in place`);
       log("to stop the daemon: `pitstop stop` there (Claude Code starts it again when it needs it)");
       return 0;
@@ -119,7 +120,15 @@ export async function main(argv: string[], config?: Config): Promise<number> {
     }
   }
 
-  const cfg = config ?? (await loadConfig());
+  // clone and init make a checkout where they are run; every other command acts on the checkout
+  // around the cwd, found the way the MCP server and the hook find it, so `pitstop start` from
+  // `src/` is the checkout's daemon, not a second one in `src/`.
+  const located = config === undefined && command !== "clone" && command !== "init" ? findWorktree(process.cwd()) : undefined;
+  if (config === undefined && located === undefined && (command === "start" || command === "daemon")) {
+    console.error(`[pitstop] ${process.cwd()} is not inside a Pitstop checkout (no .pitstop/config.json here or above); run \`pitstop setup <server-url> <owner/name>\` (or \`pitstop init\`) first`);
+    return 1;
+  }
+  const cfg = config ?? (await loadConfig(process.env, located ?? process.cwd()));
   const applier = new JjWorktree(cfg.worktree, binariesFromEnv());
   const shared = {
     serverUrl: cfg.serverUrl,
@@ -175,7 +184,9 @@ export async function main(argv: string[], config?: Config): Promise<number> {
   }
 
   if (command === "start") {
-    const result = await startDaemon(cfg.worktree);
+    // The checkout's own server, repository, token and agent, whatever this shell (or the Claude
+    // Code that runs this to start a missing daemon) carries.
+    const result = await startDaemon(cfg.worktree, { env: daemonEnv(await readFileConfig(cfg.worktree)) });
     log(`daemon ${result.started ? "started" : "already running"} in ${cfg.worktree} (pid ${result.info.pid}, local API on 127.0.0.1:${result.info.port}); log: ${result.log}`);
     return 0;
   }

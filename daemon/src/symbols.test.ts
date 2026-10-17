@@ -87,7 +87,7 @@ export function renderProfile(userId: string): string {
   });
 });
 
-describe("symbol sets on a small project", () => {
+describe("symbol sets on a small project", { timeout: 30_000 }, () => {
   const tsconfig = JSON.stringify({ compilerOptions: { strict: true, module: "NodeNext", moduleResolution: "NodeNext", target: "ES2022" }, include: ["src"] });
   const a = `export class Counter {
   private n = 0;

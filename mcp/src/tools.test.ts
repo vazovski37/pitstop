@@ -142,22 +142,36 @@ describe("setup", () => {
     try {
       await writeFile(join(worktree, ".mcp.json"), JSON.stringify({ mcpServers: { other: { command: "x" } } }));
       await mkdir(join(worktree, ".claude"), { recursive: true });
-      await writeFile(join(worktree, ".claude", "settings.json"), JSON.stringify({ permissions: { allow: ["Bash(npm test)"] }, hooks: { PostToolUse: [{ matcher: "Bash", hooks: [{ type: "command", command: "echo hi" }] }] } }));
       // The scripts folder as path.join spells it here, so the expectations hold on Windows and on Linux CI.
       const scripts = join(worktree, "mcp-dist");
+      const ours = `node "${join(scripts, "hook.js")}"`;
+      const userHook = { matcher: "Bash", hooks: [{ type: "command", command: "echo hi" }] };
+      // A group the user shares with the pitstop hook, and a hook whose name merely looks like ours.
+      const shared = { matcher: "", hooks: [{ type: "command", command: "pitstop-hook" }, { type: "command", command: "npx prettier --write ." }] };
+      const lookalike = { matcher: "Edit", hooks: [{ type: "command", command: "node tools/precommit-hook.js --lint" }] };
+      await writeFile(
+        join(worktree, ".claude", "settings.local.json"),
+        JSON.stringify({ permissions: { allow: ["Bash(npm test)"] }, hooks: { PostToolUse: [userHook, shared, lookalike] } }),
+      );
+      // An earlier version put the hook into the team's settings.json: it comes out of there.
+      await writeFile(join(worktree, ".claude", "settings.json"), JSON.stringify({ model: "x", hooks: { PostToolUse: [{ matcher: "", hooks: [{ type: "command", command: ours, timeout: 60 }] }] } }));
       const r = await setupWorktree(worktree, scripts);
+      expect(r.settings).toBe(join(worktree, ".claude", "settings.local.json"));
       const mcp = JSON.parse(await readFile(r.mcpConfig, "utf8")) as { mcpServers: Record<string, unknown> };
       expect(mcp.mcpServers.other).toEqual({ command: "x" });
       expect(mcp.mcpServers.pitstop).toEqual({ command: "node", args: [join(scripts, "index.js")], env: { PITSTOP_WORKTREE: worktree } });
       const settings = JSON.parse(await readFile(r.settings, "utf8")) as { permissions: unknown; hooks: { PostToolUse: unknown[] } };
       expect(settings.permissions).toEqual({ allow: ["Bash(npm test)"] });
       expect(settings.hooks.PostToolUse).toEqual([
-        { matcher: "Bash", hooks: [{ type: "command", command: "echo hi" }] },
-        { matcher: "", hooks: [{ type: "command", command: `node "${join(scripts, "hook.js")}"`, timeout: 60 }] },
+        userHook,
+        { matcher: "", hooks: [{ type: "command", command: "npx prettier --write ." }] },
+        lookalike,
+        { matcher: "", hooks: [{ type: "command", command: ours, timeout: 60 }] },
       ]);
+      expect(JSON.parse(await readFile(join(worktree, ".claude", "settings.json"), "utf8"))).toEqual({ model: "x" });
+      const once = await readFile(r.settings, "utf8");
       await setupWorktree(worktree, scripts);
-      const again = JSON.parse(await readFile(r.settings, "utf8")) as { hooks: { PostToolUse: unknown[] } };
-      expect(again.hooks.PostToolUse).toHaveLength(2);
+      expect(await readFile(r.settings, "utf8")).toBe(once);
     } finally {
       await rm(worktree, { recursive: true, force: true });
     }

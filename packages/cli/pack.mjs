@@ -3,12 +3,13 @@
 //   npm install -g https://<server>/pitstop-cli.tgz
 import { execSync } from "node:child_process";
 import { mkdirSync, renameSync, rmSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { bundle } from "./build.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const dest = process.argv[2] ?? join(here, "..", "..", "web", "dist");
+// Absolute before npm runs from this folder: a relative destination means the caller's cwd.
+const dest = resolve(process.argv[2] ?? join(here, "..", "..", "web", "dist"));
 
 await bundle();
 mkdirSync(dest, { recursive: true });

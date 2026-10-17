@@ -16,7 +16,7 @@ A Pitstop server keeps an ordered log of every change to a repository. Each chec
 | Mergiraf, optional | merges conflicts by structure instead of leaving markers | `winget install Mergiraf.Mergiraf`, `brew install mergiraf` |
 | A server URL and a token | where the log lives, and your key to it | from whoever runs the server (below) |
 
-**Getting a token.** On the hosted server with accounts on: sign in with GitHub at `<server>/auth/github`, then create a personal token with `POST /tokens` and a body of `{"name":"laptop"}` (from the browser's console with `fetch`, so the session cookie goes along; a page for it is on the plan). The answer carries `secret` once; it starts with `pst_`. While accounts are off, whoever runs the server gives you its shared `PITSTOP_TOKEN`. Either goes into `--token` below, or into `PITSTOP_TOKEN` in your environment, which wins over `.pitstop/config.json` in every checkout (see "Environment").
+**Getting a token.** On the hosted server with accounts on: sign in with GitHub at `<server>/auth/github`, then create a personal token with `POST /tokens` and a body of `{"name":"laptop"}` (from the browser's console with `fetch`, so the session cookie goes along; a page for it is on the plan). The answer carries `secret` once; it starts with `pst_`. While accounts are off, whoever runs the server gives you its shared `PITSTOP_TOKEN`. Either goes into `--token` below, once per checkout: setup keeps it in that checkout's `.pitstop/config.json` (git-ignored), and every command and daemon there takes it from that file and sends it to that file's server only. Do not export it in your shell profile: a token for one server has no business in a checkout of another.
 
 ## Install
 
@@ -41,19 +41,20 @@ What it does, and where it stops to tell you what to run:
 
 1. Checks Node 22+, git and jj (with the install line for your system), and that jj knows who you are; when it does not, it takes your name and email from `git config`.
 2. Asks the server for `myteam/my-repo` (created on the website first; lowercase `owner/name`).
-   - **Its log is empty:** the git checkout you are in becomes its first entry. The checkout must be on a branch named `main` with at least one commit (`git branch -m master main` if that is what you have); setup runs `jj git init --colocate` in it when needed and imports every file git and jj see (`.gitignore`d ones stay out).
+   - **Its log is empty:** the git checkout you are in becomes its first entry, exactly as its `main` branch holds it: the checkout must be on a branch named `main` with at least one commit (`git branch -m master main` if that is what you have), and with **nothing uncommitted**. Setup stops and lists every edited, staged or untracked file (`.gitignore`d ones do not count): the log is append-only and every clone replays the first entry, so commit them, add them to `.gitignore`, or `git stash -u` them first. It then runs `jj git init --colocate` when needed; where git converts line endings (`core.autocrlf`, as Git for Windows sets it), jj is told to convert them the same way, so the entry carries the LF that git stores, not your checkout's CRLF.
    - **It has entries:** it is cloned from the log into `./my-repo`, or `--dir <dir>`.
    - **The directory is already a checkout of it** (you ran setup before): it is reused, nothing is imported or cloned.
-3. Wires Claude Code in that checkout, by command name, so the files hold no path of your laptop: `.mcp.json` (the `pitstop` server; `cmd /c pitstop-mcp` on Windows), `.claude/settings.json` (the `PostToolUse` hook, `pitstop-hook`, and the server enabled), and `CLAUDE.local.md` (the house rules for the agent, below). Whatever those files already hold is kept. All three go into `.git/info/exclude`, so they never end up in a commit.
+   - **The directory is a checkout of another repository, or of the same name on another server:** setup stops; run it from a directory outside that checkout.
+3. Wires Claude Code in that checkout, by command name, so the files hold no path of your laptop: `.mcp.json` (the `pitstop` server; `cmd /c pitstop-mcp` on Windows), `.claude/settings.local.json` (your own settings file: the `PostToolUse` hook, `pitstop-hook`, and the server enabled), and `CLAUDE.local.md` (the house rules for the agent, below). Whatever those files already hold is kept, other hooks included. Those three go into `.git/info/exclude`, so they never end up in a commit; the rest of `.claude/` (the team's `settings.json`, commands, agents, skills) is committed like any other file. A wiring file your repository already tracks is the team's and is left alone: when that is `.mcp.json`, setup ends with the one line that registers the server for you only, `claude mcp add --scope local pitstop -- pitstop-mcp` (`-- cmd /c pitstop-mcp` on Windows).
 4. Records the agent's name in `.pitstop/config.json` (`--agent alice-claude`; default `<your user>-claude`, or what an earlier setup recorded) and starts the daemon in the background, its output in `.pitstop/daemon.log`.
 
-It ends with where the checkout is. Open Claude Code there (`cd my-repo && claude`); the `pitstop` tools are loaded and the agent knows the rules. Run setup again whenever something looks off: it re-checks, re-wires and starts the daemon if none runs.
+It ends with where the checkout is. Open Claude Code there (`cd my-repo && claude`); the `pitstop` tools are loaded and the agent knows the rules. Run setup again whenever something looks off: it re-checks, re-wires, starts the daemon if none runs, and restarts it when the agent name, token or server changed.
 
 The token comes from `--token` or `PITSTOP_TOKEN` only, never from a `.pitstop/config.json` in the directory you run it from (that one may belong to another checkout of another server).
 
 **A prompt for your Claude.** Setup can be run by the agent itself; give it something like: *"Run `npm install -g https://your-pitstop-server/pitstop-cli.tgz`, then `pitstop setup https://your-pitstop-server myteam/my-repo --token pst_…` here. If it stops, do what it says and run it again. Then tell me which directory to open you in."*
 
-**The daemon.** `pitstop stop` in the checkout stops it, `pitstop start` starts it again in the background. You rarely need either: when Claude Code opens the checkout and finds no daemon, the MCP server starts one, and so does the hook after a tool call.
+**The daemon.** `pitstop stop` anywhere in the checkout stops it, `pitstop start` starts it again in the background, with the server, repository, token and agent in the checkout's `.pitstop/config.json` (whatever your shell says). Both, like `commit`, `intent` and `status`, act on the nearest directory at or above the current one that has `.pitstop/config.json`, and `start` outside any checkout refuses. You rarely need either: when Claude Code opens the checkout and finds no daemon, the MCP server starts one, and so does the hook after a tool call.
 
 **The house rules** (`CLAUDE.local.md`, and the MCP server's instructions): declare an intent with `declare_intent` before changing code; commit only with the `commit` tool, never `git commit`, `git push`, `jj commit` or `jj git push`; a refused commit names what changed, so re-read it, adapt, and commit again.
 
@@ -102,14 +103,14 @@ cd my-repo
 pitstop daemon
 ```
 
-**Claude Code**, from a build of this repository: in the checkout, `node <pitstop>/mcp/dist/setup.js .` writes `.mcp.json` and the `PostToolUse` hook in `.claude/settings.json` with absolute paths to that build (keep them out of the repository, or let each laptop run it). Existing entries in both files are kept, and either setup replaces the other's pitstop entries. Then open Claude Code in the checkout.
+**Claude Code**, from a build of this repository: in the checkout, `node <pitstop>/mcp/dist/setup.js .` writes `.mcp.json` and the `PostToolUse` hook in `.claude/settings.local.json` with absolute paths to that build (keep `.mcp.json` out of the repository, or let each laptop run it). Existing entries in both files are kept, and either setup replaces the other's pitstop entries. Then open Claude Code in the checkout.
 
 ## Environment
 
 | Variable | Means | Default |
 | --- | --- | --- |
 | `PITSTOP_SERVER` | the server | `.pitstop/config.json`, else `http://localhost:8080` |
-| `PITSTOP_TOKEN` | your token | `.pitstop/config.json` |
+| `PITSTOP_TOKEN` | your token; only for a server `PITSTOP_SERVER` names, or a checkout whose `.pitstop/config.json` has none | `.pitstop/config.json` |
 | `PITSTOP_REPO` | the repository, `owner/name` | `.pitstop/config.json` |
 | `PITSTOP_DEVELOPER` | who you are on commits (with a personal token, your login wins) | your OS user name |
 | `PITSTOP_AGENT` | which agent this checkout is; make it distinct per laptop | the `agent` in `.pitstop/config.json` (`pitstop setup --agent`), else `claude-code` |
@@ -117,7 +118,7 @@ pitstop daemon
 | `PITSTOP_DAEMON_PORT` | the daemon's local API port | a free one |
 | `PITSTOP_JJ_BIN`, `PITSTOP_GIT_BIN`, `PITSTOP_MERGIRAF_BIN` | the executables when not on PATH | `jj`, `git`, `mergiraf` |
 
-The environment wins over `.pitstop/config.json`, in every checkout: a `PITSTOP_SERVER` or `PITSTOP_REPO` left in a shell redirects every command there, including a fresh `pitstop clone` whose config names another server. Set only `PITSTOP_TOKEN` and `PITSTOP_AGENT` globally. (The daemon `pitstop setup` starts gets the server, repository, token and agent setup was given, whatever the shell says; one started later by `pitstop start` or by Claude Code reads the environment as usual.)
+For commands you run by hand, the environment wins over `.pitstop/config.json`: a `PITSTOP_SERVER` or `PITSTOP_REPO` left in a shell redirects them there. The token follows the server: a checkout's own token goes to its own server and wins there, and only `PITSTOP_TOKEN` goes to a server `PITSTOP_SERVER` names instead. The background daemon always runs with the checkout's settings: the one `pitstop setup` starts gets what setup was given, and one started by `pitstop start` (or by Claude Code, which runs it) gets what `.pitstop/config.json` says, whatever the shell carries. Set none of these globally; the environment is for one-off runs and scripts.
 
 ## What the server does with write skew
 
@@ -133,7 +134,7 @@ The server's owner chooses: `PITSTOP_VALIDATE` is `warn` by default (a commit wi
 ## What lives where
 
 - `.pitstop/` in each checkout: `config.json` (server, token, repository, agent), `state.json` (the last entry applied, the open intent), `daemon.json` (the running daemon's pid and local port), `daemon.log` (the background daemon's output), a lock. It ignores itself; never commit it.
-- `.mcp.json`, `.claude/` and `CLAUDE.local.md`, when `pitstop setup` wrote them: listed in `.git/info/exclude`, so neither git nor jj ever commits them. Setup warns when git already tracks one of them in your repository; then changes to it would be committed like any other file.
+- `.mcp.json`, `.claude/settings.local.json` and `CLAUDE.local.md`, when `pitstop setup` wrote them: listed in `.git/info/exclude`, so neither git nor jj ever commits them. One your repository already tracks is left as it is (setup says so). Everything else in `.claude/` is part of the repository.
 - `main` in git and jj is always the last entry applied. Your unfinished work is jj's working copy `@` on top of it. Everything the daemon does to `main` is a plain git commit with the entry's author and timestamp, so every `pitstop clone` of a repository has identical history, entry for entry, with the same commit ids. The checkout that ran `init` keeps its older git history underneath #1, so its ids differ from the clones' (and from the mirror's) even though the trees are the same; a clone has no history before the import.
 - Nothing is pushed to GitHub by the daemon. The server can mirror a repository to GitHub as an export (`PUT /repos/:owner/:name/mirror`); the log stays the source of truth.
 
@@ -153,6 +154,9 @@ The server's owner chooses: `PITSTOP_VALIDATE` is `warn` by default (a commit wi
 | `no daemon is running in …` (the CLI) | `.pitstop/daemon.json` is missing or stale | `pitstop start` in that checkout |
 | `a daemon is already running in …` | `pitstop daemon` refuses a second one per checkout | nothing, or `pitstop stop` first |
 | setup: `… is on branch master` | an import follows a branch named `main` | `git branch -m master main`, then setup again |
+| setup: `… has changes that are not committed to main` | the first entry is `main` as it is; the listed files would otherwise reach the agent's first commit | commit them, `.gitignore` them, or `git stash -u` (with jj: `jj new main`), then setup again |
+| setup: `… is already a Pitstop checkout of …` | you ran setup inside a checkout of another repository or server | run it from a directory outside that checkout |
+| `… is not inside a Pitstop checkout` | `pitstop start`/`daemon` found no `.pitstop/config.json` here or above | `cd` into the checkout, or run `pitstop setup` first |
 | setup: `jj git init` fails with `os error 3` (Windows) | the checkout's path is too long for jj | a shorter path, e.g. `--dir C:\code\my-repo` |
 | `server answered 401/403 with something that is not a CommitResponse` | the token is missing, wrong, or not a writer of the repository | check `PITSTOP_TOKEN`; the owner adds you with `PUT …/members/<login>` |
 | the clone has only some files | the log did not begin with a full import (`--no-import`, never imported) | the owner re-creates the repository with `pitstop init` (or `import`) from a clean checkout |

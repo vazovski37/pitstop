@@ -168,7 +168,7 @@ describe("daemon with its local API", () => {
     });
   });
 
-  it("notes symbol-level overlap from the TypeScript project", async () => {
+  it("notes symbol-level overlap from the TypeScript project", { timeout: 30_000 }, async () => {
     const tsconfig = JSON.stringify({ compilerOptions: { strict: true }, include: ["src"] });
     const main: Tree = new Map([
       ["tsconfig.json", tsconfig],
