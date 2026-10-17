@@ -220,7 +220,11 @@ export async function setup(opts: SetupOptions): Promise<SetupResult> {
   } else {
     dir = resolve(cwd, opts.dir ?? name);
     warnLongPath(dir, platform, log);
-    await cloneRepository({ serverUrl, ...(token === undefined ? {} : { token }), repo: repo.id, dir, bin, fetch: fetchImpl, log }, hooks.clone);
+    // clone.ts speaks to someone who runs `pitstop daemon` next; setup starts it below.
+    const cloneLog = (line: string) => {
+      if (line !== `${repo.id} is at #${repo.headLsn}`) log(line.replace(/; run `pitstop daemon` there$/, ""));
+    };
+    await cloneRepository({ serverUrl, ...(token === undefined ? {} : { token }), repo: repo.id, dir, bin, fetch: fetchImpl, log: cloneLog }, hooks.clone);
     how = "cloned";
   }
 
