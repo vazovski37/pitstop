@@ -34,6 +34,7 @@ jobs:
       SHA: ${{ github.sha }}
       PG_ADMIN_PASSWORD: ${{ secrets.PG_ADMIN_PASSWORD }}
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      PITSTOP_TOKEN: ${{ secrets.PITSTOP_TOKEN }}
     steps:
       - uses: actions/checkout@v5
 
@@ -68,7 +69,7 @@ jobs:
           OUT="$(az deployment group create -g "$RG" -n "app-${{ github.run_number }}" \
             -f infra/main.bicep \
             -p prefix="$PREFIX" location="$LOCATION" deployApp=true containerImage="$IMAGE" \
-               pgAdminPassword="$PG_ADMIN_PASSWORD" anthropicApiKey="$ANTHROPIC_API_KEY" \
+               pgAdminPassword="$PG_ADMIN_PASSWORD" anthropicApiKey="$ANTHROPIC_API_KEY" pitstopToken="$PITSTOP_TOKEN" \
             --query properties.outputs -o json)"
           echo "FQDN=$(echo "$OUT" | jq -r .appFqdn.value)" >> "$GITHUB_ENV"
 

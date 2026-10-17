@@ -151,3 +151,33 @@ describe("GET /log", () => {
     await app.close();
   });
 });
+
+describe("with PITSTOP_TOKEN set", () => {
+  const token = "s3cret-token-for-tests";
+  const guarded = () => buildApp({ version: "test-sha", pingDb: async () => true, store: new MemoryStore(), token });
+
+  it("leaves the health probes open", async () => {
+    const app = await guarded();
+    expect((await app.inject({ method: "GET", url: "/healthz" })).statusCode).toBe(200);
+    expect((await app.inject({ method: "GET", url: "/version" })).statusCode).toBe(200);
+    await app.close();
+  });
+
+  it("refuses a request without the right bearer token", async () => {
+    const app = await guarded();
+    expect((await app.inject({ method: "GET", url: "/log" })).statusCode).toBe(401);
+    expect((await app.inject({ method: "POST", url: "/commit", payload: request("idem-guarded-01") })).statusCode).toBe(401);
+    const wrong = await app.inject({ method: "GET", url: "/log", headers: { authorization: "Bearer nope" } });
+    expect(wrong.statusCode).toBe(401);
+    expect(wrong.json()).toMatchObject({ error: "unauthorized" });
+    await app.close();
+  });
+
+  it("accepts the bearer header or ?token=", async () => {
+    const app = await guarded();
+    const header = await app.inject({ method: "GET", url: "/log", headers: { authorization: `Bearer ${token}` } });
+    expect(header.statusCode).toBe(200);
+    expect((await app.inject({ method: "GET", url: `/log?token=${token}` })).statusCode).toBe(200);
+    await app.close();
+  });
+});

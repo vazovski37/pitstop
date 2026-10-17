@@ -32,6 +32,10 @@ param containerImage string = ''
 @secure()
 param anthropicApiKey string = ''
 
+@description('Shared token every daemon sends as Authorization: Bearer (Phase 2). Empty leaves the server open.')
+@secure()
+param pitstopToken string = ''
+
 var suffix = uniqueString(resourceGroup().id)
 // Registry names allow only letters and digits.
 var acrName = take('${replace(toLower(prefix), '-', '')}acr${suffix}', 50)
@@ -155,6 +159,12 @@ var baseEnv = [
 var aiEnv = empty(anthropicApiKey) ? [] : [
   { name: 'ANTHROPIC_API_KEY', secretRef: 'anthropic-api-key' }
 ]
+var tokenSecrets = empty(pitstopToken) ? [] : [
+  { name: 'pitstop-token', value: pitstopToken }
+]
+var tokenEnv = empty(pitstopToken) ? [] : [
+  { name: 'PITSTOP_TOKEN', secretRef: 'pitstop-token' }
+]
 
 resource app 'Microsoft.App/containerApps@2024-03-01' = if (deployApp) {
   name: '${prefix}-server'
@@ -181,14 +191,14 @@ resource app 'Microsoft.App/containerApps@2024-03-01' = if (deployApp) {
           identity: appIdentity.id
         }
       ]
-      secrets: concat(baseSecrets, aiSecrets)
+      secrets: concat(baseSecrets, aiSecrets, tokenSecrets)
     }
     template: {
       containers: [
         {
           name: 'server'
           image: containerImage
-          env: concat(baseEnv, aiEnv)
+          env: concat(baseEnv, aiEnv, tokenEnv)
           resources: {
             cpu: json('0.5')
             memory: '1Gi'

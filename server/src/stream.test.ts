@@ -1,7 +1,8 @@
 import type { AddressInfo } from "node:net";
 import { afterEach, describe, expect, it } from "vitest";
+import { WebSocket } from "ws";
 import { ServerMessage, type CommitRequest } from "@pitstop/protocol";
-import { buildApp } from "./app.js";
+import { buildApp, type AppDeps } from "./app.js";
 import { MemoryStore } from "./store.js";
 
 const request = (key: string): CommitRequest => ({
@@ -43,12 +44,14 @@ class Inbox {
   }
 }
 
-const connect = (url: string): Promise<Inbox> =>
+/** The `ws` client, as the daemon will use it: it can send headers, which a browser's WebSocket cannot. */
+const connect = (url: string, headers: Record<string, string> = {}): Promise<Inbox> =>
   new Promise((resolve, reject) => {
-    const socket = new WebSocket(url);
+    const socket = new WebSocket(url, { headers });
     const inbox = new Inbox(socket);
-    socket.addEventListener("open", () => resolve(inbox), { once: true });
-    socket.addEventListener("error", () => reject(new Error("could not connect")), { once: true });
+    socket.once("open", () => resolve(inbox));
+    socket.once("unexpected-response", (_req, res) => reject(new Error(`http ${res.statusCode}`)));
+    socket.once("error", (err) => reject(err));
   });
 
 describe("GET /stream", () => {
@@ -58,9 +61,9 @@ describe("GET /stream", () => {
     cleanup = undefined;
   });
 
-  const listen = async () => {
+  const listen = async (extra: Partial<AppDeps> = {}) => {
     const store = new MemoryStore();
-    const app = await buildApp({ version: "test-sha", pingDb: async () => true, store });
+    const app = await buildApp({ version: "test-sha", pingDb: async () => true, store, ...extra });
     await app.listen({ host: "127.0.0.1", port: 0 });
     cleanup = () => app.close();
     const { port } = app.server.address() as AddressInfo;
@@ -115,5 +118,19 @@ describe("GET /stream", () => {
     await inbox.next(); // hello
     inbox.send("not json");
     expect(await inbox.closed).toBe(1003);
+  });
+
+  it("with a token set, the upgrade needs the bearer header or ?token=", async () => {
+    const token = "s3cret-token-for-tests";
+    const { url } = await listen({ token });
+    await expect(connect(url)).rejects.toThrow(/401/);
+
+    const withHeader = await connect(url, { authorization: `Bearer ${token}` });
+    expect(await withHeader.next()).toMatchObject({ type: "hello" });
+    withHeader.close();
+
+    const withQuery = await connect(`${url}?token=${token}`);
+    expect(await withQuery.next()).toMatchObject({ type: "hello" });
+    withQuery.close();
   });
 });
