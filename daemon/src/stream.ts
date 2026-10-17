@@ -94,6 +94,14 @@ export class StreamClient {
         this.log(describe(message));
         this.subscribe();
         break;
+      case "head":
+        // Answers the subscribe. A head below the applied LSN means this worktree's state and the
+        // server's log disagree; the entries that follow (or do not) decide what happens next.
+        this.log(describe(message));
+        if (message.headLsn < this.applied) {
+          this.log(`this worktree is at #${this.applied}, ahead of the log; was the state file copied?`);
+        }
+        break;
       case "entry":
         this.queue.push(message.changeset);
         void this.drain();

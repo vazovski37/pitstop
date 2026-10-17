@@ -3,10 +3,10 @@
  * A stand-in for the real server, for tests and laptops without it: replays
  * packages/protocol/fixtures/server-messages.json over /stream and accepts POST /commit.
  *
- * Behaviour copied from server/src/stream.ts: `hello` on connect, then after `subscribe`
- * every entry above `fromLsn` in order, then entries appended by commits as they happen.
+ * Behaviour copied from server/src/stream.ts: `hello` on connect, then after `subscribe` a
+ * `head` for the repository, every entry above `fromLsn` in order, then entries appended by
+ * commits as they happen. One repository only (`DEFAULT_REPO` unless the request names one).
  */
-import { DEFAULT_REPO } from "@pitstop/protocol";
 import { readFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -15,6 +15,7 @@ import { WebSocketServer, type WebSocket } from "ws";
 import {
   ClientMessage,
   CommitRequest,
+  DEFAULT_REPO,
   ServerMessage,
   type Changeset,
   type CommitResponse,

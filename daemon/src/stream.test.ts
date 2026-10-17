@@ -59,6 +59,7 @@ describe("stream client", () => {
     await waitFor(() => server!.received.some((m) => m.type === "heartbeat" && m.appliedLsn === 122));
     expect(await readState(worktree)).toEqual({ appliedLsn: 122 });
     expect(log).toContain("connected to server abc1234, head #122");
+    expect(log).toContain("local/default is at #122");
     expect(log.some((l) => l.startsWith("warning for agent-b"))).toBe(true);
   });
 
@@ -70,6 +71,14 @@ describe("stream client", () => {
     await sleep(100);
     expect(applier.lsns).toEqual([]);
     expect(await readState(worktree)).toEqual({ appliedLsn: 122 });
+  });
+
+  it("notices when the worktree is ahead of the log", async () => {
+    server = await startFakeServer({ messages: fixtureMessages() }); // head #122
+    await writeState(worktree, { appliedLsn: 130 });
+    await start();
+    await waitFor(() => log.some((l) => l.includes("ahead of the log")));
+    expect(log).toContain("this worktree is at #130, ahead of the log; was the state file copied?");
   });
 
   it("applies entries strictly in order and subscribes again on a gap", async () => {
