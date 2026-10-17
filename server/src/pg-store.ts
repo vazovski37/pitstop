@@ -24,6 +24,7 @@ import {
   newUserId,
   tokenHash,
   type Decide,
+  type Invite,
   type Member,
   type Mirror,
   type MirrorConfig,
@@ -410,7 +411,8 @@ export class PgStore implements Store {
   }
 
   async getUserByLogin(login: string): Promise<User | undefined> {
-    const res = await this.pool.query<UserRow>(`select ${USER_COLUMNS} from users where login = $1`, [login]);
+    // GitHub logins are case-insensitive.
+    const res = await this.pool.query<UserRow>(`select ${USER_COLUMNS} from users where lower(login) = lower($1)`, [login]);
     const row = res.rows[0];
     return row === undefined ? undefined : userOf(row);
   }
@@ -464,17 +466,56 @@ export class PgStore implements Store {
   }
 
   async listMembers(repo: RepoId): Promise<Member[]> {
-    const res = await this.pool.query<{ user_id: string; login: string; role: Role }>(
-      `select m.user_id, u.login, m.role from repo_members m join users u on u.id = m.user_id
+    const res = await this.pool.query<{ user_id: string; login: string; role: Role; resolver: boolean }>(
+      `select m.user_id, u.login, m.role, m.resolver from repo_members m join users u on u.id = m.user_id
        where m.repo = $1 order by u.login`,
       [repo],
     );
-    return res.rows.map((r) => ({ repo, userId: r.user_id, login: r.login, role: r.role }));
+    return res.rows.map((r) => ({ repo, userId: r.user_id, login: r.login, role: r.role, resolver: r.resolver }));
   }
 
   async roleOf(repo: RepoId, userId: string): Promise<Role | undefined> {
     const res = await this.pool.query<{ role: Role }>("select role from repo_members where repo = $1 and user_id = $2", [repo, userId]);
     return res.rows[0]?.role;
+  }
+
+  async setResolver(repo: RepoId, userId: string, resolver: boolean): Promise<boolean> {
+    const res = await this.pool.query("update repo_members set resolver = $3 where repo = $1 and user_id = $2", [repo, userId, resolver]);
+    return (res.rowCount ?? 0) > 0;
+  }
+
+  async setInvite(repo: RepoId, login: string, role: Role, invitedBy?: string): Promise<void> {
+    const known = await this.pool.query("select 1 from repos where id = $1", [repo]);
+    if ((known.rowCount ?? 0) === 0) throw unknownRepo(repo);
+    await this.pool.query(
+      `insert into repo_invites (repo, login, role, invited_by) values ($1, lower($2), $3, $4)
+       on conflict (repo, login) do update set role = excluded.role`,
+      [repo, login, role, invitedBy ?? null],
+    );
+  }
+
+  async listInvites(repo: RepoId): Promise<Invite[]> {
+    const res = await this.pool.query<{ login: string; role: Role; created_at: Date }>(
+      "select login, role, created_at from repo_invites where repo = $1 order by login",
+      [repo],
+    );
+    return res.rows.map((r) => ({ repo, login: r.login, role: r.role, createdAt: r.created_at.toISOString() }));
+  }
+
+  async deleteInvite(repo: RepoId, login: string): Promise<boolean> {
+    const res = await this.pool.query("delete from repo_invites where repo = $1 and login = lower($2)", [repo, login]);
+    return (res.rowCount ?? 0) > 0;
+  }
+
+  async acceptInvites(user: User): Promise<RepoId[]> {
+    const res = await this.pool.query<{ repo: RepoId }>(
+      `with moved as (delete from repo_invites where login = lower($2) returning repo, role)
+       insert into repo_members (repo, user_id, role) select repo, $1, role from moved
+       on conflict (repo, user_id) do nothing
+       returning repo`,
+      [user.id, user.login],
+    );
+    return res.rows.map((r) => r.repo);
   }
 
   async visibility(repo: RepoId): Promise<Visibility | undefined> {

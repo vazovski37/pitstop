@@ -183,7 +183,7 @@ describe.skipIf(!url)("PgStore against a real Postgres", () => {
     await store.setMember("pg-test/members", alice.id, "owner");
     await store.setMember("pg-test/members", alice.id, "writer"); // a second set replaces the role
     expect(await store.roleOf("pg-test/members", alice.id)).toBe("writer");
-    expect(await store.listMembers("pg-test/members")).toEqual([{ repo: "pg-test/members", userId: alice.id, login: "alice2", role: "writer" }]);
+    expect(await store.listMembers("pg-test/members")).toEqual([{ repo: "pg-test/members", userId: alice.id, login: "alice2", role: "writer", resolver: false }]);
     await store.setVisibility("pg-test/members", "public");
     expect(await store.visibility("pg-test/members")).toBe("public");
     expect(await store.removeMember("pg-test/members", alice.id)).toBe(true);
