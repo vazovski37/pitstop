@@ -32,7 +32,11 @@ if (process.env.PITSTOP_STORE === "memory") {
   pingDb = () => ping(db);
 }
 
-const app = await buildApp({ version, pingDb, store, logger: true });
+// Empty means open: fine on a laptop, not on Azure (SETUP.md, "Server token").
+const token = process.env.PITSTOP_TOKEN || undefined;
+if (token === undefined) console.log("pitstop server: PITSTOP_TOKEN is not set, every route is open");
+
+const app = await buildApp({ version, pingDb, store, token, logger: true });
 
 const shutdown = async (signal: string) => {
   app.log.info(`${signal} received, shutting down`);

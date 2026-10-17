@@ -13,6 +13,9 @@ The single source of truth: the write-ahead log, the commit API, the WebSocket s
 - `buildApp()` in `src/app.ts` takes its dependencies as arguments so tests use `app.inject()` with fakes. Keep it that way.
 - Never deploy from a laptop. Pushing to `main` deploys through GitHub Actions.
 
+## Access
+`PITSTOP_TOKEN`, when set, guards every route except `/healthz` and `/version`: `Authorization: Bearer <token>`, or `?token=` where a browser cannot set headers. Unset means open; keep it set on Azure (`infra/main.bicep` wires the GitHub secret).
+
 ## Known constraint
 The stream keeps subscribers in memory, so the Container App runs exactly one replica (`infra/main.bicep`). To scale out later, fan new entries out through Postgres `LISTEN/NOTIFY`.
 

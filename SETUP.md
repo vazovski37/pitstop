@@ -108,6 +108,14 @@ To see what is running in Azure: Actions → latest `Deploy` run → the `produc
 
 ## Later
 
+**Server token (Phase 2)**
+
+The server on Azure is public, so one shared token guards everything except `/healthz`. Pick a long random string, store it as a GitHub secret, and run **Provision infrastructure** again:
+```bash
+gh secret set PITSTOP_TOKEN --repo <you>/pitstop
+```
+Put the same value in each laptop's `.env` as `PITSTOP_TOKEN`; the daemon sends it as `Authorization: Bearer <token>` (a browser uses `?token=<token>` on `/stream`). Until the secret exists the server runs open.
+
 **Claude API key for AI repair (Phase 4)**
 ```bash
 gh secret set ANTHROPIC_API_KEY --repo <you>/pitstop

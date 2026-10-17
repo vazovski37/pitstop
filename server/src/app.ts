@@ -1,3 +1,4 @@
+import { timingSafeEqual } from "node:crypto";
 import websocket from "@fastify/websocket";
 import Fastify, { type FastifyInstance, type FastifyReply } from "fastify";
 import {
@@ -19,8 +20,20 @@ export interface AppDeps {
   pingDb: () => Promise<boolean>;
   /** The log, blobs and intents: PgStore in production, MemoryStore in tests. */
   store: Store;
+  /**
+   * Shared secret every daemon sends (`PITSTOP_TOKEN`). When set, every route except the
+   * health probes needs `Authorization: Bearer <token>`, or `?token=` where a browser
+   * cannot set headers (the live view's `/stream`). Unset means open, for local work.
+   */
+  token?: string;
   logger?: boolean;
 }
+
+/** Routes that stay open when a token is set: the deploy smoke test and Azure's probes use them. */
+const OPEN_ROUTES = new Set(["/healthz", "/version"]);
+
+const sameToken = (presented: string, expected: string): boolean =>
+  presented.length === expected.length && timingSafeEqual(Buffer.from(presented), Buffer.from(expected));
 
 /** `GET /log` pages: the default and the most a client may ask for. */
 const LOG_PAGE = 100;
@@ -34,6 +47,24 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   const app = Fastify({ logger: deps.logger ?? false });
   await app.register(websocket);
   const stream = new Stream(deps.store, deps.version, app.log);
+
+  // Phase 2: the server is public on Azure, so one shared token guards the log and the stream.
+  // The hook also runs on the /stream upgrade request, which is refused with the same 401.
+  const token = deps.token;
+  if (token !== undefined) {
+    app.addHook("onRequest", async (req, reply) => {
+      if (OPEN_ROUTES.has(req.routeOptions.url ?? "")) return;
+      const header = req.headers.authorization;
+      const presented = header?.startsWith("Bearer ")
+        ? header.slice("Bearer ".length)
+        : (req.query as { token?: string } | undefined)?.token;
+      if (presented !== undefined && sameToken(presented, token)) return;
+      return reply.code(401).send({
+        error: "unauthorized",
+        message: "send Authorization: Bearer <PITSTOP_TOKEN> (or ?token=<PITSTOP_TOKEN> on /stream)",
+      });
+    });
+  }
 
   // The deploy smoke test (infra/smoke.sh) polls this until it reports the new version with db: true.
   app.get("/healthz", async (_req, reply) => {
