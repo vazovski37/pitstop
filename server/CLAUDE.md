@@ -8,7 +8,7 @@ The single source of truth: the write-ahead log, the commit API, the WebSocket s
 ## Rules
 - Every message in or out matches a schema in `@pitstop/protocol`. Validate input with `CommitRequest.parse(...)` etc. Never invent a field locally.
 - The log is append-only. No `update` or `delete` on `changesets`, `changeset_files` or `changeset_symbols`.
-- Assign LSNs inside one Postgres transaction (`select coalesce(max(lsn), 0) + 1 ... for update` on a lock row, or a sequence plus the commit in the same transaction). Two concurrent commits must never get the same LSN or skip one.
+- Assign LSNs inside one Postgres transaction. `PgStore.append` takes `pg_advisory_xact_lock` and uses `max(lsn) + 1`, so two concurrent commits never get the same LSN or skip one. Keep every append on that path.
 - Schema changes go in a new `migrations/NNN_name.sql`. Never edit an applied migration.
 - `buildApp()` in `src/app.ts` takes its dependencies as arguments so tests use `app.inject()` with fakes. Keep it that way.
 - Never deploy from a laptop. Pushing to `main` deploys through GitHub Actions.
@@ -19,6 +19,7 @@ The stream keeps subscribers in memory, so the Container App runs exactly one re
 ## Commands
 - `npm run db:up` (repo root): local Postgres with pgvector.
 - `npm run dev -w @pitstop/server`: server with reload, reads `../.env`.
+- `PITSTOP_STORE=memory npm run dev -w @pitstop/server`: the same without Postgres (nothing persisted); enough for daemon work.
 - `npm test` (repo root): unit tests; migration tests run when `DATABASE_URL` is set.
 
 ## Phases owned here
