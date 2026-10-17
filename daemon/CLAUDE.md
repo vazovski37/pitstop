@@ -20,6 +20,8 @@ One process per worktree. It keeps the local folder in sync with the server's lo
 ## Phases owned here
 1: stream + apply into a jj worktree + send commits. 2: read/write sets. 4: safe points, rebase of unfinished work, agent notifications.
 
+For other teams, [README.md](README.md) in this folder is the user-facing guide: install, connect a repository, wire up Claude Code, the daily loop, refusals, limits, troubleshooting. Keep it in step with the CLI.
+
 ## Running it (Phases 1 and 2)
 - `pitstop clone <server-url> <owner/name> [dir] [--token t]` makes a fresh worktree of a repository that is already on the server: it fetches the log and replays every entry through the apply sequence (`clone.ts`), so `main`, `@`, the config and the state end up where a long-running daemon would leave them, and two clones of one log agree on every commit id (the root commit is dated from the repository's creation). The server has no tree endpoint yet; a log of thousands of entries would want one.
 
