@@ -120,7 +120,11 @@ async function send(opts: Omit<CommitOptions, "intent">, body: Body): Promise<Ch
   const answer = CommitResponse.safeParse(await res.json().catch(() => undefined));
   if (!answer.success) throw new Error(`server answered ${res.status} with something that is not a CommitResponse`);
   if (answer.data.status === "rejected") {
-    throw new CommitRejected(answer.data.reason, answer.data.message, answer.data.conflictsWith);
+    const { reason, message, conflictsWith } = answer.data;
+    if ((reason === "escalated" || reason === "repair_failed") && conflictsWith.length > 0) {
+      await reread(opts.worktree, conflictsWith, opts.log);
+    }
+    throw new CommitRejected(reason, message, conflictsWith);
   }
   const changeset = answer.data.changeset;
   // The server has already pushed the entry to the stream, so a running daemon may be applying it
@@ -143,4 +147,22 @@ async function send(opts: Omit<CommitOptions, "intent">, body: Body): Promise<Ch
     }
   });
   return changeset;
+}
+
+/**
+ * A skew refusal names the entries whose changes the agent read past and tells it to re-read
+ * them at head. From here the agent knows them, so the next commit's reads are checked from the
+ * last of them rather than from where the work began, which would refuse the adapted commit for
+ * the same skew, forever. The notes at a safe point are a heads-up (they only see the agent's
+ * edits, not what it read before editing); the server's refusal is the authority. The value may
+ * run ahead of the applied LSN while the daemon holds those entries for the next safe point.
+ */
+async function reread(worktree: string, conflictsWith: number[], log?: (line: string) => void): Promise<void> {
+  await withWorktreeLock(worktree, async () => {
+    const state = await readState(worktree);
+    const readBaseLsn = Math.max(state.readBaseLsn ?? 0, ...conflictsWith);
+    if (readBaseLsn === state.readBaseLsn) return;
+    await writeState(worktree, { ...state, readBaseLsn });
+    log?.(`reads are checked from #${readBaseLsn} from now on: the server named what to re-read`);
+  });
 }

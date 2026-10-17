@@ -9,7 +9,8 @@ export interface State {
   /**
    * The applied LSN when the agent's current work in `@` began, recorded by the daemon the first
    * time it applies an entry over unfinished edits. Sent as `readBaseLsn` with the commit, so the
-   * server checks the agent's reads from there; cleared when the commit lands.
+   * server checks the agent's reads from there; moved past the entries a skew refusal named, and
+   * cleared when the commit lands.
    */
   readBaseLsn?: number;
   /** The open intent declared for the current task; heartbeats keep it alive, the next commit closes it. */

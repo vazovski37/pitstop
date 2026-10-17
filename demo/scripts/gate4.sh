@@ -269,12 +269,9 @@ export function renderProfile(userId: string): string {
 }
 EOF
 (cd "$work/B" && npx tsc -p tsconfig.json --noEmit && npx vitest run --silent >/dev/null) || { echo "B's adapted page does not pass its checks"; exit 1; }
-# The daemon keeps readBaseLsn at the LSN its unfinished edits began at until a commit succeeds, so the
-# adapted commit would still be checked from #1 and refused as the same skew, forever. Once a safe
-# point has delivered its notes the agent knows everything up to the applied LSN, and that is where
-# the read base belongs: the daemon should advance it there. Until it does, this stands in for it.
-# (Found by this gate on 2026-10-17; the daemon is the teammate's.)
-node -e 'const fs=require("fs");const p=process.argv[1];const s=JSON.parse(fs.readFileSync(p,"utf8"));delete s.readBaseLsn;fs.writeFileSync(p,JSON.stringify(s,null,2)+"\n")' "$work/B/.pitstop/state.json"
+# The skew refusal above named #2 as what B read past, so B's daemon now checks B's reads from #2
+# (readBaseLsn in B/.pitstop/state.json): the adapted commit is not refused for the same skew again.
+grep -q '"readBaseLsn": 2' "$work/B/.pitstop/state.json" || { echo "B's daemon did not move readBaseLsn past #2 after the refusal:"; cat "$work/B/.pitstop/state.json"; exit 1; }
 b "${daemon[@]}" commit -m "Show last-seen on the profile page" | tee "$work/b-commit-2.txt"
 grep -q "#3" "$work/b-commit-2.txt" || { echo "B's adapted commit did not land as #3"; exit 1; }
 
