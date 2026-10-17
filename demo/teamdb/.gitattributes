@@ -1,0 +1,2 @@
+# Same bytes on both laptops: LF in the repo, whatever the OS.
+* text=auto eol=lf
