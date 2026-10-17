@@ -1,11 +1,13 @@
 #!/usr/bin/env node
 /**
- * Wires a worktree's Claude Code config to Pitstop:
+ * Wires a worktree's Claude Code config to a from-source build of Pitstop, by absolute path:
  *   .mcp.json                 the pitstop MCP server (this package's index.js), with PITSTOP_WORKTREE
  *   .claude/settings.json     a PostToolUse hook running this package's hook.js
  *
  * Usage: node mcp/dist/setup.js [worktree]   (default: the current directory)
- * Existing keys in both files are kept; only the pitstop entries are set.
+ * Existing keys in both files are kept; only the pitstop entries are set. With pitstop-cli
+ * installed, `pitstop setup` does this instead, by command name (daemon/src/wire.ts), plus
+ * CLAUDE.local.md and the git excludes; each replaces the other's entries.
  */
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
@@ -49,7 +51,8 @@ export async function setupWorktree(worktree: string, scriptsDir = dirname(fileU
   const command = `node "${hookScript}"`;
   const post = Array.isArray(hooks.PostToolUse) ? (hooks.PostToolUse as Json[]) : [];
   const ours = { matcher: "", hooks: [{ type: "command", command, timeout: 60 }] };
-  const kept = post.filter((entry) => !JSON.stringify(entry).includes("hook.js"));
+  // Ours from an earlier run, or the by-name one `pitstop setup` writes (daemon/src/wire.ts).
+  const kept = post.filter((entry) => !/hook\.js|pitstop-hook/.test(JSON.stringify(entry)));
   hooks.PostToolUse = [...kept, ours];
   current.hooks = hooks;
   await writeFile(settings, `${JSON.stringify(current, null, 2)}\n`);

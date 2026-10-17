@@ -12,14 +12,29 @@ export interface ToolResult {
 const ok = (text: string): ToolResult => ({ text });
 const fail = (text: string): ToolResult => ({ text, isError: true });
 
-const guarded = async (fn: () => Promise<ToolResult>): Promise<ToolResult> => {
-  try {
-    return await fn();
-  } catch (err) {
-    if (err instanceof NoDaemon) return fail(err.message);
-    return fail(err instanceof Error ? err.message : String(err));
-  }
-};
+export interface ToolOptions {
+  /**
+   * Starts the worktree's daemon when a tool finds none (autostart.ts); true when one answers
+   * afterwards, and the tool is tried once more.
+   */
+  ensureDaemon?: () => Promise<boolean>;
+}
+
+const guard =
+  (opts: ToolOptions) =>
+  async (fn: () => Promise<ToolResult>): Promise<ToolResult> => {
+    try {
+      try {
+        return await fn();
+      } catch (err) {
+        if (!(err instanceof NoDaemon) || opts.ensureDaemon === undefined) throw err;
+        if (!(await opts.ensureDaemon())) return fail(`${err.message} Starting one did not work: .pitstop/daemon.log there says why.`);
+        return await fn();
+      }
+    } catch (err) {
+      return fail(err instanceof Error ? err.message : String(err));
+    }
+  };
 
 export const DESCRIPTIONS = {
   declare_intent:
@@ -31,7 +46,8 @@ export const DESCRIPTIONS = {
   status: "Where this worktree stands: applied and head LSN, pending entries, your open intent, other agents' open intents.",
 } as const;
 
-export function makeTools(client: DaemonClient) {
+export function makeTools(client: DaemonClient, opts: ToolOptions = {}) {
+  const guarded = guard(opts);
   return {
     declare_intent: (text: string, symbols: string[] = []) =>
       guarded(async () => {

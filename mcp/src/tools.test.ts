@@ -97,7 +97,7 @@ describe("MCP tools against a fake daemon", () => {
 
   it("says so when no daemon runs", async () => {
     const tools = makeTools(new DaemonClient(worktree));
-    expect(await tools.status()).toEqual({ text: `No daemon is running in ${worktree}: start \`pitstop daemon\` there.`, isError: true });
+    expect(await tools.status()).toEqual({ text: `No daemon is running in ${worktree}: run \`pitstop start\` there.`, isError: true });
   });
 });
 
