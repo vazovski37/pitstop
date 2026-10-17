@@ -16,6 +16,9 @@ The single source of truth: the write-ahead log, the commit API, the WebSocket s
 ## Repositories
 One server, many repositories (`repos` table, migration 003). LSNs count per repository and every log table is keyed by `(repo, lsn)`; `PgStore.append` locks per repository. A request without `repo` means `local/default`; an unknown repository is `invalid_request` (`POST /repos` first). A stream socket follows one repository from its `subscribe` on and is answered with `head` before any entry. `GET /repos`, `GET /repos/:owner/:name`, `GET /log?repo=`.
 
+## Mirror
+`src/mirror.ts` with `src/github.ts`: when `MIRROR_GITHUB_TOKEN` is set, every accepted entry of a repository with a mirror (`PUT /repos/:owner/:name/mirror`, table `repo_mirrors`) becomes a commit on its GitHub branch through the Git Data API, no git binary and no clone. Commits use the daemon's recipe (`daemon/src/jj.ts`, `buildCommit`: author `agent <developer@pitstop.local>`, committer `pitstop daemon`, both dates `createdAt`, message `#lsn intent`), so every laptop and GitHub name the same commit; the worker warns when GitHub's id differs. One worker per repository, in LSN order, position in Postgres; a push that is not a fast-forward marks the mirror `diverged` until a new `PUT`. The mirror is an export, never the truth.
+
 ## Access
 `PITSTOP_TOKEN`, when set, guards every route except `/healthz` and `/version`: `Authorization: Bearer <token>`, or `?token=` where a browser cannot set headers. Unset means open; keep it set on Azure (`infra/main.bicep` wires the GitHub secret).
 

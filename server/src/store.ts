@@ -45,6 +45,39 @@ export interface Store {
   openIntent(req: IntentRequest): Promise<Intent>;
   /** Refreshes an open intent's heartbeat. Unknown or closed intents are ignored. */
   heartbeat(intentId: string): Promise<void>;
+  getMirror(repo: RepoId): Promise<Mirror | undefined>;
+  /** Creates or replaces the repository's mirror; its position starts over at `baseCommit`. */
+  setMirror(repo: RepoId, config: MirrorConfig): Promise<Mirror>;
+  deleteMirror(repo: RepoId): Promise<void>;
+  updateMirror(repo: RepoId, patch: MirrorPatch): Promise<void>;
+  listMirrors(): Promise<Mirror[]>;
+}
+
+/** Where a repository's entries are pushed as git commits (mirror.ts). */
+export interface MirrorConfig {
+  /** `owner/name` on github.com. */
+  githubRepo: string;
+  branch: string;
+  /** The commit the first mirrored entry builds on: what the import was made from. */
+  baseCommit: string;
+}
+export type MirrorStatus = "enabled" | "diverged" | "error";
+export interface Mirror extends MirrorConfig {
+  repo: RepoId;
+  /** The last entry pushed; 0 before the first. */
+  lastLsn: Lsn;
+  /** Its commit; `baseCommit` before the first push. */
+  lastCommit: string;
+  status: MirrorStatus;
+  error?: string;
+  updatedAt: string;
+}
+export interface MirrorPatch {
+  lastLsn?: Lsn;
+  lastCommit?: string;
+  status?: MirrorStatus;
+  /** `null` clears it. */
+  error?: string | null;
 }
 
 /** Path to text. */
@@ -130,6 +163,7 @@ export class MemoryStore implements Store {
   private readonly repos = new Map<RepoId, Repo>([[DEFAULT_REPO, { id: DEFAULT_REPO, headLsn: 0, createdAt: new Date().toISOString() }]]);
   private readonly byKey = new Map<string, Changeset>();
   private readonly intents = new Map<string, Intent>();
+  private readonly mirrors = new Map<RepoId, Mirror>();
 
   async append(req: CommitRequest, decide?: Decide): Promise<Changeset> {
     const seen = this.byKey.get(req.idempotencyKey);
@@ -217,6 +251,35 @@ export class MemoryStore implements Store {
   async heartbeat(intentId: string): Promise<void> {
     const intent = this.intents.get(intentId);
     if (intent?.status === "open") this.intents.set(intentId, { ...intent, heartbeatAt: new Date().toISOString() });
+  }
+
+  async getMirror(repo: RepoId): Promise<Mirror | undefined> {
+    return this.mirrors.get(repo);
+  }
+
+  async setMirror(repo: RepoId, config: MirrorConfig): Promise<Mirror> {
+    if (!this.repos.has(repo)) throw unknownRepo(repo);
+    const mirror: Mirror = { repo, ...config, lastLsn: 0, lastCommit: config.baseCommit, status: "enabled", updatedAt: new Date().toISOString() };
+    this.mirrors.set(repo, mirror);
+    return mirror;
+  }
+
+  async deleteMirror(repo: RepoId): Promise<void> {
+    this.mirrors.delete(repo);
+  }
+
+  async updateMirror(repo: RepoId, patch: MirrorPatch): Promise<void> {
+    const mirror = this.mirrors.get(repo);
+    if (mirror === undefined) return;
+    const { error, ...rest } = patch;
+    const next: Mirror = { ...mirror, ...rest, updatedAt: new Date().toISOString() };
+    if (error === null) delete next.error;
+    else if (error !== undefined) next.error = error;
+    this.mirrors.set(repo, next);
+  }
+
+  async listMirrors(): Promise<Mirror[]> {
+    return [...this.mirrors.values()].sort((a, b) => a.repo.localeCompare(b.repo));
   }
 
   /** For tests. */

@@ -20,9 +20,39 @@ import {
   SKIPPED_CHECKS,
   unknownRepo,
   type Decide,
+  type Mirror,
+  type MirrorConfig,
+  type MirrorPatch,
+  type MirrorStatus,
   type Store,
   type Tree,
 } from "./store.js";
+
+interface MirrorRow {
+  repo: string;
+  github_repo: string;
+  branch: string;
+  base_commit: string;
+  last_lsn: number;
+  last_commit: string;
+  status: MirrorStatus;
+  error: string | null;
+  updated_at: Date;
+}
+
+const MIRROR_COLUMNS = "repo, github_repo, branch, base_commit, last_lsn::int as last_lsn, last_commit, status, error, updated_at";
+
+const mirrorOf = (row: MirrorRow): Mirror => ({
+  repo: row.repo,
+  githubRepo: row.github_repo,
+  branch: row.branch,
+  baseCommit: row.base_commit,
+  lastLsn: row.last_lsn,
+  lastCommit: row.last_commit,
+  status: row.status,
+  ...(row.error === null ? {} : { error: row.error }),
+  updatedAt: row.updated_at.toISOString(),
+});
 
 /** A pool or a client inside a transaction; both answer `query`. */
 interface Queryable {
@@ -242,6 +272,51 @@ export class PgStore implements Store {
 
   async heartbeat(intentId: string): Promise<void> {
     await this.pool.query("update intents set heartbeat_at = now() where id = $1 and status = 'open'", [intentId]);
+  }
+
+  async getMirror(repo: RepoId): Promise<Mirror | undefined> {
+    const res = await this.pool.query<MirrorRow>(`select ${MIRROR_COLUMNS} from repo_mirrors where repo = $1`, [repo]);
+    const row = res.rows[0];
+    return row === undefined ? undefined : mirrorOf(row);
+  }
+
+  async setMirror(repo: RepoId, config: MirrorConfig): Promise<Mirror> {
+    const known = await this.pool.query("select 1 from repos where id = $1", [repo]);
+    if ((known.rowCount ?? 0) === 0) throw unknownRepo(repo);
+    const res = await this.pool.query<MirrorRow>(
+      `insert into repo_mirrors (repo, github_repo, branch, base_commit, last_lsn, last_commit, status, error, updated_at)
+       values ($1, $2, $3, $4, 0, $4, 'enabled', null, now())
+       on conflict (repo) do update set github_repo = excluded.github_repo, branch = excluded.branch,
+         base_commit = excluded.base_commit, last_lsn = 0, last_commit = excluded.base_commit,
+         status = 'enabled', error = null, updated_at = now()
+       returning ${MIRROR_COLUMNS}`,
+      [repo, config.githubRepo, config.branch, config.baseCommit],
+    );
+    const row = res.rows[0];
+    if (row === undefined) throw new Error(`mirror of ${repo} not readable after insert`);
+    return mirrorOf(row);
+  }
+
+  async deleteMirror(repo: RepoId): Promise<void> {
+    await this.pool.query("delete from repo_mirrors where repo = $1", [repo]);
+  }
+
+  async updateMirror(repo: RepoId, patch: MirrorPatch): Promise<void> {
+    await this.pool.query(
+      `update repo_mirrors set
+         last_lsn = coalesce($2, last_lsn),
+         last_commit = coalesce($3, last_commit),
+         status = coalesce($4, status),
+         error = case when $5::boolean then null else coalesce($6, error) end,
+         updated_at = now()
+       where repo = $1`,
+      [repo, patch.lastLsn ?? null, patch.lastCommit ?? null, patch.status ?? null, patch.error === null, patch.error ?? null],
+    );
+  }
+
+  async listMirrors(): Promise<Mirror[]> {
+    const res = await this.pool.query<MirrorRow>(`select ${MIRROR_COLUMNS} from repo_mirrors order by repo`);
+    return res.rows.map(mirrorOf);
   }
 
   private async head(db: Queryable, repo: RepoId): Promise<Lsn> {

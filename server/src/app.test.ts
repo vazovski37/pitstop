@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { CommitResponse, Health, Intent, type CommitRequest } from "@pitstop/protocol";
 import { buildApp, type AppDeps } from "./app.js";
+import type { GitHubClient } from "./github.js";
 import { blobHash, MemoryStore } from "./store.js";
 
 const content = "export const a = 1;\n";
@@ -382,6 +383,66 @@ describe("repair (PITSTOP_REPAIR)", () => {
     const { app, commit } = await start(true, { repair: "groq", repairer: { propose: async () => { throw new Error("must not be called"); } } });
     await commit("import", importRepo);
     expect((await commit("auth-fix", authFix)).statusCode).toBe(200);
+    await app.close();
+  });
+});
+
+describe("the git mirror", () => {
+  const base = "c".repeat(40);
+  const fakeGithub = () => {
+    const refs = new Map<string, string>([["vazovski37/pitstop@main", base]]);
+    const commits: { message: string; parents: string[] }[] = [];
+    const client: GitHubClient = {
+      getRef: async (repo, branch) => refs.get(`${repo}@${branch}`) ?? "",
+      getCommit: async (_r, sha) => ({ sha, tree: `tree-of-${sha.slice(0, 7)}` }),
+      getTree: async () => [],
+      createTree: async (_r, baseTree) => `${baseTree}+`,
+      createCommit: async (_r, input) => {
+        commits.push({ message: input.message, parents: input.parents });
+        return `commit-${commits.length}`.padEnd(40, "0");
+      },
+      updateRef: async (repo, branch, sha) => {
+        refs.set(`${repo}@${branch}`, sha);
+      },
+    };
+    return { client, refs, commits };
+  };
+  const mirrored = async (app: Awaited<ReturnType<typeof buildApp>>, expected: number) => {
+    for (let i = 0; i < 100; i++) {
+      const res = await app.inject({ method: "GET", url: "/repos/local/default/mirror" });
+      if ((res.json() as { lastLsn: number }).lastLsn >= expected) return res.json();
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    throw new Error(`the mirror never reached #${expected}`);
+  };
+
+  it("answers 501 without a GitHub token", async () => {
+    const { app } = await start();
+    const res = await app.inject({ method: "PUT", url: "/repos/local/default/mirror", payload: { github: "vazovski37/pitstop" } });
+    expect(res.statusCode).toBe(501);
+    await app.close();
+  });
+
+  it("is configured per repository and pushes every accepted entry", async () => {
+    const github = fakeGithub();
+    const { app, commit } = await start(true, { github: github.client });
+    expect((await app.inject({ method: "GET", url: "/repos/local/default/mirror" })).statusCode).toBe(404);
+    const put = await app.inject({ method: "PUT", url: "/repos/local/default/mirror", payload: { github: "vazovski37/pitstop" } });
+    expect(put.statusCode).toBe(200);
+    expect(put.json()).toMatchObject({ repo: "local/default", githubRepo: "vazovski37/pitstop", branch: "main", baseCommit: base, lastLsn: 0, status: "enabled" });
+
+    await commit("first-entry");
+    await commit("second-entry", { files: [{ path: "src/b.ts", op: "add", content }], writeSet: ["src/b.ts#b"] });
+    const mirror = await mirrored(app, 2);
+    expect(mirror).toMatchObject({ lastLsn: 2, status: "enabled" });
+    expect(github.commits.map((c) => c.message)).toEqual(["#1 add a\n", "#2 add a\n"]);
+    expect(github.commits[0]?.parents).toEqual([base]);
+    expect(github.refs.get("vazovski37/pitstop@main")).toBe((mirror as { lastCommit: string }).lastCommit);
+
+    expect((await app.inject({ method: "PUT", url: "/repos/no/such/mirror", payload: { github: "x/y" } })).statusCode).toBe(404);
+    expect((await app.inject({ method: "PUT", url: "/repos/local/default/mirror", payload: { github: "not a repo" } })).statusCode).toBe(400);
+    expect((await app.inject({ method: "DELETE", url: "/repos/local/default/mirror" })).statusCode).toBe(204);
+    expect((await app.inject({ method: "GET", url: "/repos/local/default/mirror" })).statusCode).toBe(404);
     await app.close();
   });
 });

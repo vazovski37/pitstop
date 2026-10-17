@@ -43,6 +43,10 @@ param groqModel string = 'openai/gpt-oss-120b'
 @secure()
 param pitstopToken string = ''
 
+@description('GitHub token for the git mirror (Phase 3): Contents write on the mirrored repositories. Empty turns mirroring off.')
+@secure()
+param mirrorGithubToken string = ''
+
 var suffix = uniqueString(resourceGroup().id)
 // Registry names allow only letters and digits.
 var acrName = take('${replace(toLower(prefix), '-', '')}acr${suffix}', 50)
@@ -175,6 +179,12 @@ var tokenSecrets = empty(pitstopToken) ? [] : [
 var tokenEnv = empty(pitstopToken) ? [] : [
   { name: 'PITSTOP_TOKEN', secretRef: 'pitstop-token' }
 ]
+var mirrorSecrets = empty(mirrorGithubToken) ? [] : [
+  { name: 'mirror-github-token', value: mirrorGithubToken }
+]
+var mirrorEnv = empty(mirrorGithubToken) ? [] : [
+  { name: 'MIRROR_GITHUB_TOKEN', secretRef: 'mirror-github-token' }
+]
 
 resource app 'Microsoft.App/containerApps@2024-03-01' = if (deployApp) {
   name: '${prefix}-server'
@@ -201,14 +211,14 @@ resource app 'Microsoft.App/containerApps@2024-03-01' = if (deployApp) {
           identity: appIdentity.id
         }
       ]
-      secrets: concat(baseSecrets, aiSecrets, tokenSecrets)
+      secrets: concat(baseSecrets, aiSecrets, tokenSecrets, mirrorSecrets)
     }
     template: {
       containers: [
         {
           name: 'server'
           image: containerImage
-          env: concat(baseEnv, aiEnv, tokenEnv)
+          env: concat(baseEnv, aiEnv, tokenEnv, mirrorEnv)
           resources: {
             cpu: json('0.5')
             memory: '1Gi'
