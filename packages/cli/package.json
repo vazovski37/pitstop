@@ -1,6 +1,6 @@
 {
   "name": "pitstop-cli",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Pitstop's client: the pitstop CLI and daemon, the MCP server and the hook for Claude Code",
   "type": "module",
   "bin": {

@@ -161,7 +161,8 @@ describe("setup", () => {
       expect(mcp.mcpServers.other).toEqual({ command: "x" });
       expect(mcp.mcpServers.pitstop).toEqual({ command: "node", args: [join(scripts, "index.js")], env: { PITSTOP_WORKTREE: worktree } });
       const settings = JSON.parse(await readFile(r.settings, "utf8")) as { permissions: unknown; hooks: { PostToolUse: unknown[] } };
-      expect(settings.permissions).toEqual({ allow: ["Bash(npm test)"] });
+      // The pitstop tools join the allow list, which keeps what was there.
+      expect(settings.permissions).toEqual({ allow: ["Bash(npm test)", "mcp__pitstop"] });
       expect(settings.hooks.PostToolUse).toEqual([
         userHook,
         { matcher: "", hooks: [{ type: "command", command: "npx prettier --write ." }] },

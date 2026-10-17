@@ -2,7 +2,7 @@
  * Wires a checkout's Claude Code to Pitstop, with command names instead of paths, so the files
  * work on any laptop that installed pitstop-cli (`npm install -g <server>/pitstop-cli.tgz`):
  *   .mcp.json                    the `pitstop` MCP server, `pitstop-mcp` (`cmd /c pitstop-mcp` on Windows)
- *   .claude/settings.local.json  a PostToolUse hook running `pitstop-hook`; the server enabled
+ *   .claude/settings.local.json  a PostToolUse hook running `pitstop-hook`; the server enabled, its tools allowed
  *   CLAUDE.local.md              the house rules for the agent, between pitstop markers
  * Whatever else those files hold is kept. All three go into `.git/info/exclude`, so jj never
  * snapshots them into the agent's work and no commit carries them. The rest of `.claude/` (the
@@ -25,6 +25,15 @@ type Json = Record<string, unknown>;
 
 export const MCP_COMMAND = "pitstop-mcp";
 export const HOOK_COMMAND = "pitstop-hook";
+/** Claude Code's permission rule for every tool of the `pitstop` MCP server. */
+export const PITSTOP_TOOLS = "mcp__pitstop";
+
+/** `settings` with the pitstop tools in `permissions.allow`, once; everything else kept. */
+export function allowPitstopTools(settings: Json): Json {
+  const permissions = asObject(settings.permissions);
+  const allow = asArray(permissions.allow).filter((s): s is string => typeof s === "string");
+  return { ...settings, permissions: { ...permissions, allow: allow.includes(PITSTOP_TOOLS) ? allow : [...allow, PITSTOP_TOOLS] } };
+}
 
 /** The files the wiring writes, relative to the checkout, posix. */
 export const WIRING_FILES = [".mcp.json", ".claude/settings.local.json", "CLAUDE.local.md"];
@@ -168,7 +177,9 @@ export async function wireClaudeCode(checkout: string, opts: WireOptions): Promi
       const enabled = asArray(current.enabledMcpjsonServers).filter((s): s is string => typeof s === "string");
       current.enabledMcpjsonServers = enabled.includes("pitstop") ? enabled : [...enabled, "pitstop"];
     }
-    await writeJson(local, current);
+    // The pitstop tools run without Claude Code asking before each call (the owner's choice,
+    // 18 October 2026): declaring an intent and committing are the agent's normal loop.
+    await writeJson(local, allowPitstopTools(current));
     written.push(local);
   }
 
