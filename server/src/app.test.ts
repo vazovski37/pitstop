@@ -215,11 +215,11 @@ describe("with PITSTOP_TOKEN set", () => {
     await app.close();
   });
 
-  it("accepts the bearer header or ?token=", async () => {
+  it("accepts the bearer header; ?token= only on /stream, so tokens stay out of URLs elsewhere", async () => {
     const app = await guarded();
     const header = await app.inject({ method: "GET", url: "/log", headers: { authorization: `Bearer ${token}` } });
     expect(header.statusCode).toBe(200);
-    expect((await app.inject({ method: "GET", url: `/log?token=${token}` })).statusCode).toBe(200);
+    expect((await app.inject({ method: "GET", url: `/log?token=${token}` })).statusCode).toBe(401);
     await app.close();
   });
 });
@@ -512,43 +512,105 @@ describe("accounts", () => {
     const alice = await tokenFor(store, "alice", 1001);
     const bob = await tokenFor(store, "bob", 1002);
 
-    expect((await app.inject({ method: "POST", url: "/repos", payload: { id: "acme/app" } })).statusCode).toBe(401);
-    expect((await app.inject({ method: "POST", url: "/repos", payload: { id: "acme/app" }, headers: bearer(alice) })).statusCode).toBe(201);
-    expect((await app.inject({ method: "GET", url: "/repos/acme/app/members", headers: bearer(alice) })).json()).toEqual([{ login: "alice", role: "owner" }]);
+    expect((await app.inject({ method: "POST", url: "/repos", payload: { id: "alice/app" } })).statusCode).toBe(401);
+    expect((await app.inject({ method: "POST", url: "/repos", payload: { id: "alice/app" }, headers: bearer(alice) })).statusCode).toBe(201);
+    expect((await app.inject({ method: "GET", url: "/repos/alice/app/members", headers: bearer(alice) })).json()).toEqual([{ login: "alice", role: "owner" }]);
 
-    expect((await app.inject({ method: "POST", url: "/commit", payload: request("bob-1", { repo: "acme/app" }), headers: bearer(bob) })).statusCode).toBe(403);
-    expect((await app.inject({ method: "GET", url: "/repos/acme/app", headers: bearer(bob) })).statusCode).toBe(403);
-    expect((await app.inject({ method: "GET", url: "/log?repo=acme/app" })).statusCode).toBe(401);
-    expect((await app.inject({ method: "PUT", url: "/repos/acme/app/members/bob", payload: { role: "writer" }, headers: bearer(bob) })).statusCode).toBe(403);
+    expect((await app.inject({ method: "POST", url: "/commit", payload: request("bob-1", { repo: "alice/app" }), headers: bearer(bob) })).statusCode).toBe(403);
+    expect((await app.inject({ method: "GET", url: "/repos/alice/app", headers: bearer(bob) })).statusCode).toBe(403);
+    expect((await app.inject({ method: "GET", url: "/log?repo=alice/app" })).statusCode).toBe(401);
+    expect((await app.inject({ method: "PUT", url: "/repos/alice/app/members/bob", payload: { role: "writer" }, headers: bearer(bob) })).statusCode).toBe(403);
 
-    expect((await app.inject({ method: "PUT", url: "/repos/acme/app/members/bob", payload: { role: "writer" }, headers: bearer(alice) })).statusCode).toBe(200);
-    expect((await app.inject({ method: "PUT", url: "/repos/acme/app/members/nobody", payload: { role: "writer" }, headers: bearer(alice) })).statusCode).toBe(404);
-    const landed = await app.inject({ method: "POST", url: "/commit", payload: request("bob-1", { repo: "acme/app" }), headers: bearer(bob) });
+    expect((await app.inject({ method: "PUT", url: "/repos/alice/app/members/bob", payload: { role: "writer" }, headers: bearer(alice) })).statusCode).toBe(200);
+    expect((await app.inject({ method: "PUT", url: "/repos/alice/app/members/nobody", payload: { role: "writer" }, headers: bearer(alice) })).statusCode).toBe(404);
+    const landed = await app.inject({ method: "POST", url: "/commit", payload: request("bob-1", { repo: "alice/app" }), headers: bearer(bob) });
     expect(landed.statusCode).toBe(200);
     expect(CommitResponse.parse(landed.json())).toMatchObject({ status: "accepted", changeset: { author: { developer: "bob", agent: "agent-a" } } });
-    expect((await app.inject({ method: "GET", url: "/repos", headers: bearer(bob) })).json()).toEqual([expect.objectContaining({ id: "acme/app" }), expect.objectContaining({ id: "local/default" })]);
+    // Only what bob is a member of: local/default has no members, so it is closed to users.
+    expect((await app.inject({ method: "GET", url: "/repos", headers: bearer(bob) })).json()).toEqual([expect.objectContaining({ id: "alice/app" })]);
 
-    expect((await app.inject({ method: "PATCH", url: "/repos/acme/app", payload: { visibility: "public" }, headers: bearer(bob) })).statusCode).toBe(403);
-    expect((await app.inject({ method: "PATCH", url: "/repos/acme/app", payload: { visibility: "public" }, headers: bearer(alice) })).statusCode).toBe(200);
-    expect((await app.inject({ method: "GET", url: "/log?repo=acme/app" })).statusCode).toBe(200);
-    expect((await app.inject({ method: "POST", url: "/commit", payload: request("anon-1", { repo: "acme/app" }) })).statusCode).toBe(401);
+    expect((await app.inject({ method: "PATCH", url: "/repos/alice/app", payload: { visibility: "public" }, headers: bearer(bob) })).statusCode).toBe(403);
+    expect((await app.inject({ method: "PATCH", url: "/repos/alice/app", payload: { visibility: "public" }, headers: bearer(alice) })).statusCode).toBe(200);
+    expect((await app.inject({ method: "GET", url: "/log?repo=alice/app" })).statusCode).toBe(200);
+    expect((await app.inject({ method: "POST", url: "/commit", payload: request("anon-1", { repo: "alice/app" }) })).statusCode).toBe(401);
 
-    expect((await app.inject({ method: "DELETE", url: "/repos/acme/app/members/bob", headers: bearer(alice) })).statusCode).toBe(204);
-    expect((await app.inject({ method: "POST", url: "/commit", payload: request("bob-2", { repo: "acme/app" }), headers: bearer(bob) })).statusCode).toBe(403);
-    expect((await app.inject({ method: "GET", url: "/repos/acme/app", headers: bearer(bob) })).statusCode).toBe(200); // public now
+    expect((await app.inject({ method: "DELETE", url: "/repos/alice/app/members/bob", headers: bearer(alice) })).statusCode).toBe(204);
+    expect((await app.inject({ method: "POST", url: "/commit", payload: request("bob-2", { repo: "alice/app" }), headers: bearer(bob) })).statusCode).toBe(403);
+    expect((await app.inject({ method: "GET", url: "/repos/alice/app", headers: bearer(bob) })).statusCode).toBe(200); // public now
 
-    // The shared token stays the super-user; a repository with no members is open to any signed-in user.
-    expect((await commit("default-by-bob", { repo: "local/default" }, bearer(bob))).statusCode).toBe(200);
+    // A repository with no members is closed to users: the first stranger to sign in cannot take it.
+    expect((await commit("default-by-bob", { repo: "local/default" }, bearer(bob))).statusCode).toBe(403);
+    expect((await app.inject({ method: "PUT", url: "/repos/local/default/members/bob", payload: { role: "owner" }, headers: bearer(bob) })).statusCode).toBe(403);
     await app.close();
   });
 
-  it("the shared token still does everything when accounts are on", async () => {
-    const { app, store, commit } = await accounts({ token: "the-shared-token-1234" });
+  it("creates repositories only under the user's own login, and says a taken name is taken", async () => {
+    const { app, store } = await accounts();
+    const alice = await tokenFor(store, "Alice", 1001);
+    const bob = await tokenFor(store, "bob", 1002);
+    const create = (id: string, token: string) => app.inject({ method: "POST", url: "/repos", payload: { id }, headers: bearer(token) });
+    const squat = await create("microsoft/app", alice);
+    expect(squat.statusCode).toBe(403);
+    expect(squat.json()).toMatchObject({ message: "repositories are created under your login: alice/<name>" });
+    expect((await create("alice/app", alice)).statusCode).toBe(201); // the login lowercased
+    expect((await create("alice/app", alice)).statusCode).toBe(200); // idempotent for its owner (pitstop init)
+    expect((await create("alice/app", bob)).statusCode).toBe(403); // not bob's namespace
+    await app.close();
+  });
+
+  it("never leaves a repository without an owner; a member may leave", async () => {
+    const { app, store } = await accounts();
     const alice = await tokenFor(store, "alice", 1001);
-    await app.inject({ method: "POST", url: "/repos", payload: { id: "acme/app" }, headers: bearer(alice) });
-    expect((await commit("shared-1", { repo: "acme/app" }, bearer("the-shared-token-1234"))).statusCode).toBe(200);
-    expect((await app.inject({ method: "GET", url: "/repos/acme/app/mirror", headers: bearer("the-shared-token-1234") })).statusCode).toBe(404);
+    const bob = await tokenFor(store, "bob", 1002);
+    await app.inject({ method: "POST", url: "/repos", payload: { id: "alice/app" }, headers: bearer(alice) });
+    const member = (login: string, role: string, token: string) =>
+      app.inject({ method: "PUT", url: `/repos/alice/app/members/${login}`, payload: { role }, headers: bearer(token) });
+    expect((await member("alice", "writer", alice)).statusCode).toBe(409);
+    expect((await app.inject({ method: "DELETE", url: "/repos/alice/app/members/alice", headers: bearer(alice) })).statusCode).toBe(409);
+    expect((await member("bob", "writer", alice)).statusCode).toBe(200);
+    expect((await app.inject({ method: "DELETE", url: "/repos/alice/app/members/bob", headers: bearer(bob) })).statusCode).toBe(204); // bob leaves
+    expect((await member("bob", "owner", alice)).statusCode).toBe(200);
+    expect((await member("alice", "writer", alice)).statusCode).toBe(200); // bob owns it now
+    expect((await app.inject({ method: "GET", url: "/repos/alice/app/members", headers: bearer(bob) })).json()).toEqual(
+      expect.arrayContaining([{ login: "alice", role: "writer" }, { login: "bob", role: "owner" }]),
+    );
+    await app.close();
+  });
+
+  it("the shared token still does everything when accounts are on, and alone configures mirrors", async () => {
+    const shared = "the-shared-token-1234";
+    const github: GitHubClient = {
+      getRef: async () => "c".repeat(40),
+      getCommit: async (_r, sha) => ({ sha, tree: "t" }),
+      getTree: async () => [],
+      createTree: async () => "t2",
+      createCommit: async () => "d".repeat(40),
+      updateRef: async () => undefined,
+    };
+    const { app, store, commit } = await accounts({ token: shared, github });
+    const alice = await tokenFor(store, "alice", 1001);
+    await app.inject({ method: "POST", url: "/repos", payload: { id: "alice/app" }, headers: bearer(alice) });
+    expect((await commit("shared-1", { repo: "alice/app" }, bearer(shared))).statusCode).toBe(200);
+    expect((await app.inject({ method: "GET", url: "/repos/alice/app/mirror", headers: bearer(shared) })).statusCode).toBe(404);
     expect((await app.inject({ method: "GET", url: "/log" })).statusCode).toBe(401);
+    // The owner may not aim the server's GitHub token anywhere; the administrator may.
+    const aim = (token: string) => app.inject({ method: "PUT", url: "/repos/alice/app/mirror", payload: { github: "vazovski37/pitstop" }, headers: bearer(token) });
+    expect((await aim(alice)).statusCode).toBe(403);
+    expect((await aim(shared)).statusCode).toBe(200);
+    expect((await app.inject({ method: "DELETE", url: "/repos/alice/app/mirror", headers: bearer(alice) })).statusCode).toBe(403);
+    // The administrator makes the repositories it created reachable by adding their owner.
+    await app.inject({ method: "POST", url: "/repos", payload: { id: "team/legacy" }, headers: bearer(shared) });
+    expect((await app.inject({ method: "GET", url: "/repos/team/legacy", headers: bearer(alice) })).statusCode).toBe(403);
+    expect((await app.inject({ method: "PUT", url: "/repos/team/legacy/members/alice", payload: { role: "owner" }, headers: bearer(shared) })).statusCode).toBe(200);
+    expect((await app.inject({ method: "GET", url: "/repos/team/legacy", headers: bearer(alice) })).statusCode).toBe(200);
+    await app.close();
+  });
+
+  it("takes a token from the URL only on /stream", async () => {
+    const { app, store } = await accounts();
+    const alice = await tokenFor(store, "alice", 1001);
+    expect((await app.inject({ method: "GET", url: `/me?token=${alice}` })).statusCode).toBe(401);
+    expect((await app.inject({ method: "GET", url: "/me", headers: bearer(alice) })).statusCode).toBe(200);
     await app.close();
   });
 });

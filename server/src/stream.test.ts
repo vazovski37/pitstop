@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { WebSocket } from "ws";
 import { Intent, ServerMessage, type CommitRequest } from "@pitstop/protocol";
 import { buildApp, type AppDeps, type WorktreesResponse } from "./app.js";
+import { sessionValue } from "./auth.js";
 import { MemoryStore } from "./store.js";
 
 const request = (key: string): CommitRequest => ({
@@ -221,6 +222,25 @@ describe("GET /stream", () => {
     reader.send({ type: "subscribe", repo: "acme/app", fromLsn: 0 });
     expect(await reader.next()).toMatchObject({ type: "head", repo: "acme/app" });
     reader.close();
+  });
+
+  it("refuses a signed-in browser's stream opened by another site (cross-site WebSocket hijacking)", async () => {
+    const oauth = { authorizeUrl: () => "https://github.test/authorize", exchange: async () => ({ githubId: 1, login: "alice" }) };
+    const store = new MemoryStore();
+    const app = await buildApp({ version: "test-sha", pingDb: async () => true, store, oauth, sessionSecret: "a-cookie-secret-for-tests" });
+    await app.listen({ host: "127.0.0.1", port: 0 });
+    cleanup = () => app.close();
+    const port = (app.server.address() as AddressInfo).port;
+    const url = `ws://127.0.0.1:${port}/stream`;
+    const alice = await store.upsertUser({ githubId: 1, login: "alice" });
+    const cookie = `pitstop_session=${encodeURIComponent(app.signCookie(sessionValue(alice)))}`;
+
+    const foreign = await connect(url, { cookie, origin: "https://evil.test" });
+    expect(await foreign.closed).toBe(1008);
+
+    const own = await connect(url, { cookie, origin: `http://127.0.0.1:${port}` });
+    expect(await own.next()).toMatchObject({ type: "hello" });
+    own.close();
   });
 
   it("closes a socket that sends something other than a ClientMessage", async () => {
