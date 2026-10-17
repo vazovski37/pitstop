@@ -41,6 +41,8 @@ export interface FakeServerOptions {
   dropOnce?: number;
   /** When set, requests without `Authorization: Bearer <token>` (or `?token=`) are refused. */
   token?: string;
+  /** Repositories that exist from the start (the default one always does). */
+  repos?: string[];
 }
 
 export interface FakeServer {
@@ -78,7 +80,8 @@ export async function startFakeServer(opts: FakeServerOptions = {}): Promise<Fak
   const received: ClientMessage[] = [];
   const commits: CommitRequest[] = [];
   const intents: Intent[] = [];
-  const repos: Repo[] = [];
+  const startedAt = new Date().toISOString();
+  const repos: Repo[] = (opts.repos ?? []).map((id) => ({ id, headLsn: 0, createdAt: startedAt }));
   const subscribers = new Map<WebSocket, { lastSentLsn: number | null }>();
   let dropped = false;
   let rejectNext: Rejection | undefined;
@@ -178,6 +181,12 @@ export async function startFakeServer(opts: FakeServerOptions = {}): Promise<Fak
       repos.push(repo);
       return json(res, 201, repo);
     }
+    if (req.method === "GET" && req.url?.startsWith("/repos/")) {
+      const id = decodeURIComponent(req.url.slice("/repos/".length));
+      const known = repos.find((r) => r.id === id) ?? (id === DEFAULT_REPO ? { id, headLsn: 0, createdAt: startedAt } : undefined);
+      if (!known) return json(res, 404, { error: "not_found", message: `unknown repo ${id}` });
+      return json(res, 200, { ...known, headLsn: headLsn() });
+    }
     if (req.method === "GET" && req.url?.startsWith("/log")) {
       const query = new URL(req.url, "http://fake").searchParams;
       const fromLsn = Number(query.get("fromLsn") ?? 0);
@@ -260,7 +269,13 @@ const isMain = process.argv[1] !== undefined && pathToFileURL(process.argv[1]).h
 if (isMain) {
   const port = Number(process.env.PITSTOP_FAKE_PORT ?? 8081);
   const token = process.env.PITSTOP_TOKEN?.trim();
-  startFakeServer({ port, ...(token ? { token } : {}) })
+  // PITSTOP_FAKE_LOG=empty starts with no entries, so an import becomes #1 (as on a new server).
+  const empty = process.env.PITSTOP_FAKE_LOG === "empty";
+  startFakeServer({
+    port,
+    ...(token ? { token } : {}),
+    ...(empty ? { messages: [{ type: "hello", serverVersion: "fake", headLsn: 0 }] } : {}),
+  })
     .then((s) => console.log(`fake pitstop server on ${s.url} (stream: ${s.streamUrl}), head #${s.headLsn()}`))
     .catch((err: unknown) => {
       console.error(err);
