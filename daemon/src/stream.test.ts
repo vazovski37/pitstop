@@ -134,6 +134,26 @@ describe("stream client", () => {
     expect(applier.lsns).toEqual([122, 124]);
   });
 
+  it("records where unfinished work began, for readBaseLsn", async () => {
+    server = await startFakeServer({ messages: threeEntries });
+    await writeState(worktree, { appliedLsn: 121 });
+    applier.changes = true;
+    const applied: number[] = [];
+    await start({ onApplied: (lsn) => applied.push(lsn) });
+    await waitFor(() => applied.includes(124));
+    expect(await readState(worktree)).toEqual({ appliedLsn: 124, readBaseLsn: 121 });
+    applier.changes = false;
+  });
+
+  it("records nothing when @ is empty", async () => {
+    server = await startFakeServer({ messages: threeEntries });
+    await writeState(worktree, { appliedLsn: 121 });
+    const applied: number[] = [];
+    await start({ onApplied: (lsn) => applied.push(lsn) });
+    await waitFor(() => applied.includes(124));
+    expect(await readState(worktree)).toEqual({ appliedLsn: 124 });
+  });
+
   it("sends the shared token", async () => {
     server = await startFakeServer({ messages: fixtureMessages(), token: "s3cret" });
     await writeState(worktree, { appliedLsn: 121 });

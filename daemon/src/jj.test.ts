@@ -114,5 +114,18 @@ describe.skipIf(!available)("JjWorktree against a real colocated repo", () => {
 
   it("reports nothing when @ is empty", async () => {
     expect(await wt.diffAgainstMain()).toEqual([]);
+    expect(await wt.hasChanges()).toBe(false);
+    await writeFile(join(dir, "a.txt"), "a1\nchanged\n");
+    expect(await wt.hasChanges()).toBe(true);
+  });
+
+  it("lists the files at main and at @, without the state directory", async () => {
+    await writeState(dir, { appliedLsn: 1 });
+    await writeFile(join(dir, "c.txt"), "c1\n");
+    expect([...(await wt.treeFiles("main")).entries()]).toEqual([
+      ["a.txt", "a1\na2\na3\n"],
+      ["b.txt", "b1\nb2\n"],
+    ]);
+    expect([...(await wt.treeFiles("@")).keys()]).toEqual(["a.txt", "b.txt", "c.txt"]);
   });
 });

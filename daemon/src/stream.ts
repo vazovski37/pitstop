@@ -120,8 +120,8 @@ export class StreamClient {
         const changeset = this.queue.shift();
         if (changeset === undefined) return;
         // `pitstop commit` runs in its own process and may have applied its own entry meanwhile.
-        const onDisk = (await readState(this.opts.worktree)).appliedLsn;
-        if (onDisk > this.applied) this.applied = onDisk;
+        const state = await readState(this.opts.worktree);
+        if (state.appliedLsn > this.applied) this.applied = state.appliedLsn;
         if (changeset.lsn <= this.applied) continue;
         if (changeset.lsn !== this.applied + 1) {
           this.opts.onGap?.(this.applied + 1, changeset.lsn);
@@ -130,10 +130,17 @@ export class StreamClient {
           this.subscribe();
           return;
         }
+        // Unfinished work in @ began at or before the current applied LSN: the server must check
+        // its reads from there, not from the LSN this entry moves the worktree to.
+        const readBaseLsn =
+          state.readBaseLsn ?? ((await this.opts.applier.hasChanges()) ? this.applied : undefined);
         const result = await this.opts.applier.apply(changeset);
         this.gaps = 0;
         this.applied = changeset.lsn;
-        await writeState(this.opts.worktree, { appliedLsn: this.applied });
+        await writeState(this.opts.worktree, {
+          appliedLsn: this.applied,
+          ...(readBaseLsn === undefined ? {} : { readBaseLsn }),
+        });
         const note = result.conflicted.length === 0 ? "" : ` (conflicts in ${result.conflicted.join(", ")})`;
         this.log(`applied #${changeset.lsn} ${changeset.intent}${note}`);
         this.send({ type: "heartbeat", appliedLsn: this.applied });

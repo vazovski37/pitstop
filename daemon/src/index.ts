@@ -4,6 +4,7 @@
  *
  *   pitstop daemon               keep this worktree in sync with the server's log
  *   pitstop commit -m "<intent>" send the agent's unfinished work in @ as a commit
+ *   pitstop import [-m "<why>"]  send every tracked file as the log's first entry
  *
  * Configuration comes from the environment (the repo's .env through `npm run dev -w @pitstop/daemon`):
  *   PITSTOP_SERVER     http://localhost:8080 by default
@@ -16,15 +17,16 @@ import { userInfo } from "node:os";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import type { Author } from "@pitstop/protocol";
-import { commit, CommitRejected } from "./commit.js";
+import { commit, CommitRejected, importWorktree } from "./commit.js";
 import { binariesFromEnv, JjWorktree } from "./jj.js";
 import { StreamClient } from "./stream.js";
 
 export { describe } from "./messages.js";
-export { commit, CommitRejected } from "./commit.js";
+export { commit, CommitRejected, importWorktree } from "./commit.js";
 export { JjWorktree, type Applier, type ApplyResult } from "./jj.js";
 export { StreamClient } from "./stream.js";
 export { readState, writeState } from "./state.js";
+export { symbolSets, type SymbolSets, type Tree } from "./symbols.js";
 
 export interface Config {
   serverUrl: string;
@@ -49,7 +51,13 @@ export const streamUrl = (serverUrl: string): string => `${serverUrl.replace(/^h
 
 const USAGE = `usage:
   pitstop daemon               sync this worktree with the server's log
-  pitstop commit -m "<intent>" commit the unfinished work in @`;
+  pitstop commit -m "<intent>" commit the unfinished work in @
+  pitstop import [-m "<why>"]  send every tracked file as the log's first entry`;
+
+const messageFlag = (args: string[]): string | undefined => {
+  const at = args.indexOf("-m");
+  return at === -1 ? undefined : args[at + 1];
+};
 
 export async function main(argv: string[], config: Config = configFromEnv()): Promise<number> {
   const [command, ...rest] = argv;
@@ -80,23 +88,25 @@ export async function main(argv: string[], config: Config = configFromEnv()): Pr
     return process.exitCode === 1 ? 1 : 0;
   }
 
-  if (command === "commit") {
-    const at = rest.indexOf("-m");
-    const intent = at === -1 ? undefined : rest[at + 1];
-    if (intent === undefined || intent.trim() === "") {
+  if (command === "commit" || command === "import") {
+    const intent = messageFlag(rest);
+    if (command === "commit" && (intent === undefined || intent.trim() === "")) {
       console.error(USAGE);
       return 2;
     }
+    const shared = {
+      serverUrl: config.serverUrl,
+      ...(config.token === undefined ? {} : { token: config.token }),
+      worktree: config.worktree,
+      applier,
+      author: config.author,
+      log,
+    };
     try {
-      const changeset = await commit({
-        serverUrl: config.serverUrl,
-        ...(config.token === undefined ? {} : { token: config.token }),
-        worktree: config.worktree,
-        applier,
-        intent,
-        author: config.author,
-        log,
-      });
+      const changeset =
+        command === "commit"
+          ? await commit({ ...shared, intent: intent ?? "" })
+          : await importWorktree({ ...shared, ...(intent === undefined ? {} : { intent }) });
       log(`#${changeset.lsn} ${changeset.intent}`);
       return 0;
     } catch (err) {

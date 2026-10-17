@@ -2,15 +2,24 @@ import { randomBytes } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
-/** What the daemon remembers between runs: the last log entry applied to this worktree. */
+/** What the daemon remembers between runs. */
 export interface State {
+  /** The last log entry applied to this worktree. */
   appliedLsn: number;
+  /**
+   * The applied LSN when the agent's current work in `@` began, recorded by the daemon the first
+   * time it applies an entry over unfinished edits. Sent as `readBaseLsn` with the commit, so the
+   * server checks the agent's reads from there; cleared when the commit lands.
+   */
+  readBaseLsn?: number;
 }
 
 export const STATE_DIR = ".pitstop";
 export const STATE_FILE = "state.json";
 
 export const statePath = (worktree: string): string => join(worktree, STATE_DIR, STATE_FILE);
+
+const isLsn = (v: unknown): v is number => typeof v === "number" && Number.isInteger(v) && v >= 0;
 
 /** The worktree's state; `appliedLsn: 0` when the daemon has never run here. */
 export async function readState(worktree: string): Promise<State> {
@@ -21,12 +30,13 @@ export async function readState(worktree: string): Promise<State> {
     if ((err as NodeJS.ErrnoException).code === "ENOENT") return { appliedLsn: 0 };
     throw err;
   }
-  const raw: unknown = JSON.parse(text);
-  const lsn = (raw as { appliedLsn?: unknown } | null)?.appliedLsn;
-  if (typeof lsn !== "number" || !Number.isInteger(lsn) || lsn < 0) {
+  const raw = JSON.parse(text) as { appliedLsn?: unknown; readBaseLsn?: unknown } | null;
+  const appliedLsn = raw?.appliedLsn;
+  const readBaseLsn = raw?.readBaseLsn;
+  if (!isLsn(appliedLsn) || (readBaseLsn !== undefined && !isLsn(readBaseLsn))) {
     throw new Error(`${statePath(worktree)} is not a daemon state file`);
   }
-  return { appliedLsn: lsn };
+  return readBaseLsn === undefined ? { appliedLsn } : { appliedLsn, readBaseLsn };
 }
 
 /**
