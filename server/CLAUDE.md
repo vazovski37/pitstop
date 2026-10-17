@@ -31,6 +31,9 @@ One server, many repositories (`repos` table, migration 003). LSNs count per rep
 ## Checks
 `src/checks.ts` runs `tsc --noEmit` on `Store.treeAt(head)` plus the commit's files, in a temp folder, with the server's own TypeScript (a dependency, so the image has it). The tree must carry its own `tsconfig.json` and need nothing from `node_modules`: the demo slice does, the pitstop repo itself does not. `PITSTOP_CHECK=always` gates every commit (a failure is `rejected constraint_failed` with tsc's errors); `off` (default) leaves it to the repair path. `treeAt` needs the repository to have entered the log as a full import at its first entry.
 
+## Live view
+`web/` (its own `CLAUDE.md`) is a static page the server serves at `/` with `@fastify/static` when `buildApp` gets `webDir`; `index.ts` takes `PITSTOP_WEB_DIR` or `web/dist` next to the server, and the Dockerfile builds it into the image. The files are open routes (`/*`): on a shared-token server the page asks for the token itself and sends it on every request. API routes are registered before the static wildcard, so they win.
+
 ## Known constraint
 The stream keeps subscribers in memory, so the Container App runs exactly one replica (`infra/main.bicep`). To scale out later, fan new entries out through Postgres `LISTEN/NOTIFY`.
 

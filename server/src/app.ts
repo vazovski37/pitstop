@@ -1,4 +1,5 @@
 import cookie from "@fastify/cookie";
+import fastifyStatic from "@fastify/static";
 import websocket from "@fastify/websocket";
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
 import {
@@ -65,6 +66,8 @@ export interface AppDeps {
   webUrl?: string;
   /** `https://host` of this server, for the OAuth redirect; derived from the request when absent. */
   publicUrl?: string;
+  /** The live view's built files (web/dist), served at `/`; absent means no page. */
+  webDir?: string;
   secureCookies?: boolean;
   /** What the validator does with write skew until AI repair exists: `warn` (default) records it, `enforce` refuses it, `off` skips validation. */
   validation?: ValidationMode;
@@ -82,7 +85,8 @@ export interface AppDeps {
 }
 
 /** Routes that stay open whatever the auth setup: the probes, and the way in. */
-const OPEN_ROUTES = new Set(["/healthz", "/version", "/auth/github", "/auth/github/callback"]);
+// `/*` is the live view's static files: the page asks for a token or a sign-in itself.
+const OPEN_ROUTES = new Set(["/healthz", "/version", "/auth/github", "/auth/github/callback", "/*"]);
 
 /** `GET /log` pages: the default and the most a client may ask for. */
 const LOG_PAGE = 100;
@@ -435,6 +439,12 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     const identity = req.identity;
     stream.connect(socket, (repo) => allowed(identity, repo, "reader", deps.store, auth));
   });
+
+  // The live view (web/): static files at /, registered last so every API route above wins over
+  // the wildcard. Open to anyone who can reach the server; the data it shows is still guarded.
+  if (deps.webDir !== undefined) {
+    await app.register(fastifyStatic, { root: deps.webDir, prefix: "/", index: ["index.html"], wildcard: true });
+  }
 
   return app;
 }

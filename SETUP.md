@@ -106,6 +106,9 @@ To see what is running in Azure: Actions → latest `Deploy` run → the `produc
 
 ---
 
+## The live view
+The server's root URL (`http://localhost:8080/` on a laptop, the Container App's URL on Azure) is the page the judges watch: the log as it grows, open intents, repairs and warnings as they happen. It is built from `web/` into the server image, so it deploys with the server. On a server with `PITSTOP_TOKEN` set, paste that token into the field at the top right once; with accounts on, sign in with GitHub instead. Locally, `npm run build -w @pitstop/web` once, then `npm run dev:server` serves it.
+
 ## Later
 
 **Server token (Phase 2)**

@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Pitstop</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <header>
+      <h1>Pitstop</h1>
+      <label class="field">repository <select id="repo"></select></label>
+      <span id="head" class="pill">head —</span>
+      <span id="conn" class="pill off" title="stream">offline</span>
+      <span class="spacer"></span>
+      <span id="who"></span>
+      <form id="token-form" hidden>
+        <input id="token" type="password" placeholder="server token" autocomplete="off" />
+        <button type="submit">use</button>
+      </form>
+      <span id="version" class="dim"></span>
+    </header>
+    <main>
+      <section id="log-panel">
+        <h2>Log <span id="count" class="dim"></span></h2>
+        <p id="empty" class="dim">Waiting for the first entry…</p>
+        <ol id="log" reversed></ol>
+      </section>
+      <section id="side">
+        <article id="detail" hidden>
+          <h2><span id="detail-title"></span> <button id="close" type="button" title="close">×</button></h2>
+          <div id="detail-body"></div>
+        </article>
+        <article>
+          <h2>Open intents <span id="intent-count" class="dim"></span></h2>
+          <ul id="intents"></ul>
+          <p id="no-intents" class="dim">None open.</p>
+        </article>
+        <article>
+          <h2>As it happens</h2>
+          <ul id="events"></ul>
+        </article>
+      </section>
+    </main>
+    <script type="module" src="app.js"></script>
+  </body>
+</html>

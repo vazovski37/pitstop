@@ -8,8 +8,8 @@ Full design: the technical design doc (written when the project was called Agent
 | Folder | Owner |
 | --- | --- |
 | `packages/protocol` | Both, changed only together |
-| `server/`, `infra/`, `.github/` | Vazovski |
-| `daemon/`, `mcp/`, `web/`, `server/semantic/` | Teammate |
+| `server/`, `infra/`, `.github/`, `web/` | Vazovski |
+| `daemon/`, `mcp/`, `server/semantic/` | Teammate |
 | `demo/` | Both |
 
 **Rule for Claude:** edit only files in folders your developer owns. If a change is needed elsewhere, stop and describe it instead. Read the `CLAUDE.md` in a folder before editing it.
