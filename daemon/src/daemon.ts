@@ -23,7 +23,7 @@ import { commit, CommitRejected } from "./commit.js";
 import { serverHeaders, streamUrl } from "./config.js";
 import { declareIntent } from "./intents.js";
 import type { Applier } from "./jj.js";
-import { readState, STATE_DIR } from "./state.js";
+import { readState, STATE_DIR, stateDir, withWorktreeLock, writeState } from "./state.js";
 import { StreamClient, type Applied, type Warning } from "./stream.js";
 import { hasTsProject, symbolSets, type SymbolSets } from "./symbols.js";
 
@@ -139,6 +139,7 @@ export class Daemon {
     });
     this.port = (http.address() as AddressInfo).port;
     const info: DaemonInfo = { port: this.port, pid: process.pid, startedAt: new Date().toISOString() };
+    await stateDir(this.opts.worktree); // a fresh worktree has no .pitstop/ yet
     await writeFile(daemonInfoPath(this.opts.worktree), `${JSON.stringify(info, null, 2)}\n`);
     return this.port;
   }
@@ -154,6 +155,17 @@ export class Daemon {
     this.attachedUntil = Date.now() + (this.opts.attachMs ?? 10 * 60_000);
     const applied = await this.stream.applyPending();
     const notes = await this.notes(applied);
+    if (applied.length > 0) {
+      // The agent has now been told what landed and re-reads from here: its reads are checked
+      // from this LSN on, not from where its edits began, or an adapted commit would be refused
+      // for the same write skew again (found by the Phase 4 gate).
+      await withWorktreeLock(this.opts.worktree, async () => {
+        const state = await readState(this.opts.worktree);
+        if (state.readBaseLsn !== undefined && state.readBaseLsn < state.appliedLsn) {
+          await writeState(this.opts.worktree, { ...state, readBaseLsn: state.appliedLsn });
+        }
+      });
+    }
     return { applied: applied.map((a) => a.changeset.lsn), pending: this.stream.pending, notes };
   }
 

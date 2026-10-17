@@ -93,7 +93,14 @@ export async function main(argv: string[], config?: Config): Promise<number> {
         process.exitCode = 1;
       },
     });
-    const port = await daemon.start();
+    let port: number;
+    try {
+      port = await daemon.start();
+    } catch (err) {
+      // Without the local API the agent side is blind: better to stop than to run half.
+      await daemon.close().catch(() => undefined);
+      throw err;
+    }
     const where = cfg.repo === undefined ? cfg.serverUrl : `${cfg.serverUrl} (${cfg.repo})`;
     log(`watching ${cfg.worktree} from #${daemon.stream.appliedLsn} on ${where}; local API on 127.0.0.1:${port}; ctrl-c to stop`);
     await new Promise<void>((done) => {
@@ -162,7 +169,7 @@ if (isMain) {
     },
     (err: unknown) => {
       console.error(`[pitstop] ${err instanceof Error ? err.message : String(err)}`);
-      process.exitCode = 1;
+      process.exit(1); // not exitCode: a stream socket or server would keep the process alive
     },
   );
 }
