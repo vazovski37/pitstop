@@ -116,6 +116,19 @@ gh secret set PITSTOP_TOKEN --repo <you>/pitstop
 ```
 Put the same value in each laptop's `.env` as `PITSTOP_TOKEN`; the daemon sends it as `Authorization: Bearer <token>` (a browser uses `?token=<token>` on `/stream`). Until the secret exists the server runs open.
 
+**Git mirror (Phase 3)**
+
+Every accepted entry of a mirrored repository becomes a commit on a GitHub branch, built with the same recipe as the daemons' local commits, so CI and deploys keep running from `main` while the repository lives on Pitstop. Make a fine-grained token with **Contents: write** on the repositories to mirror, store it, and run **Provision infrastructure**:
+```bash
+gh secret set MIRROR_GITHUB_TOKEN --repo <you>/pitstop
+```
+Then, per repository, after its `pitstop import` from a clean checkout of the branch:
+```bash
+curl -X PUT "$SERVER/repos/<owner>/<name>/mirror" -H "authorization: Bearer $PITSTOP_TOKEN" -H "content-type: application/json" \
+  -d '{"github":"<owner>/<name>","branch":"main","baseCommit":"<the sha the import was made from>"}'
+```
+`GET /repos/<owner>/<name>/mirror` shows how far it is. A branch that someone else pushes to shows `diverged`; nothing but the mirror should push it. Locally, `MIRROR_GITHUB_TOKEN` in `.env` does the same.
+
 **AI repair (Phase 4)**
 
 Write skew is resolved by whoever `PITSTOP_REPAIR` names. The default, `agent`, needs nothing: the coding agent that committed is told what changed and commits again. For the server to repair with a model, get a free key at console.groq.com and store it:

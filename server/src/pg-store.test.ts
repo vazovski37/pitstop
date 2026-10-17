@@ -149,6 +149,23 @@ describe.skipIf(!url)("PgStore against a real Postgres", () => {
     expect((await store.listRepos()).map((r) => r.id)).toEqual(expect.arrayContaining([DEFAULT_REPO, other]));
   });
 
+  it("keeps a mirror per repository", async () => {
+    const config = { githubRepo: "vazovski37/pitstop", branch: "main", baseCommit: "a".repeat(40) };
+    const mirror = await store.setMirror(DEFAULT_REPO, config);
+    expect(mirror).toMatchObject({ repo: DEFAULT_REPO, ...config, lastLsn: 0, lastCommit: config.baseCommit, status: "enabled" });
+    expect(mirror.error).toBeUndefined();
+    await store.updateMirror(DEFAULT_REPO, { lastLsn: 3, lastCommit: "b".repeat(40), status: "error", error: "github is down" });
+    expect(await store.getMirror(DEFAULT_REPO)).toMatchObject({ lastLsn: 3, lastCommit: "b".repeat(40), status: "error", error: "github is down" });
+    await store.updateMirror(DEFAULT_REPO, { status: "enabled", error: null });
+    expect((await store.getMirror(DEFAULT_REPO))?.error).toBeUndefined();
+    // Setting it again starts the position over.
+    expect(await store.setMirror(DEFAULT_REPO, { ...config, branch: "pitstop" })).toMatchObject({ branch: "pitstop", lastLsn: 0, status: "enabled" });
+    expect((await store.listMirrors()).map((m) => m.repo)).toContain(DEFAULT_REPO);
+    await store.deleteMirror(DEFAULT_REPO);
+    expect(await store.getMirror(DEFAULT_REPO)).toBeUndefined();
+    await expect(store.setMirror("no/such", config)).rejects.toThrow(/unknown repo/);
+  });
+
   it("refuses a repository that does not exist", async () => {
     await expect(store.append(request("nowhere", 0, { repo: "no/such" }))).rejects.toThrow(/unknown repo no\/such/);
     await expect(store.openIntent({ repo: "no/such", author: { developer: "x", agent: "y" }, baseLsn: 0, text: "t", declaredSymbols: [] })).rejects.toThrow(/unknown repo/);

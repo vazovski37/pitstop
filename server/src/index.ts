@@ -3,6 +3,7 @@ import { buildApp } from "./app.js";
 import { createPool, ping } from "./db.js";
 import { migrate } from "./migrate.js";
 import { PgStore } from "./pg-store.js";
+import { GitHubApi } from "./github.js";
 import { GroqClient } from "./groq.js";
 import { modelRepairer, parseRepairMode, type Repairer } from "./repair.js";
 import { MemoryStore, type Store } from "./store.js";
@@ -57,7 +58,12 @@ console.log(
   `pitstop server: validation ${validation} (PITSTOP_VALIDATE), type-check gate ${check} (PITSTOP_CHECK), repair ${repair} (PITSTOP_REPAIR)`,
 );
 
-const app = await buildApp({ version, pingDb, store, token, validation, check, repair, repairer, logger: true });
+// Phase 3: the git mirror pushes accepted entries to GitHub with this token (SETUP.md, "Git mirror").
+const mirrorToken = process.env.MIRROR_GITHUB_TOKEN || undefined;
+const github = mirrorToken === undefined ? undefined : new GitHubApi({ token: mirrorToken });
+console.log(`pitstop server: git mirror ${github === undefined ? "off (no MIRROR_GITHUB_TOKEN)" : "on"}`);
+
+const app = await buildApp({ version, pingDb, store, token, validation, check, repair, repairer, github, logger: true });
 
 const shutdown = async (signal: string) => {
   app.log.info(`${signal} received, shutting down`);

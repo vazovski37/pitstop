@@ -13,7 +13,10 @@ import {
   type Repo,
   type ServerMessage,
 } from "@pitstop/protocol";
+import { z } from "zod";
 import { typecheckGate } from "./checks.js";
+import type { GitHubClient } from "./github.js";
+import { MirrorWorker } from "./mirror.js";
 import { escalation, repairCommit, type Repairer, type RepairMode } from "./repair.js";
 import {
   gapStart,
@@ -50,8 +53,20 @@ export interface AppDeps {
   repair?: RepairMode;
   /** The model-backed repairer for `groq` mode; tests inject a fake. */
   repairer?: Repairer;
+  /** GitHub, for the git mirror (mirror.ts). Absent: the mirror routes answer 501. Tests inject a fake. */
+  github?: GitHubClient;
+  /** How often failed mirrors are retried; tests shorten it. */
+  mirrorRetryMs?: number;
   logger?: boolean;
 }
+
+const MirrorBody = z.object({
+  /** `owner/name` on github.com. */
+  github: z.string().regex(/^[\w.-]+\/[\w.-]+$/, "expected owner/name"),
+  branch: z.string().min(1).default("main"),
+  /** The commit the first entry builds on; defaults to the branch's head on GitHub. */
+  baseCommit: z.string().regex(/^[0-9a-f]{40}$/, "expected a commit sha").optional(),
+});
 
 /** Routes that stay open when a token is set: the deploy smoke test and Azure's probes use them. */
 const OPEN_ROUTES = new Set(["/healthz", "/version"]);
@@ -72,6 +87,14 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   const app = Fastify({ logger: deps.logger ?? false, bodyLimit: 32 * 1024 * 1024 });
   await app.register(websocket);
   const stream = new Stream(deps.store, deps.version, app.log);
+
+  // The git mirror: pushes every accepted entry to GitHub when a client is configured (MIRROR_GITHUB_TOKEN).
+  const mirrors = deps.github === undefined ? undefined : new MirrorWorker(deps.store, deps.github, app.log, deps.mirrorRetryMs);
+  app.decorate("mirrors", mirrors);
+  if (mirrors !== undefined) {
+    app.addHook("onReady", async () => mirrors.start());
+    app.addHook("onClose", async () => mirrors.stop());
+  }
 
   // Phase 2: the server is public on Azure, so one shared token guards the log and the stream.
   // The hook also runs on the /stream upgrade request, which is refused with the same 401.
@@ -146,6 +169,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
         return { ...decision, checks: { ...checks, typecheck: gate.typecheck, ...(details === "" ? {} : { details }) } };
       });
       stream.notify(repo);
+      mirrors?.kick(repo);
       if (skew) {
         // Without a resolver the skew lands as is; the daemon and the live view hear about it.
         stream.broadcast(repo, {
@@ -195,6 +219,32 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     const repo = await deps.store.getRepo(`${req.params.owner}/${req.params.name}`);
     if (repo === undefined) return reply.code(404).send({ error: "unknown_repo" });
     return repo;
+  });
+
+  // The git mirror of a repository: an export of its log to a GitHub branch (build plan, Phase 3).
+  app.put<{ Params: { owner: string; name: string } }>("/repos/:owner/:name/mirror", async (req, reply) => {
+    if (deps.github === undefined || mirrors === undefined) {
+      return reply.code(501).send({ error: "no_mirror", message: "set MIRROR_GITHUB_TOKEN on the server to mirror repositories" });
+    }
+    const repo = `${req.params.owner}/${req.params.name}`;
+    if ((await deps.store.getRepo(repo)) === undefined) return reply.code(404).send({ error: "unknown_repo" });
+    const parsed = MirrorBody.safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ error: "invalid_request", message: issues(parsed.error) });
+    const baseCommit = parsed.data.baseCommit ?? (await deps.github.getRef(parsed.data.github, parsed.data.branch));
+    const mirror = await deps.store.setMirror(repo, { githubRepo: parsed.data.github, branch: parsed.data.branch, baseCommit });
+    mirrors.kick(repo);
+    return mirror;
+  });
+
+  app.get<{ Params: { owner: string; name: string } }>("/repos/:owner/:name/mirror", async (req, reply) => {
+    const mirror = await deps.store.getMirror(`${req.params.owner}/${req.params.name}`);
+    if (mirror === undefined) return reply.code(404).send({ error: "no_mirror" });
+    return mirror;
+  });
+
+  app.delete<{ Params: { owner: string; name: string } }>("/repos/:owner/:name/mirror", async (req, reply) => {
+    await deps.store.deleteMirror(`${req.params.owner}/${req.params.name}`);
+    return reply.code(204).send();
   });
 
   // The log over HTTP: for the live view, catch-up by hand, and debugging.

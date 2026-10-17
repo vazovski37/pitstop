@@ -35,6 +35,7 @@ jobs:
       PG_ADMIN_PASSWORD: ${{ secrets.PG_ADMIN_PASSWORD }}
       GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
       PITSTOP_TOKEN: ${{ secrets.PITSTOP_TOKEN }}
+      MIRROR_GITHUB_TOKEN: ${{ secrets.MIRROR_GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v5
 
@@ -70,6 +71,7 @@ jobs:
             -f infra/main.bicep \
             -p prefix="$PREFIX" location="$LOCATION" deployApp=true containerImage="$IMAGE" \
                pgAdminPassword="$PG_ADMIN_PASSWORD" groqApiKey="$GROQ_API_KEY" pitstopToken="$PITSTOP_TOKEN" \
+               mirrorGithubToken="$MIRROR_GITHUB_TOKEN" \
             --query properties.outputs -o json)"
           echo "FQDN=$(echo "$OUT" | jq -r .appFqdn.value)" >> "$GITHUB_ENV"
 
