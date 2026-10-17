@@ -1,0 +1,15 @@
+{
+  "name": "teamdb-demo",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "A slice of TeamDB for the Pitstop demo: a session with a known bug, a profile page, a timeAgo helper.",
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0"
+  }
+}
