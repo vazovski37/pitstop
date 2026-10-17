@@ -384,5 +384,59 @@ describe("repair (PITSTOP_REPAIR)", () => {
     expect((await commit("auth-fix", authFix)).statusCode).toBe(200);
     await app.close();
   });
+});
+
+describe("repositories", () => {
+  it("creates, lists and describes repositories", async () => {
+    const { app } = await start();
+    const created = await app.inject({ method: "POST", url: "/repos", payload: { id: "acme/app" } });
+    expect(created.statusCode).toBe(201);
+    expect(created.json()).toMatchObject({ id: "acme/app", headLsn: 0 });
+    expect((await app.inject({ method: "POST", url: "/repos", payload: { id: "acme/app" } })).statusCode).toBe(200);
+    expect((await app.inject({ method: "POST", url: "/repos", payload: { id: "Not/Valid" } })).statusCode).toBe(400);
+    const list = (await app.inject({ method: "GET", url: "/repos" })).json() as { id: string }[];
+    expect(list.map((r) => r.id)).toEqual(["acme/app", "local/default"]);
+    expect((await app.inject({ method: "GET", url: "/repos/acme/app" })).json()).toMatchObject({ id: "acme/app" });
+    expect((await app.inject({ method: "GET", url: "/repos/no/such" })).statusCode).toBe(404);
+    await app.close();
+  });
+
+  it("counts LSNs per repository and keeps their logs apart", async () => {
+    const { app, commit } = await start();
+    await app.inject({ method: "POST", url: "/repos", payload: { id: "acme/app" } });
+    await commit("default-1");
+    const other = CommitResponse.parse((await commit("acme-1", { repo: "acme/app" })).json());
+    expect(other.status).toBe("accepted");
+    if (other.status === "accepted") expect(other.changeset).toMatchObject({ repo: "acme/app", lsn: 1 });
+    const acme = (await app.inject({ method: "GET", url: "/log?repo=acme/app" })).json() as { lsn: number; repo: string }[];
+    expect(acme).toEqual([expect.objectContaining({ repo: "acme/app", lsn: 1 })]);
+    expect((await app.inject({ method: "GET", url: "/log" })).json()).toEqual([expect.objectContaining({ repo: "local/default", lsn: 1 })]);
+    expect((await app.inject({ method: "GET", url: "/repos/acme/app" })).json()).toMatchObject({ headLsn: 1 });
+    await app.close();
+  });
+
+  it("validates each repository against its own log", async () => {
+    const { app, commit } = await start();
+    await app.inject({ method: "POST", url: "/repos", payload: { id: "acme/app" } });
+    // The same file in both repositories: no conflict, they are different logs.
+    expect((await commit("default-1")).statusCode).toBe(200);
+    expect((await commit("acme-1", { repo: "acme/app" })).statusCode).toBe(200);
+    // Inside one repository the validator still works.
+    expect((await commit("acme-2", { repo: "acme/app" })).statusCode).toBe(409);
+    await app.close();
+  });
+
+  it("refuses commits, intents and log reads for a repository that does not exist", async () => {
+    const { app, commit } = await start();
+    const res = await commit("nowhere", { repo: "no/such" });
+    expect(res.statusCode).toBe(400);
+    expect(res.json()).toMatchObject({ status: "rejected", reason: "invalid_request" });
+    expect(res.json().message).toContain("unknown repo no/such");
+    const intent = await app.inject({ method: "POST", url: "/intents", payload: { repo: "no/such", author: { developer: "x", agent: "y" }, baseLsn: 0, text: "t" } });
+    expect(intent.statusCode).toBe(400);
+    expect((await app.inject({ method: "GET", url: "/log?repo=no/such" })).statusCode).toBe(404);
+    expect((await app.inject({ method: "GET", url: "/log?repo=BAD" })).statusCode).toBe(400);
+    await app.close();
+  });
 
 });

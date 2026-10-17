@@ -101,7 +101,7 @@ describe("GET /stream", () => {
     inbox.close();
   });
 
-  it("refuses a subscription to a repository this server does not have yet", async () => {
+  it("refuses a subscription to a repository that does not exist", async () => {
     const { url } = await listen();
     const inbox = await connect(url);
     await inbox.next(); // hello
@@ -109,10 +109,30 @@ describe("GET /stream", () => {
     expect(await inbox.closed).toBe(1008);
   });
 
-  it("broadcasts opened intents", async () => {
+  it("a socket follows one repository and hears only its entries and intents", async () => {
+    const { app, commit, url } = await listen();
+    await app.inject({ method: "POST", url: "/repos", payload: { id: "acme/app" } });
+    const inbox = await connect(url);
+    await inbox.next(); // hello
+    inbox.send({ type: "subscribe", repo: "acme/app", fromLsn: 0 });
+    expect(await inbox.next()).toMatchObject({ type: "head", repo: "acme/app", headLsn: 0 });
+
+    await commit("default-one"); // another repository: silence here
+    await app.inject({ method: "POST", url: "/commit", payload: { ...request("acme-one"), repo: "acme/app" } });
+    expect(await inbox.next()).toMatchObject({ type: "entry", changeset: { repo: "acme/app", lsn: 1 } });
+
+    await app.inject({ method: "POST", url: "/intents", payload: { author: { developer: "x", agent: "y" }, baseLsn: 0, text: "elsewhere" } });
+    await app.inject({ method: "POST", url: "/intents", payload: { repo: "acme/app", author: { developer: "x", agent: "y" }, baseLsn: 1, text: "here" } });
+    expect(await inbox.next()).toMatchObject({ type: "intent", intent: { repo: "acme/app", text: "here" } });
+    inbox.close();
+  });
+
+  it("broadcasts opened intents to the sockets following their repository", async () => {
     const { app, url } = await listen();
     const inbox = await connect(url);
     await inbox.next(); // hello
+    inbox.send({ type: "subscribe", fromLsn: 0 });
+    expect(await inbox.next()).toMatchObject({ type: "head", repo: "local/default" });
     await app.inject({
       method: "POST",
       url: "/intents",
