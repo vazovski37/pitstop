@@ -37,13 +37,16 @@ export class Stream {
     private readonly log?: FastifyBaseLogger,
   ) {}
 
-  /** Wires a new connection: `hello` first (with the default repository's head), then whatever the daemon asks for. */
-  connect(socket: WebSocket): void {
+  /**
+   * Wires a new connection: `hello` first (with the default repository's head), then whatever the
+   * daemon asks for. `canRead` decides which repositories this socket may follow (auth.ts).
+   */
+  connect(socket: WebSocket, canRead: (repo: RepoId) => Promise<boolean> = async () => true): void {
     const sub: Subscriber = { socket, repo: null, lastSentLsn: null, appliedLsn: null, sending: Promise.resolve() };
     this.subs.add(sub);
     socket.on("close", () => this.subs.delete(sub));
     socket.on("error", (err) => this.log?.warn({ err }, "stream socket error"));
-    socket.on("message", (raw) => void this.onMessage(sub, raw));
+    socket.on("message", (raw) => void this.onMessage(sub, raw, canRead));
     sub.sending = this.store
       .headLsn(DEFAULT_REPO)
       .then((headLsn) => this.send(sub, { type: "hello", serverVersion: this.version, headLsn }))
@@ -65,7 +68,7 @@ export class Stream {
     return [...this.subs].flatMap((s) => (s.repo === repo && s.appliedLsn !== null ? [s.appliedLsn] : []));
   }
 
-  private async onMessage(sub: Subscriber, raw: RawData): Promise<void> {
+  private async onMessage(sub: Subscriber, raw: RawData, canRead: (repo: RepoId) => Promise<boolean>): Promise<void> {
     const parsed = ClientMessage.safeParse(tryJson(raw.toString()));
     if (!parsed.success) {
       sub.socket.close(1003, "expected a ClientMessage");
@@ -77,6 +80,10 @@ export class Stream {
         const repo = message.repo ?? DEFAULT_REPO;
         if ((await this.store.getRepo(repo)) === undefined) {
           sub.socket.close(1008, `unknown repo ${repo}: POST /repos first`);
+          return;
+        }
+        if (!(await canRead(repo))) {
+          sub.socket.close(1008, `no read access to ${repo}`);
           return;
         }
         sub.repo = repo;

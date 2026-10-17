@@ -47,6 +47,17 @@ param pitstopToken string = ''
 @secure()
 param mirrorGithubToken string = ''
 
+@description('GitHub OAuth App client id for sign-in (Phase 5). Empty turns accounts off.')
+param githubOauthClientId string = ''
+
+@description('GitHub OAuth App client secret (Phase 5).')
+@secure()
+param githubOauthClientSecret string = ''
+
+@description('Random secret that signs session cookies (Phase 5).')
+@secure()
+param sessionSecret string = ''
+
 var suffix = uniqueString(resourceGroup().id)
 // Registry names allow only letters and digits.
 var acrName = take('${replace(toLower(prefix), '-', '')}acr${suffix}', 50)
@@ -185,6 +196,16 @@ var mirrorSecrets = empty(mirrorGithubToken) ? [] : [
 var mirrorEnv = empty(mirrorGithubToken) ? [] : [
   { name: 'MIRROR_GITHUB_TOKEN', secretRef: 'mirror-github-token' }
 ]
+var accountsOn = !empty(githubOauthClientId) && !empty(githubOauthClientSecret) && !empty(sessionSecret)
+var accountsSecrets = accountsOn ? [
+  { name: 'github-oauth-client-secret', value: githubOauthClientSecret }
+  { name: 'session-secret', value: sessionSecret }
+] : []
+var accountsEnv = accountsOn ? [
+  { name: 'GITHUB_OAUTH_CLIENT_ID', value: githubOauthClientId }
+  { name: 'GITHUB_OAUTH_CLIENT_SECRET', secretRef: 'github-oauth-client-secret' }
+  { name: 'SESSION_SECRET', secretRef: 'session-secret' }
+] : []
 
 resource app 'Microsoft.App/containerApps@2024-03-01' = if (deployApp) {
   name: '${prefix}-server'
@@ -211,14 +232,14 @@ resource app 'Microsoft.App/containerApps@2024-03-01' = if (deployApp) {
           identity: appIdentity.id
         }
       ]
-      secrets: concat(baseSecrets, aiSecrets, tokenSecrets, mirrorSecrets)
+      secrets: concat(baseSecrets, aiSecrets, tokenSecrets, mirrorSecrets, accountsSecrets)
     }
     template: {
       containers: [
         {
           name: 'server'
           image: containerImage
-          env: concat(baseEnv, aiEnv, tokenEnv, mirrorEnv)
+          env: concat(baseEnv, aiEnv, tokenEnv, mirrorEnv, accountsEnv)
           resources: {
             cpu: json('0.5')
             memory: '1Gi'

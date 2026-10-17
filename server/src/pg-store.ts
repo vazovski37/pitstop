@@ -19,14 +19,60 @@ import {
   repoOf,
   SKIPPED_CHECKS,
   unknownRepo,
+  newTokenId,
+  newTokenSecret,
+  newUserId,
+  tokenHash,
   type Decide,
+  type Member,
   type Mirror,
   type MirrorConfig,
   type MirrorPatch,
   type MirrorStatus,
+  type Role,
   type Store,
+  type Token,
   type Tree,
+  type User,
+  type UserInput,
+  type Visibility,
 } from "./store.js";
+
+interface UserRow {
+  id: string;
+  github_id: string | number;
+  login: string;
+  name: string | null;
+  avatar_url: string | null;
+  created_at: Date;
+}
+const USER_COLUMNS = "id, github_id, login, name, avatar_url, created_at";
+const userOf = (row: UserRow): User => ({
+  id: row.id,
+  githubId: Number(row.github_id),
+  login: row.login,
+  ...(row.name === null ? {} : { name: row.name }),
+  ...(row.avatar_url === null ? {} : { avatarUrl: row.avatar_url }),
+  createdAt: row.created_at.toISOString(),
+});
+
+interface TokenRow {
+  id: string;
+  user_id: string;
+  name: string;
+  created_at: Date;
+  last_used_at: Date | null;
+  revoked_at: Date | null;
+}
+const TOKEN_COLUMNS = "id, user_id, name, created_at, last_used_at, revoked_at";
+const tokenOf = (row: TokenRow): Token => ({
+  id: row.id,
+  userId: row.user_id,
+  name: row.name,
+  createdAt: row.created_at.toISOString(),
+  ...(row.last_used_at === null ? {} : { lastUsedAt: row.last_used_at.toISOString() }),
+  ...(row.revoked_at === null ? {} : { revokedAt: row.revoked_at.toISOString() }),
+});
 
 interface MirrorRow {
   repo: string;
@@ -343,6 +389,102 @@ export class PgStore implements Store {
   async listMirrors(): Promise<Mirror[]> {
     const res = await this.pool.query<MirrorRow>(`select ${MIRROR_COLUMNS} from repo_mirrors order by repo`);
     return res.rows.map(mirrorOf);
+  }
+
+  async upsertUser(input: UserInput): Promise<User> {
+    const res = await this.pool.query<UserRow>(
+      `insert into users (id, github_id, login, name, avatar_url) values ($1, $2, $3, $4, $5)
+       on conflict (github_id) do update set login = excluded.login, name = excluded.name, avatar_url = excluded.avatar_url
+       returning ${USER_COLUMNS}`,
+      [newUserId(), input.githubId, input.login, input.name ?? null, input.avatarUrl ?? null],
+    );
+    const row = res.rows[0];
+    if (row === undefined) throw new Error("user not readable after upsert");
+    return userOf(row);
+  }
+
+  async getUser(id: string): Promise<User | undefined> {
+    const res = await this.pool.query<UserRow>(`select ${USER_COLUMNS} from users where id = $1`, [id]);
+    const row = res.rows[0];
+    return row === undefined ? undefined : userOf(row);
+  }
+
+  async getUserByLogin(login: string): Promise<User | undefined> {
+    const res = await this.pool.query<UserRow>(`select ${USER_COLUMNS} from users where login = $1`, [login]);
+    const row = res.rows[0];
+    return row === undefined ? undefined : userOf(row);
+  }
+
+  async createToken(userId: string, name: string): Promise<{ token: Token; secret: string }> {
+    const secret = newTokenSecret();
+    const res = await this.pool.query<TokenRow>(
+      `insert into tokens (hash, id, user_id, name) values ($1, $2, $3, $4) returning ${TOKEN_COLUMNS}`,
+      [tokenHash(secret), newTokenId(), userId, name],
+    );
+    const row = res.rows[0];
+    if (row === undefined) throw new Error("token not readable after insert");
+    return { token: tokenOf(row), secret };
+  }
+
+  async userForToken(secret: string): Promise<User | undefined> {
+    const res = await this.pool.query<UserRow>(
+      `update tokens set last_used_at = now() where hash = $1 and revoked_at is null returning user_id`,
+      [tokenHash(secret)],
+    );
+    const userId = (res.rows[0] as unknown as { user_id?: string } | undefined)?.user_id;
+    return userId === undefined ? undefined : this.getUser(userId);
+  }
+
+  async listTokens(userId: string): Promise<Token[]> {
+    const res = await this.pool.query<TokenRow>(`select ${TOKEN_COLUMNS} from tokens where user_id = $1 order by created_at`, [userId]);
+    return res.rows.map(tokenOf);
+  }
+
+  async revokeToken(userId: string, tokenId: string): Promise<boolean> {
+    const res = await this.pool.query(
+      "update tokens set revoked_at = now() where id = $1 and user_id = $2 and revoked_at is null",
+      [tokenId, userId],
+    );
+    return (res.rowCount ?? 0) > 0;
+  }
+
+  async setMember(repo: RepoId, userId: string, role: Role): Promise<void> {
+    const known = await this.pool.query("select 1 from repos where id = $1", [repo]);
+    if ((known.rowCount ?? 0) === 0) throw unknownRepo(repo);
+    await this.pool.query(
+      `insert into repo_members (repo, user_id, role) values ($1, $2, $3)
+       on conflict (repo, user_id) do update set role = excluded.role`,
+      [repo, userId, role],
+    );
+  }
+
+  async removeMember(repo: RepoId, userId: string): Promise<boolean> {
+    const res = await this.pool.query("delete from repo_members where repo = $1 and user_id = $2", [repo, userId]);
+    return (res.rowCount ?? 0) > 0;
+  }
+
+  async listMembers(repo: RepoId): Promise<Member[]> {
+    const res = await this.pool.query<{ user_id: string; login: string; role: Role }>(
+      `select m.user_id, u.login, m.role from repo_members m join users u on u.id = m.user_id
+       where m.repo = $1 order by u.login`,
+      [repo],
+    );
+    return res.rows.map((r) => ({ repo, userId: r.user_id, login: r.login, role: r.role }));
+  }
+
+  async roleOf(repo: RepoId, userId: string): Promise<Role | undefined> {
+    const res = await this.pool.query<{ role: Role }>("select role from repo_members where repo = $1 and user_id = $2", [repo, userId]);
+    return res.rows[0]?.role;
+  }
+
+  async visibility(repo: RepoId): Promise<Visibility | undefined> {
+    const res = await this.pool.query<{ visibility: Visibility }>("select visibility from repos where id = $1", [repo]);
+    return res.rows[0]?.visibility;
+  }
+
+  async setVisibility(repo: RepoId, visibility: Visibility): Promise<void> {
+    const res = await this.pool.query("update repos set visibility = $2 where id = $1", [repo, visibility]);
+    if ((res.rowCount ?? 0) === 0) throw unknownRepo(repo);
   }
 
   private async head(db: Queryable, repo: RepoId): Promise<Lsn> {

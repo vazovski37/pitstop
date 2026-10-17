@@ -116,6 +116,16 @@ gh secret set PITSTOP_TOKEN --repo <you>/pitstop
 ```
 Put the same value in each laptop's `.env` as `PITSTOP_TOKEN`; the daemon sends it as `Authorization: Bearer <token>` (a browser uses `?token=<token>` on `/stream`). Until the secret exists the server runs open.
 
+**Accounts (Phase 5)**
+
+People sign in with GitHub, make personal tokens for their daemons, and are members of repositories. Register an OAuth App at GitHub → Settings → Developer settings → OAuth Apps: homepage `https://<app>`, callback `https://<app>/auth/github/callback`. Then:
+```bash
+gh variable set GITHUB_OAUTH_CLIENT_ID --repo <you>/pitstop --body <client id>
+gh secret set GITHUB_OAUTH_CLIENT_SECRET --repo <you>/pitstop
+gh secret set SESSION_SECRET --repo <you>/pitstop      # any long random string
+```
+and run **Provision infrastructure**. From then on `GET /auth/github` signs in, `POST /tokens {"name": "laptop"}` (with the session cookie) answers a `pst_…` secret once, and that secret goes into the laptop's `.env` as `PITSTOP_TOKEN`: the daemon sends it like the shared one. `POST /repos` by a signed-in user makes them its owner; owners add members (`PUT /repos/<owner>/<name>/members/<login>` with `{"role": "writer"}`) and can make a repository public. The shared `PITSTOP_TOKEN` keeps working as the super-user, and a repository with no members is open to any signed-in user, so nothing breaks the day accounts go on.
+
 **Git mirror (Phase 3)**
 
 Every accepted entry of a mirrored repository becomes a commit on a GitHub branch, built with the same recipe as the daemons' local commits, so CI and deploys keep running from `main` while the repository lives on Pitstop. Make a fine-grained token with **Contents: write** on the repositories to mirror, store it, and run **Provision infrastructure**:
