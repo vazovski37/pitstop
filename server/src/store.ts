@@ -1,13 +1,27 @@
 import { createHash, randomBytes } from "node:crypto";
-import type { Changeset, Checks, CommitRequest, Intent, IntentRequest, Lsn } from "@pitstop/protocol";
+import type {
+  Changeset,
+  Checks,
+  CommitRequest,
+  CommitResponse,
+  Intent,
+  IntentRequest,
+  Lsn,
+  Repair,
+} from "@pitstop/protocol";
 
 /**
  * What the server needs from its storage: the log, the blobs and the open intents.
  * `PgStore` (pg-store.ts) is the real one; `MemoryStore` serves tests and laptops without Postgres.
  */
 export interface Store {
-  /** Appends a changeset at the next LSN. The same idempotency key returns the same changeset. */
-  append(req: CommitRequest): Promise<Changeset>;
+  /**
+   * Appends a changeset at the next LSN. The same idempotency key returns the same changeset.
+   * `decide`, when given, runs inside the append's critical section with every entry after
+   * `gapStart(req)` (at most GAP_LIMIT + 1 of them) and the head LSN. It returns what to record
+   * with the changeset, or throws `RejectedCommit` to refuse it. The validator lives there (validate.ts).
+   */
+  append(req: CommitRequest, decide?: Decide): Promise<Changeset>;
   /** Entries with `lsn > fromLsn`, in LSN order, at most `limit` of them. */
   entriesAfter(fromLsn: Lsn, limit: number): Promise<Changeset[]>;
   headLsn(): Promise<Lsn>;
@@ -16,7 +30,20 @@ export interface Store {
   heartbeat(intentId: string): Promise<void>;
 }
 
-/** Phase 1 appends without validating; the validator fills these in from Phase 4. */
+/** What a decision records with the changeset. Defaults: skipped checks, no repairs. */
+export interface Decision {
+  checks?: Checks;
+  repairs?: Repair[];
+}
+export type Decide = (gap: Changeset[], head: Lsn) => Decision;
+
+/** How far behind head a commit may be before the daemon must rebase first. */
+export const GAP_LIMIT = 500;
+
+/** The start of the window a commit is checked against: reads may be older than the files' base. */
+export const gapStart = (req: CommitRequest): Lsn => Math.min(req.baseLsn, req.readBaseLsn ?? req.baseLsn);
+
+/** Recorded until the type-check gate exists (Phase 4). */
 export const SKIPPED_CHECKS: Checks = { typecheck: "skipped", tests: "skipped", adr: "skipped" };
 
 export const blobHash = (content: string): string =>
@@ -26,6 +53,19 @@ export const newIntentId = (): string => `int_${randomBytes(4).toString("hex")}`
 
 /** The request cannot be appended as sent. The route answers `rejected` with `invalid_request`. */
 export class InvalidCommit extends Error {}
+
+export type RejectReason = Extract<CommitResponse, { status: "rejected" }>["reason"];
+
+/** The commit is well-formed but may not land as it is: the route answers `rejected` with `reason`. */
+export class RejectedCommit extends Error {
+  constructor(
+    readonly reason: RejectReason,
+    message: string,
+    readonly conflictsWith: Lsn[] = [],
+  ) {
+    super(message);
+  }
+}
 
 /** Fills in a missing `blob` from `content`, and refuses a `blob` that is not its sha256. */
 export function withBlobHashes(req: CommitRequest): CommitRequest {
@@ -45,7 +85,7 @@ export class MemoryStore implements Store {
   private readonly byKey = new Map<string, Changeset>();
   private readonly intents = new Map<string, Intent>();
 
-  async append(req: CommitRequest): Promise<Changeset> {
+  async append(req: CommitRequest, decide?: Decide): Promise<Changeset> {
     const seen = this.byKey.get(req.idempotencyKey);
     if (seen) return seen;
     const lsn = this.entries.length + 1;
@@ -53,6 +93,8 @@ export class MemoryStore implements Store {
     if (req.intentId !== undefined && !this.intents.has(req.intentId)) {
       throw new InvalidCommit(`unknown intent ${req.intentId}`);
     }
+    const gap = this.entries.filter((e) => e.lsn > gapStart(req)).slice(0, GAP_LIMIT + 1);
+    const decision = decide ? decide(gap, lsn - 1) : {};
     const changeset: Changeset = {
       lsn,
       baseLsn: req.baseLsn,
@@ -62,8 +104,8 @@ export class MemoryStore implements Store {
       writeSet: req.writeSet,
       sigWriteSet: req.sigWriteSet,
       readSet: req.readSet,
-      repairs: [],
-      checks: SKIPPED_CHECKS,
+      repairs: decision.repairs ?? [],
+      checks: decision.checks ?? SKIPPED_CHECKS,
       brainVersion: 0,
       createdAt: new Date().toISOString(),
     };

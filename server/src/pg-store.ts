@@ -1,6 +1,6 @@
 import type pg from "pg";
 import type { Changeset, Checks, CommitRequest, FileChange, Intent, IntentRequest, Lsn, Repair } from "@pitstop/protocol";
-import { InvalidCommit, newIntentId, SKIPPED_CHECKS, type Store } from "./store.js";
+import { GAP_LIMIT, gapStart, InvalidCommit, newIntentId, SKIPPED_CHECKS, type Decide, type Store } from "./store.js";
 
 /** Every append takes this transaction-scoped advisory lock, so two commits never share or skip an LSN. */
 const APPEND_LOCK_ID = 7_301_421;
@@ -41,7 +41,7 @@ interface SymbolRow {
 export class PgStore implements Store {
   constructor(private readonly pool: pg.Pool) {}
 
-  async append(req: CommitRequest): Promise<Changeset> {
+  async append(req: CommitRequest, decide?: Decide): Promise<Changeset> {
     const client = await this.pool.connect();
     try {
       await client.query("begin");
@@ -67,10 +67,14 @@ export class PgStore implements Store {
       }
       const brain = await client.query<{ version: number | null }>("select max(version) as version from brain_versions");
 
+      // The validator runs here, under the lock, so nothing lands between its look at the gap and this append.
+      const gap = decide ? await this.read(client, gapStart(req), GAP_LIMIT + 1) : [];
+      const decision = decide ? decide(gap, lsn - 1) : {};
+
       await client.query(
         `insert into changesets
            (lsn, base_lsn, idempotency_key, developer, agent, intent, intent_id, repairs, checks, brain_version)
-         values ($1, $2, $3, $4, $5, $6, $7, '[]', $8, $9)`,
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
         [
           lsn,
           req.baseLsn,
@@ -79,7 +83,8 @@ export class PgStore implements Store {
           req.author.agent,
           req.intent,
           req.intentId ?? null,
-          JSON.stringify(SKIPPED_CHECKS),
+          JSON.stringify(decision.repairs ?? []),
+          JSON.stringify(decision.checks ?? SKIPPED_CHECKS),
           brain.rows[0]?.version ?? 0,
         ],
       );

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { CommitResponse, Health, Intent, type CommitRequest } from "@pitstop/protocol";
-import { buildApp } from "./app.js";
+import { buildApp, type AppDeps } from "./app.js";
 import { blobHash, MemoryStore } from "./store.js";
 
 const content = "export const a = 1;\n";
@@ -16,7 +16,7 @@ const request = (key: string, extra: Partial<CommitRequest> = {}): CommitRequest
   ...extra,
 });
 
-const start = async (dbUp = true) => {
+const start = async (dbUp = true, extra: Partial<AppDeps> = {}) => {
   const store = new MemoryStore();
   const app = await buildApp({
     version: "test-sha",
@@ -25,6 +25,7 @@ const start = async (dbUp = true) => {
       return true;
     },
     store,
+    ...extra,
   });
   const commit = (key: string, extra?: Partial<CommitRequest>) =>
     app.inject({ method: "POST", url: "/commit", payload: request(key, extra) });
@@ -137,7 +138,10 @@ describe("POST /intents", () => {
 describe("GET /log", () => {
   it("pages entries after fromLsn in order", async () => {
     const { app, commit } = await start();
-    for (const key of ["a", "b", "c"]) await commit(key);
+    // Distinct files, or the validator would refuse the second and third as write-write.
+    for (const key of ["a", "b", "c"]) {
+      await commit(key, { files: [{ path: `src/${key}.ts`, op: "add", content }], writeSet: [`src/${key}.ts#${key}`] });
+    }
     const res = await app.inject({ method: "GET", url: "/log?fromLsn=1&limit=1" });
     expect(res.statusCode).toBe(200);
     expect(res.json().map((e: { lsn: number }) => e.lsn)).toEqual([2]);
@@ -178,6 +182,78 @@ describe("with PITSTOP_TOKEN set", () => {
     const header = await app.inject({ method: "GET", url: "/log", headers: { authorization: `Bearer ${token}` } });
     expect(header.statusCode).toBe(200);
     expect((await app.inject({ method: "GET", url: `/log?token=${token}` })).statusCode).toBe(200);
+    await app.close();
+  });
+});
+
+describe("validation (PITSTOP_VALIDATE)", () => {
+  // The demo scenario on an empty log: the auth fix lands as #1, the profile commit read what it changed.
+  const authFix: Partial<CommitRequest> = {
+    intent: "Fix the expired-session bug in auth",
+    files: [{ path: "src/auth/session.ts", op: "modify", content: "export function getCurrentUser() { return null; }\n" }],
+    writeSet: ["src/auth/session.ts#getCurrentUser"],
+    sigWriteSet: ["src/auth/session.ts#getCurrentUser"],
+    readSet: [],
+  };
+  const profile: Partial<CommitRequest> = {
+    intent: "Show last-seen on the profile page",
+    files: [{ path: "src/pages/ProfilePage.ts", op: "modify", content }],
+    writeSet: ["src/pages/ProfilePage.ts#renderProfile"],
+    readSet: ["src/auth/session.ts#getCurrentUser"],
+  };
+
+  it("warn (the default) lands write skew and says so in checks.details", async () => {
+    const { app, commit } = await start();
+    await commit("auth-fix", authFix);
+    const res = await commit("profile", profile);
+    expect(res.statusCode).toBe(200);
+    const body = CommitResponse.parse(res.json());
+    if (body.status === "accepted") {
+      expect(body.changeset.lsn).toBe(2);
+      expect(body.changeset.checks.details).toBe(
+        "write skew, not repaired (PITSTOP_VALIDATE=warn): #1 changed src/auth/session.ts#getCurrentUser (signature)",
+      );
+    }
+    await app.close();
+  });
+
+  it("enforce refuses write skew as repair_failed", async () => {
+    const { app, commit } = await start(true, { validation: "enforce" });
+    await commit("auth-fix", authFix);
+    const res = await commit("profile", profile);
+    expect(res.statusCode).toBe(409);
+    expect(res.json()).toMatchObject({ status: "rejected", reason: "repair_failed", conflictsWith: [1] });
+    expect((await app.inject({ method: "GET", url: "/log" })).json()).toHaveLength(1);
+    await app.close();
+  });
+
+  it("refuses a commit that changes a file the gap changed", async () => {
+    const { app, commit } = await start();
+    await commit("auth-fix", authFix);
+    const res = await commit("profile-and-session", {
+      ...profile,
+      files: [...(profile.files ?? []), { path: "src/auth/session.ts", op: "modify", content: "// mine\n" }],
+    });
+    expect(res.statusCode).toBe(409);
+    expect(res.json()).toMatchObject({ status: "rejected", reason: "constraint_failed", conflictsWith: [1] });
+    expect(res.json().message).toContain("Rebase onto #1 and retry");
+    await app.close();
+  });
+
+  it("accepts work that touches nothing the gap touched", async () => {
+    const { app, commit } = await start();
+    await commit("auth-fix", authFix);
+    const res = await commit("profile", { ...profile, readSet: ["src/utils/timeAgo.ts#timeAgo"] });
+    expect(res.statusCode).toBe(200);
+    const body = CommitResponse.parse(res.json());
+    if (body.status === "accepted") expect(body.changeset.checks.details).toBeUndefined();
+    await app.close();
+  });
+
+  it("off appends anything", async () => {
+    const { app, commit } = await start(true, { validation: "off" });
+    await commit("auth-fix", authFix);
+    expect((await commit("profile", profile)).statusCode).toBe(200);
     await app.close();
   });
 });

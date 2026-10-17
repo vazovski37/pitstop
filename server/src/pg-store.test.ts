@@ -3,7 +3,7 @@ import type { CommitRequest } from "@pitstop/protocol";
 import { createPool } from "./db.js";
 import { migrate } from "./migrate.js";
 import { PgStore } from "./pg-store.js";
-import { blobHash, InvalidCommit, withBlobHashes } from "./store.js";
+import { blobHash, InvalidCommit, RejectedCommit, withBlobHashes } from "./store.js";
 
 // Runs only when a database is available: in CI (Postgres service container)
 // or locally after `npm run db:up` with DATABASE_URL set.
@@ -80,6 +80,29 @@ describe.skipIf(!url)("PgStore against a real Postgres", () => {
   it("rejects a base at or beyond the next LSN", async () => {
     const head = await store.headLsn();
     await expect(store.append(request("ahead", head + 1))).rejects.toBeInstanceOf(InvalidCommit);
+    expect(await store.headLsn()).toBe(head);
+  });
+
+  it("runs the decision inside the append with the gap after the base, and records what it returns", async () => {
+    const head = await store.headLsn();
+    let seen: { gap: number; head: number } | undefined;
+    const landed = await store.append(request("decided", head - 2), (gap, at) => {
+      seen = { gap: gap.length, head: at };
+      return { checks: { typecheck: "pass", tests: "skipped", adr: "skipped", details: "decided" } };
+    });
+    expect(seen).toEqual({ gap: 2, head });
+    expect(landed.checks).toEqual({ typecheck: "pass", tests: "skipped", adr: "skipped", details: "decided" });
+    const [back] = await store.entriesAfter(landed.lsn - 1, 1);
+    expect(back?.checks.details).toBe("decided");
+  });
+
+  it("a rejecting decision appends nothing", async () => {
+    const head = await store.headLsn();
+    await expect(
+      store.append(request("refused", 0), () => {
+        throw new RejectedCommit("constraint_failed", "no", [1]);
+      }),
+    ).rejects.toBeInstanceOf(RejectedCommit);
     expect(await store.headLsn()).toBe(head);
   });
 });

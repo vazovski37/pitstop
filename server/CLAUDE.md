@@ -16,6 +16,9 @@ The single source of truth: the write-ahead log, the commit API, the WebSocket s
 ## Access
 `PITSTOP_TOKEN`, when set, guards every route except `/healthz` and `/version`: `Authorization: Bearer <token>`, or `?token=` where a browser cannot set headers. Unset means open; keep it set on Azure (`infra/main.bicep` wires the GitHub secret).
 
+## Validation
+`src/validate.ts` runs inside `Store.append`, under the append lock, against the entries after the commit's base (writes from `baseLsn`, reads from `readBaseLsn`). Write-write on a file or symbol: `rejected constraint_failed` with `conflictsWith`; the daemon rebases and retries. Write skew (a read symbol changed in the gap): `PITSTOP_VALIDATE=warn` (default) lands it with the skew in `checks.details` and a `warning` on the stream, `enforce` answers `rejected repair_failed`, `off` skips the validator. AI repair and the type-check gate replace `warn` in Phase 4.
+
 ## Known constraint
 The stream keeps subscribers in memory, so the Container App runs exactly one replica (`infra/main.bicep`). To scale out later, fan new entries out through Postgres `LISTEN/NOTIFY`.
 

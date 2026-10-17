@@ -1,6 +1,7 @@
 {
   "idempotencyKey": "agent-b-7f3a91c2",
   "baseLsn": 120,
+  "readBaseLsn": 120,
   "author": { "developer": "teammate", "agent": "agent-b" },
   "intent": "Show last-seen time on ProfilePage",
   "intentId": "int_02",
