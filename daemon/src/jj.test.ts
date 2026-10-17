@@ -16,6 +16,10 @@ const available = await Promise.all([
   () => true,
   () => false,
 );
+const mergiraf = await run(bin.mergiraf, ["--version"], { cwd: tmpdir() }).then(
+  () => true,
+  () => false,
+);
 
 // Each test spawns a dozen jj and git processes; under the full suite's load that passes 5 s.
 describe.skipIf(!available)("JjWorktree against a real colocated repo", { timeout: 30_000 }, () => {
@@ -82,14 +86,30 @@ describe.skipIf(!available)("JjWorktree against a real colocated repo", { timeou
     }
   });
 
-  it("reports a conflict and keeps both sides in the working copy", async () => {
+  it("reports a conflict and keeps both sides in the working copy, with git-style markers", async () => {
     await writeFile(join(dir, "a.txt"), "a1\na2-local\na3\n");
     const result = await wt.apply(entry(122, "a.txt", "a1\na2-server\na3\n"));
     expect(result.conflicted).toHaveLength(1);
+    expect(result.conflictedFiles).toEqual(["a.txt"]);
+    expect(result.resolved).toEqual([]);
     const text = await file("a.txt");
     expect(text).toContain("<<<<<<<");
+    expect(text).toContain("|||||||"); // the base section Mergiraf and git tools expect
     expect(text).toContain("a2-local");
     expect(text).toContain("a2-server");
+  });
+
+  it.skipIf(!mergiraf)("lets Mergiraf resolve a conflict that structure allows", async () => {
+    await writeFile(join(dir, "c.json"), '{\n  "a": 1\n}\n');
+    await jj("describe", "-m", "base with json");
+    await jj("bookmark", "set", "main", "-r", "@");
+    await jj("new");
+    await writeFile(join(dir, "c.json"), '{\n  "a": 1,\n  "local": true\n}\n');
+    const result = await wt.apply(entry(122, "c.json", '{\n  "a": 1,\n  "server": true\n}\n'));
+    expect(result.resolved).toEqual(["c.json"]);
+    expect(result.conflictedFiles).toEqual([]);
+    expect(result.conflicted).toEqual([]);
+    expect(JSON.parse(await file("c.json"))).toEqual({ a: 1, local: true, server: true });
   });
 
   it("handles add, delete and rename", async () => {

@@ -219,8 +219,9 @@ export class StreamClient {
       ...(readBaseLsn === undefined ? {} : { readBaseLsn }),
     });
     const where = result.conflictedFiles.length > 0 ? result.conflictedFiles : result.conflicted;
+    const merged = result.resolved.length === 0 ? "" : ` (Mergiraf resolved ${result.resolved.join(", ")})`;
     const note = where.length === 0 ? "" : ` (conflicts in ${where.join(", ")})`;
-    this.log(`applied #${changeset.lsn} ${changeset.intent}${note}`);
+    this.log(`applied #${changeset.lsn} ${changeset.intent}${merged}${note}`);
     this.send({
       type: "heartbeat",
       appliedLsn: this.applied,

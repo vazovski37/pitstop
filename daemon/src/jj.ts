@@ -12,6 +12,8 @@ export interface ApplyResult {
   conflicted: string[];
   /** The files in `@` that carry conflict markers now; empty when clean. */
   conflictedFiles: string[];
+  /** The files whose conflicts Mergiraf resolved by structure; worth a look, but no markers left. */
+  resolved: string[];
 }
 
 /** The worktree operations the daemon needs. `JjWorktree` is the real one; tests substitute a fake. */
@@ -34,12 +36,18 @@ export const blobHash = (content: string): string =>
 export interface Binaries {
   jj: string;
   git: string;
+  /** Mergiraf, the structural merge tool; conflicts stay as markers when it is not installed. */
+  mergiraf: string;
 }
 
 export const binariesFromEnv = (env: NodeJS.ProcessEnv = process.env): Binaries => ({
   jj: env.PITSTOP_JJ_BIN ?? "jj",
   git: env.PITSTOP_GIT_BIN ?? "git",
+  mergiraf: env.PITSTOP_MERGIRAF_BIN ?? "mergiraf",
 });
+
+/** Git-style (diff3) conflict markers, which Mergiraf and most tools understand; jj's default is its own style. */
+const GIT_MARKERS = "ui.conflict-marker-style=git";
 
 /**
  * A worktree under Jujutsu colocated with git (`jj git init --colocate`).
@@ -70,16 +78,25 @@ export class JjWorktree implements Applier {
       // 2. Move main; fails if something else moved it since step 1.
       await this.git(["update-ref", `refs/heads/${this.bookmark}`, newMain, oldMain]);
       // 3. Rebase @ onto the new main (jj imports the moved git ref by itself in a colocated repo).
-      await this.jj(["rebase", "-d", this.bookmark]);
+      await this.jj(["--config", GIT_MARKERS, "rebase", "-d", this.bookmark]);
       // 4. jj records conflicts instead of stopping; report the changes that carry one.
-      const conflicted = (
-        await this.jj(["log", "-r", `conflicts() & ${this.bookmark}..@`, "--no-graph", "-T", 'change_id ++ "\\n"'])
-      )
-        .split("\n")
-        .map((line) => line.trim())
-        .filter((line) => line.length > 0);
-      const conflictedFiles = conflicted.length === 0 ? [] : await this.conflictedFiles();
-      return { commit: newMain, conflicted, conflictedFiles };
+      let conflicted = await this.conflictedChanges();
+      let conflictedFiles = conflicted.length === 0 ? [] : await this.conflictedFiles();
+      // 5. Mergiraf resolves what structure allows (both sides added a function, a key, an import);
+      //    what remains keeps its markers for the agent. It runs as jj's merge tool (Mergiraf refuses
+      //    `solve` inside a jj repository), one file at a time, with its program set explicitly.
+      const resolved: string[] = [];
+      if (conflictedFiles.length > 0 && (await this.hasMergiraf())) {
+        const program = `merge-tools.mergiraf.program=${this.bin.mergiraf}`;
+        for (const path of conflictedFiles) {
+          await this.jj(["--config", GIT_MARKERS, "--config", program, "resolve", "--tool", "mergiraf", path]).catch(() => undefined);
+        }
+        conflicted = await this.conflictedChanges();
+        const remaining = conflicted.length === 0 ? [] : await this.conflictedFiles();
+        resolved.push(...conflictedFiles.filter((p) => !remaining.includes(p)));
+        conflictedFiles = remaining;
+      }
+      return { commit: newMain, conflicted, conflictedFiles, resolved };
     } catch (err) {
       await this.jj(["op", "restore", restoreOp]);
       throw err;
@@ -102,6 +119,27 @@ export class JjWorktree implements Applier {
     if (symbolic === "") return;
     const commit = (await this.git(["rev-parse", "HEAD"])).trim();
     await this.git(["update-ref", "--no-deref", "HEAD", commit]);
+  }
+
+  /** The change ids of `@` and anything between it and `main` that carry conflicts. */
+  private async conflictedChanges(): Promise<string[]> {
+    const out = await this.jj(["log", "-r", `conflicts() & ${this.bookmark}..@`, "--no-graph", "-T", 'change_id ++ "\\n"']);
+    return out
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0);
+  }
+
+  private mergirafAvailable: boolean | undefined;
+
+  private async hasMergiraf(): Promise<boolean> {
+    if (this.mergirafAvailable === undefined) {
+      this.mergirafAvailable = await run(this.bin.mergiraf, ["--version"], { cwd: this.dir }).then(
+        () => true,
+        () => false,
+      );
+    }
+    return this.mergirafAvailable;
   }
 
   /** `jj resolve --list` prints one line per conflicted file in `@`: the path, spaces, "N-sided conflict". */
