@@ -69,6 +69,14 @@ export interface Store {
   removeMember(repo: RepoId, userId: string): Promise<boolean>;
   listMembers(repo: RepoId): Promise<Member[]>;
   roleOf(repo: RepoId, userId: string): Promise<Role | undefined>;
+  /** Marks a member as one the repository's conflicts go to; false when they are not a member. */
+  setResolver(repo: RepoId, userId: string, resolver: boolean): Promise<boolean>;
+  // Invites (migration 006): a GitHub login that has not signed in yet, with the role it gets.
+  setInvite(repo: RepoId, login: string, role: Role, invitedBy?: string): Promise<void>;
+  listInvites(repo: RepoId): Promise<Invite[]>;
+  deleteInvite(repo: RepoId, login: string): Promise<boolean>;
+  /** Turns the user's pending invites into memberships; the repositories they joined. */
+  acceptInvites(user: User): Promise<RepoId[]>;
   visibility(repo: RepoId): Promise<Visibility | undefined>;
   setVisibility(repo: RepoId, visibility: Visibility): Promise<void>;
 }
@@ -103,6 +111,15 @@ export interface Member {
   userId: string;
   login: string;
   role: Role;
+  /** The repository's conflicts go to this member (migration 006). */
+  resolver: boolean;
+}
+export interface Invite {
+  repo: RepoId;
+  /** Lowercased. */
+  login: string;
+  role: Role;
+  createdAt: string;
 }
 export type Visibility = "private" | "public";
 
@@ -226,6 +243,7 @@ export class MemoryStore implements Store {
   private readonly users = new Map<string, User>();
   private readonly tokens = new Map<string, Token & { hash: string }>();
   private readonly members = new Map<string, Member>(); // `${repo}\n${userId}`
+  private readonly invites = new Map<string, Invite>(); // `${repo}\n${login}`
   private readonly visibilities = new Map<RepoId, Visibility>();
 
   async append(req: CommitRequest, decide?: Decide): Promise<Changeset> {
@@ -368,7 +386,8 @@ export class MemoryStore implements Store {
   }
 
   async getUserByLogin(login: string): Promise<User | undefined> {
-    return [...this.users.values()].find((u) => u.login === login);
+    // GitHub logins are case-insensitive.
+    return [...this.users.values()].find((u) => u.login.toLowerCase() === login.toLowerCase());
   }
 
   async createToken(userId: string, name: string): Promise<{ token: Token; secret: string }> {
@@ -405,7 +424,8 @@ export class MemoryStore implements Store {
     if (!this.repos.has(repo)) throw unknownRepo(repo);
     const user = this.users.get(userId);
     if (user === undefined) throw new Error(`no user ${userId}`);
-    this.members.set(`${repo}\n${userId}`, { repo, userId, login: user.login, role });
+    const key = `${repo}\n${userId}`;
+    this.members.set(key, { repo, userId, login: user.login, role, resolver: this.members.get(key)?.resolver ?? false });
   }
 
   async removeMember(repo: RepoId, userId: string): Promise<boolean> {
@@ -418,6 +438,40 @@ export class MemoryStore implements Store {
 
   async roleOf(repo: RepoId, userId: string): Promise<Role | undefined> {
     return this.members.get(`${repo}\n${userId}`)?.role;
+  }
+
+  async setResolver(repo: RepoId, userId: string, resolver: boolean): Promise<boolean> {
+    const key = `${repo}\n${userId}`;
+    const member = this.members.get(key);
+    if (member === undefined) return false;
+    this.members.set(key, { ...member, resolver });
+    return true;
+  }
+
+  async setInvite(repo: RepoId, login: string, role: Role): Promise<void> {
+    if (!this.repos.has(repo)) throw unknownRepo(repo);
+    const key = `${repo}\n${login.toLowerCase()}`;
+    this.invites.set(key, { repo, login: login.toLowerCase(), role, createdAt: this.invites.get(key)?.createdAt ?? new Date().toISOString() });
+  }
+
+  async listInvites(repo: RepoId): Promise<Invite[]> {
+    return [...this.invites.values()].filter((i) => i.repo === repo).sort((a, b) => a.login.localeCompare(b.login));
+  }
+
+  async deleteInvite(repo: RepoId, login: string): Promise<boolean> {
+    return this.invites.delete(`${repo}\n${login.toLowerCase()}`);
+  }
+
+  async acceptInvites(user: User): Promise<RepoId[]> {
+    const mine = [...this.invites.values()].filter((i) => i.login === user.login.toLowerCase());
+    const joined: RepoId[] = [];
+    for (const invite of mine) {
+      this.invites.delete(`${invite.repo}\n${invite.login}`);
+      if (this.members.has(`${invite.repo}\n${user.id}`)) continue;
+      await this.setMember(invite.repo, user.id, invite.role);
+      joined.push(invite.repo);
+    }
+    return joined;
   }
 
   async visibility(repo: RepoId): Promise<Visibility | undefined> {

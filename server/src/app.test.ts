@@ -522,7 +522,7 @@ describe("accounts", () => {
     expect((await app.inject({ method: "PUT", url: "/repos/alice/app/members/bob", payload: { role: "writer" }, headers: bearer(bob) })).statusCode).toBe(403);
 
     expect((await app.inject({ method: "PUT", url: "/repos/alice/app/members/bob", payload: { role: "writer" }, headers: bearer(alice) })).statusCode).toBe(200);
-    expect((await app.inject({ method: "PUT", url: "/repos/alice/app/members/nobody", payload: { role: "writer" }, headers: bearer(alice) })).statusCode).toBe(404);
+    expect((await app.inject({ method: "PUT", url: "/repos/alice/app/members/not a login", payload: { role: "writer" }, headers: bearer(alice) })).statusCode).toBe(400);
     const landed = await app.inject({ method: "POST", url: "/commit", payload: request("bob-1", { repo: "alice/app" }), headers: bearer(bob) });
     expect(landed.statusCode).toBe(200);
     expect(CommitResponse.parse(landed.json())).toMatchObject({ status: "accepted", changeset: { author: { developer: "bob", agent: "agent-a" } } });
@@ -555,6 +555,47 @@ describe("accounts", () => {
     expect((await create("alice/app", alice)).statusCode).toBe(201); // the login lowercased
     expect((await create("alice/app", alice)).statusCode).toBe(200); // idempotent for its owner (pitstop init)
     expect((await create("alice/app", bob)).statusCode).toBe(403); // not bob's namespace
+    await app.close();
+  });
+
+  it("invites a login that has not signed in yet; it joins at its first sign-in", async () => {
+    const { app, store } = await accounts();
+    const alice = await tokenFor(store, "alice", 1001);
+    await app.inject({ method: "POST", url: "/repos", payload: { id: "alice/app" }, headers: bearer(alice) });
+    const invited = await app.inject({ method: "PUT", url: "/repos/alice/app/members/Bob", payload: { role: "writer" }, headers: bearer(alice) });
+    expect(invited.statusCode).toBe(202);
+    expect(invited.json()).toEqual({ login: "bob", role: "writer", pending: true });
+    expect((await app.inject({ method: "GET", url: "/repos/alice/app/members", headers: bearer(alice) })).json()).toEqual([
+      { login: "alice", role: "owner" },
+      { login: "bob", role: "writer", pending: true },
+    ]);
+    const session = await signIn(app, "code-bob"); // GitHub login "bob"
+    expect((await app.inject({ method: "GET", url: "/repos/alice/app", cookies: { pitstop_session: session } })).statusCode).toBe(200);
+    expect((await app.inject({ method: "GET", url: "/repos/alice/app/members", headers: bearer(alice) })).json()).toEqual([
+      { login: "alice", role: "owner" },
+      { login: "bob", role: "writer" },
+    ]);
+    // An invite can be withdrawn before it is used.
+    await app.inject({ method: "PUT", url: "/repos/alice/app/members/carol", payload: { role: "reader" }, headers: bearer(alice) });
+    expect((await app.inject({ method: "DELETE", url: "/repos/alice/app/members/carol", headers: bearer(alice) })).statusCode).toBe(204);
+    expect((await store.listInvites("alice/app")).length).toBe(0);
+    await app.close();
+  });
+
+  it("marks the members the repository's conflicts go to", async () => {
+    const { app, store } = await accounts();
+    const alice = await tokenFor(store, "alice", 1001);
+    await tokenFor(store, "bob", 1002);
+    await app.inject({ method: "POST", url: "/repos", payload: { id: "alice/app" }, headers: bearer(alice) });
+    const put = await app.inject({ method: "PUT", url: "/repos/alice/app/members/bob", payload: { role: "writer", resolver: true }, headers: bearer(alice) });
+    expect(put.json()).toEqual({ login: "bob", role: "writer", resolver: true });
+    // A role change alone keeps the flag.
+    await app.inject({ method: "PUT", url: "/repos/alice/app/members/bob", payload: { role: "owner" }, headers: bearer(alice) });
+    expect((await app.inject({ method: "GET", url: "/repos/alice/app/members", headers: bearer(alice) })).json()).toEqual([
+      { login: "alice", role: "owner" },
+      { login: "bob", role: "owner", resolver: true },
+    ]);
+    expect((await app.inject({ method: "GET", url: "/version" })).json()).toMatchObject({ accounts: true });
     await app.close();
   });
 

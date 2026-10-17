@@ -8,10 +8,14 @@
   </head>
   <body>
     <header>
-      <h1>Pitstop</h1>
-      <label class="field">repository <select id="repo"></select></label>
-      <span id="head" class="pill">head —</span>
-      <span id="conn" class="pill off" title="stream">offline</span>
+      <h1><a href="#/">Pitstop</a></h1>
+      <nav>
+        <a href="#/">Repositories</a>
+        <a href="#/account" id="nav-account" hidden>Account</a>
+      </nav>
+      <span id="repo-title" class="pill" hidden></span>
+      <span id="head" class="pill" hidden>head —</span>
+      <span id="conn" class="pill off" title="stream" hidden>offline</span>
       <span class="spacer"></span>
       <span id="who"></span>
       <form id="token-form" hidden>
@@ -20,33 +24,135 @@
       </form>
       <span id="version" class="dim"></span>
     </header>
-    <main>
-      <section id="log-panel">
-        <h2>Log <span id="count" class="dim"></span></h2>
-        <p id="empty" class="dim">Waiting for the first entry…</p>
-        <ol id="log" reversed></ol>
+
+    <section id="view-home" class="view" hidden>
+      <div id="home-out" class="hero" hidden>
+        <h2 class="big">Version control for teams whose code is written by agents</h2>
+        <p>
+          One server keeps every change in order. Each developer's checkout follows it live, each agent task is a
+          transaction, and when one agent's change breaks what another relied on, a member of your repository decides
+          before it lands.
+        </p>
+        <p><a class="button" href="/auth/github">Sign in with GitHub</a></p>
+        <p id="home-token-hint" class="dim" hidden>This server has no sign-in yet: paste its token at the top right.</p>
+      </div>
+      <div id="home-in" class="columns" hidden>
+        <article>
+          <h2>Your repositories</h2>
+          <ul id="repos" class="list"></ul>
+          <p id="no-repos" class="dim">None yet. Create one, or ask an owner to invite your GitHub login.</p>
+        </article>
+        <article>
+          <h2>New repository</h2>
+          <form id="new-repo" class="stack">
+            <label class="inline"><span id="new-owner" class="dim"></span><input id="new-name" required autocomplete="off" placeholder="name" /></label>
+            <button type="submit">Create</button>
+          </form>
+          <p id="new-repo-msg" class="msg"></p>
+          <p class="dim">Then open it and go to <em>Set up Claude</em> for the prompt that connects your checkout.</p>
+        </article>
+      </div>
+    </section>
+
+    <section id="view-repo" class="view" hidden>
+      <nav class="tabs">
+        <a id="tab-live">Live</a>
+        <a id="tab-members">Members</a>
+        <a id="tab-setup">Set up Claude</a>
+      </nav>
+
+      <main id="pane-live">
+        <section id="log-panel">
+          <h2>Log <span id="count" class="dim"></span></h2>
+          <p id="empty" class="dim">Waiting for the first entry…</p>
+          <ol id="log" reversed></ol>
+        </section>
+        <section id="side">
+          <article id="detail" hidden>
+            <h2><span id="detail-title"></span> <button id="close" type="button" title="close">×</button></h2>
+            <div id="detail-body"></div>
+          </article>
+          <article>
+            <h2>Open intents <span id="intent-count" class="dim"></span></h2>
+            <ul id="intents"></ul>
+            <p id="no-intents" class="dim">None open.</p>
+          </article>
+          <article>
+            <h2>Worktrees <span id="worktree-count" class="dim"></span></h2>
+            <ul id="worktrees"></ul>
+            <p id="no-worktrees" class="dim">No daemon connected.</p>
+          </article>
+          <article>
+            <h2>As it happens</h2>
+            <ul id="events"></ul>
+          </article>
+        </section>
+      </main>
+
+      <section id="pane-members" class="pane" hidden>
+        <article>
+          <h2>Members</h2>
+          <ul id="members" class="list"></ul>
+          <p class="dim">A member marked <strong>resolver</strong> decides when a commit would break what another change relied on. With none marked, the owners decide.</p>
+          <p id="members-msg" class="msg"></p>
+        </article>
+        <article id="invite-box" hidden>
+          <h2>Invite</h2>
+          <form id="invite" class="stack">
+            <input id="invite-login" required autocomplete="off" placeholder="GitHub login" />
+            <select id="invite-role">
+              <option value="writer">writer</option>
+              <option value="reader">reader</option>
+              <option value="owner">owner</option>
+            </select>
+            <button type="submit">Invite</button>
+          </form>
+          <p class="dim">Someone who has not signed in yet joins the first time they sign in with that GitHub login. Send them this site's address.</p>
+        </article>
       </section>
-      <section id="side">
-        <article id="detail" hidden>
-          <h2><span id="detail-title"></span> <button id="close" type="button" title="close">×</button></h2>
-          <div id="detail-body"></div>
-        </article>
+
+      <section id="pane-setup" class="pane" hidden>
         <article>
-          <h2>Open intents <span id="intent-count" class="dim"></span></h2>
-          <ul id="intents"></ul>
-          <p id="no-intents" class="dim">None open.</p>
-        </article>
-        <article>
-          <h2>Worktrees <span id="worktree-count" class="dim"></span></h2>
-          <ul id="worktrees"></ul>
-          <p id="no-worktrees" class="dim">No daemon connected.</p>
-        </article>
-        <article>
-          <h2>As it happens</h2>
-          <ul id="events"></ul>
+          <h2>Set up your Claude for <span id="setup-repo"></span></h2>
+          <p id="setup-state"></p>
+          <p>
+            Paste the prompt below into Claude Code on your computer. It installs the Pitstop client, connects a checkout
+            of this repository, wires the Pitstop tools into Claude Code and starts the background daemon. It contains a
+            personal token for you: do not share it.
+          </p>
+          <p><button id="make-prompt" type="button">Create a token and write the prompt</button></p>
+          <p id="setup-msg" class="msg"></p>
+          <div id="prompt-box" hidden>
+            <pre id="prompt"></pre>
+            <button id="copy-prompt" type="button">Copy</button>
+          </div>
         </article>
       </section>
-    </main>
+    </section>
+
+    <section id="view-account" class="view" hidden>
+      <div class="columns">
+        <article>
+          <h2>Personal tokens</h2>
+          <p class="dim">A token stands for you on one computer: the daemon and the Pitstop tools send it. Revoke it when the computer is gone.</p>
+          <ul id="tokens" class="list"></ul>
+          <form id="new-token" class="stack">
+            <input id="new-token-name" required autocomplete="off" placeholder="laptop" maxlength="80" />
+            <button type="submit">Create token</button>
+          </form>
+          <div id="new-token-box" hidden>
+            <p>Shown once. Put it in <code>PITSTOP_TOKEN</code> or pass it to <code>pitstop setup --token</code>.</p>
+            <pre id="new-token-secret"></pre>
+          </div>
+        </article>
+        <article>
+          <h2>You</h2>
+          <p id="account-who"></p>
+          <p><button id="sign-out" type="button">Sign out</button></p>
+        </article>
+      </div>
+    </section>
+
     <script type="module" src="app.js"></script>
   </body>
 </html>

@@ -1,8 +1,10 @@
 /**
- * The live view: one page, no framework (web/CLAUDE.md). It subscribes to the server's stream
- * for one repository from LSN 0, so the whole log replays and then stays live; the rest of the
- * API is read once at start. Only types come from @pitstop/protocol: nothing from node_modules
- * reaches the browser.
+ * The website, one page, no framework (web/CLAUDE.md): sign in, your repositories, a
+ * repository's live view, its members and invites, the prompt that sets up a developer's Claude,
+ * and personal tokens. Routes live in the hash (#/, #/r/<owner>/<name>[/members|/setup],
+ * #/account). The live view subscribes to the server's stream for one repository from LSN 0, so
+ * the whole log replays and then stays live. Only types come from @pitstop/protocol: nothing from
+ * node_modules reaches the browser.
  */
 import type { Changeset, ClientMessage, Intent, Repo, ServerMessage } from "@pitstop/protocol";
 
@@ -87,41 +89,38 @@ const plural = (n: number, word: string, words = `${word}s`): string => `${n} ${
 
 const authHeaders = (): Record<string, string> => (token === "" ? {} : { authorization: `Bearer ${token}` });
 
-/** A GET as JSON, or nothing. `unauthorized` remembers a 401 for the caller to act on. */
-let unauthorized = false;
+/** A GET as JSON, or nothing. */
 async function api<T>(path: string): Promise<T | undefined> {
   const res = await fetch(path, { headers: authHeaders() });
-  unauthorized = res.status === 401;
   if (!res.ok) return undefined;
   return (await res.json()) as T;
 }
 
-async function whoAmI(): Promise<void> {
-  const who = $("who");
-  who.replaceChildren();
-  // Anonymous is fine on an open server: /me answers 401 there too, so this alone shows no field.
-  const me = await api<{ login: string }>("/me");
-  if (me !== undefined) {
-    who.append(`signed in as ${me.login}`);
-    return;
+/** Any request; the session cookie rides along on its own. The body is JSON when there is one. */
+async function call<T>(method: string, path: string, body?: unknown): Promise<{ status: number; body: T | undefined }> {
+  const headers: Record<string, string> = { ...authHeaders(), ...(body === undefined ? {} : { "content-type": "application/json" }) };
+  const res = await fetch(path, { method, headers, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
+  const text = await res.text();
+  let parsed: T | undefined;
+  try {
+    parsed = text === "" ? undefined : (JSON.parse(text) as T);
+  } catch {
+    parsed = undefined;
   }
-  who.append(el("a", { href: "/auth/github" }, "sign in with GitHub"));
-  if (token !== "") who.append(" · token set");
+  return { status: res.status, body: parsed };
 }
 
-async function loadRepos(): Promise<void> {
-  const repos = (await api<Repo[]>("/repos")) ?? [];
-  // The data is guarded: the server wants a token (or the sign-in above).
-  $("token-form").hidden = !unauthorized;
-  const wanted = decodeURIComponent(location.hash.slice(1)) || state.repo;
-  const ids = repos.map((r) => r.id);
-  // The one in the URL, or the default, even when the list could not be read.
-  if (!ids.includes(wanted)) ids.unshift(wanted);
-  const select = $<HTMLSelectElement>("repo");
-  select.replaceChildren(...ids.map((id) => el("option", { value: id }, id)));
-  select.value = wanted;
-  state.repo = wanted;
+const messageOf = (body: unknown, fallback: string): string =>
+  typeof body === "object" && body !== null && "message" in body && typeof body.message === "string" ? body.message : fallback;
+
+/** Who is looking: a signed-in user (session cookie or personal token), the administrator's token, or nobody. */
+interface Me {
+  id: string;
+  login: string;
+  name?: string;
 }
+const session = { me: undefined as Me | undefined, accounts: false };
+const signedIn = (): boolean => session.me !== undefined || token !== "";
 
 // --- the stream ----------------------------------------------------------------------------------
 
@@ -137,7 +136,8 @@ function setConnected(on: boolean): void {
   pill.className = `pill ${on ? "on" : "off"}`;
 }
 
-function connect(): void {
+/** Stops following a repository: the page moved elsewhere. */
+function disconnect(): void {
   if (reconnectTimer !== undefined) {
     clearTimeout(reconnectTimer);
     reconnectTimer = undefined;
@@ -145,6 +145,11 @@ function connect(): void {
   const old = socket;
   socket = undefined;
   old?.close();
+  setConnected(false);
+}
+
+function connect(): void {
+  disconnect();
 
   const url = new URL("/stream", location.href);
   url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
@@ -409,7 +414,7 @@ function renderEvents(): void {
   );
 }
 
-// --- start ---------------------------------------------------------------------------------------
+// --- the live view's lifecycle -------------------------------------------------------------------
 
 function reset(): void {
   state.head = null;
@@ -427,34 +432,362 @@ function reset(): void {
   renderEvents();
 }
 
-async function load(): Promise<void> {
-  const version = await api<{ version: string }>("/version");
-  $("version").textContent = version === undefined ? "" : version.version.slice(0, 7);
-  await whoAmI();
-  await loadRepos();
+/** Follows `repo` live, unless the page already does. */
+function follow(repo: string): void {
+  if (state.repo === repo && socket !== undefined) return;
+  state.repo = repo;
   reset();
   connect();
 }
 
+// --- routes --------------------------------------------------------------------------------------
+
+type Tab = "live" | "members" | "setup";
+type Route = { view: "home" } | { view: "account" } | { view: "repo"; repo: string; tab: Tab };
+
+function parseRoute(hash: string): Route {
+  const raw = decodeURIComponent(hash.replace(/^#/, ""));
+  if (raw === "" || raw === "/") return { view: "home" };
+  if (raw === "/account") return { view: "account" };
+  // Before routes, the hash held only the repository: #owner/name.
+  const parts = (raw.startsWith("/r/") ? raw.slice(3) : raw.replace(/^\//, "")).split("/");
+  const [owner, name, tab] = parts;
+  if (owner && name) return { view: "repo", repo: `${owner}/${name}`, tab: tab === "members" || tab === "setup" ? tab : "live" };
+  return { view: "home" };
+}
+
+const repoHref = (repo: string, tab: Tab = "live"): string => `#/r/${repo}${tab === "live" ? "" : `/${tab}`}`;
+
+function show(route: Route): void {
+  for (const id of ["view-home", "view-repo", "view-account"]) $(id).hidden = true;
+  const inRepo = route.view === "repo";
+  for (const id of ["repo-title", "head", "conn"]) $(id).hidden = !inRepo;
+  if (route.view !== "repo") disconnect();
+  if (route.view === "home") {
+    $("view-home").hidden = false;
+    void renderHome();
+  } else if (route.view === "account") {
+    $("view-account").hidden = false;
+    void renderAccount();
+  } else {
+    $("view-repo").hidden = false;
+    $("repo-title").textContent = route.repo;
+    for (const tab of ["live", "members", "setup"] as const) {
+      const link = $<HTMLAnchorElement>(`tab-${tab}`);
+      link.href = repoHref(route.repo, tab);
+      link.className = tab === route.tab ? "active" : "";
+    }
+    $("pane-live").hidden = route.tab !== "live";
+    $("pane-members").hidden = route.tab !== "members";
+    $("pane-setup").hidden = route.tab !== "setup";
+    follow(route.repo);
+    if (route.tab === "members") void renderMembers(route.repo);
+    if (route.tab === "setup") void renderSetup(route.repo);
+  }
+}
+
+// --- who is looking ------------------------------------------------------------------------------
+
+async function loadSession(): Promise<void> {
+  const version = await api<{ version: string; accounts?: boolean }>("/version");
+  $("version").textContent = version === undefined ? "" : version.version.slice(0, 7);
+  session.accounts = version?.accounts === true;
+  session.me = await api<Me>("/me");
+  const who = $("who");
+  who.replaceChildren();
+  if (session.me !== undefined) {
+    who.append(el("a", { href: "#/account" }, session.me.login));
+  } else if (token !== "") {
+    const forget = el("a", { href: "#/" }, "forget token");
+    forget.addEventListener("click", () => {
+      token = "";
+      localStorage.removeItem(TOKEN_KEY);
+      void start();
+    });
+    who.append("server token · ", forget);
+  } else if (session.accounts) {
+    who.append(el("a", { href: "/auth/github" }, "Sign in with GitHub"));
+  }
+  $("nav-account").hidden = session.me === undefined;
+  // Without sign-in the server takes its shared token; with sign-in the page never asks for it.
+  $("token-form").hidden = session.accounts || signedIn();
+}
+
+// --- home: your repositories ---------------------------------------------------------------------
+
+async function renderHome(): Promise<void> {
+  $("home-out").hidden = signedIn();
+  $("home-in").hidden = !signedIn();
+  $("home-token-hint").hidden = session.accounts;
+  if (!signedIn()) return;
+  $("new-owner").textContent = session.me === undefined ? "" : `${session.me.login.toLowerCase()}/`;
+  $<HTMLInputElement>("new-name").placeholder = session.me === undefined ? "owner/name" : "name";
+  const repos = (await api<Repo[]>("/repos")) ?? [];
+  $("no-repos").hidden = repos.length > 0;
+  $("repos").replaceChildren(
+    ...repos.map((r) =>
+      el(
+        "li",
+        {},
+        el("a", { href: repoHref(r.id), class: "grow" }, r.id),
+        el("span", { class: "dim" }, r.headLsn === 0 ? "empty" : `head #${r.headLsn}`),
+        el("a", { href: repoHref(r.id, "members") }, "members"),
+        el("a", { href: repoHref(r.id, "setup") }, "set up Claude"),
+      ),
+    ),
+  );
+}
+
+async function createRepo(ev: SubmitEvent): Promise<void> {
+  ev.preventDefault();
+  const input = $<HTMLInputElement>("new-name");
+  const name = input.value.trim().toLowerCase();
+  const id = session.me === undefined ? name : `${session.me.login.toLowerCase()}/${name}`;
+  const res = await call<Repo>("POST", "/repos", { id });
+  if (res.status === 201 || res.status === 200) {
+    input.value = "";
+    say("new-repo-msg", res.status === 201 ? `${id} created` : `${id} exists`, true);
+    location.hash = repoHref(id, "setup");
+    return;
+  }
+  say("new-repo-msg", messageOf(res.body, `the server answered ${res.status}`), false);
+}
+
+// --- members and invites -------------------------------------------------------------------------
+
+interface MemberRow {
+  login: string;
+  role: "owner" | "writer" | "reader";
+  resolver?: boolean;
+  pending?: boolean;
+}
+
+function say(id: string, text: string, ok: boolean): void {
+  const msg = $(id);
+  msg.className = `msg ${ok ? "ok" : "error"}`;
+  msg.textContent = text;
+}
+
+async function renderMembers(repo: string): Promise<void> {
+  const res = await call<MemberRow[]>("GET", `/repos/${repo}/members`);
+  if (res.status !== 200 || res.body === undefined) {
+    $("members").replaceChildren();
+    say("members-msg", messageOf(res.body, res.status === 401 ? "sign in to see this repository" : `the server answered ${res.status}`), false);
+    $("invite-box").hidden = true;
+    return;
+  }
+  const rows = res.body;
+  const myLogin = session.me?.login.toLowerCase();
+  const mine = rows.find((m) => m.pending !== true && m.login.toLowerCase() === myLogin);
+  // A signed-in user manages as an owner; the administrator's token manages everything.
+  const canManage = session.me === undefined ? token !== "" : mine?.role === "owner";
+  $("invite-box").hidden = !canManage;
+  const put = async (login: string, body: { role: string; resolver?: boolean }): Promise<void> => {
+    const r = await call("PUT", `/repos/${repo}/members/${encodeURIComponent(login)}`, body);
+    if (r.status >= 300) say("members-msg", messageOf(r.body, `the server answered ${r.status}`), false);
+    else say("members-msg", `${login} updated`, true);
+    await renderMembers(repo);
+  };
+  $("members").replaceChildren(
+    ...rows.map((m) => {
+      const self = m.login.toLowerCase() === myLogin;
+      const role = el("select", {}, ...(["owner", "writer", "reader"] as const).map((r) => el("option", r === m.role ? { value: r, selected: "" } : { value: r }, r)));
+      role.disabled = !canManage || m.pending === true;
+      role.addEventListener("change", () => void put(m.login, { role: role.value }));
+      const resolver = el("input", { type: "checkbox", title: "resolver: decides on conflicts" });
+      resolver.checked = m.resolver === true;
+      resolver.disabled = !canManage || m.pending === true;
+      resolver.addEventListener("change", () => void put(m.login, { role: m.role, resolver: resolver.checked }));
+      const remove = el("button", { type: "button" }, self ? "Leave" : m.pending === true ? "Withdraw" : "Remove");
+      remove.hidden = !(canManage || self);
+      remove.addEventListener("click", () => void removeMember(repo, m.login, self));
+      return el(
+        "li",
+        {},
+        el("span", { class: "grow" }, m.login, self ? el("span", { class: "dim" }, " (you)") : null),
+        m.pending === true ? el("span", { class: "badge warn" }, "invited") : null,
+        role,
+        el("label", { class: "inline" }, resolver, " resolver"),
+        remove,
+      );
+    }),
+  );
+}
+
+async function removeMember(repo: string, login: string, self: boolean): Promise<void> {
+  const r = await call("DELETE", `/repos/${repo}/members/${encodeURIComponent(login)}`);
+  if (r.status >= 300) {
+    say("members-msg", messageOf(r.body, `the server answered ${r.status}`), false);
+    return;
+  }
+  if (self) {
+    location.hash = "#/";
+    return;
+  }
+  say("members-msg", `${login} removed`, true);
+  await renderMembers(repo);
+}
+
+async function invite(ev: SubmitEvent, repo: string): Promise<void> {
+  ev.preventDefault();
+  const login = $<HTMLInputElement>("invite-login").value.trim();
+  const role = $<HTMLSelectElement>("invite-role").value;
+  const res = await call<MemberRow>("PUT", `/repos/${repo}/members/${encodeURIComponent(login)}`, { role });
+  if (res.status === 202) say("members-msg", `${login} invited as ${role}: they join when they first sign in at ${location.origin}`, true);
+  else if (res.status < 300) say("members-msg", `${login} added as ${role}`, true);
+  else say("members-msg", messageOf(res.body, `the server answered ${res.status}`), false);
+  $<HTMLInputElement>("invite-login").value = "";
+  await renderMembers(repo);
+}
+
+// --- the prompt that sets up a developer's Claude ------------------------------------------------
+
+/** What the developer pastes into Claude Code: install, connect a checkout, wire the tools, start the daemon. */
+function promptText(repo: string, secret: string, empty: boolean): string {
+  const server = location.origin;
+  const where = empty
+    ? "This repository is empty, so it starts from code I already have. Ask me where my project is (a git checkout on the branch main), go to that folder, and run:"
+    : "Ask me where the checkout should go (on Windows keep the path short, like C:\\code), go to that folder, and run:";
+  return [
+    `Set up Pitstop for the repository ${repo} on this computer.`,
+    "",
+    `Pitstop is version control built for coding agents: the server at ${server} keeps the history, and a small background daemon keeps a local checkout in sync. From now on we commit through Pitstop's tools, not git.`,
+    "",
+    "1. Make sure Node.js 22 or newer, git and jj (Jujutsu) are installed, and install what is missing:",
+    "   - Windows: winget install OpenJS.NodeJS.LTS, then winget install Git.Git, then winget install jj-vcs.jj",
+    "   - macOS: brew install node git jj",
+    "   - Linux: Node.js and git from the package manager; jj from https://github.com/jj-vcs/jj/releases",
+    `2. Install the Pitstop client: npm install -g ${server}/pitstop-cli.tgz`,
+    `3. ${where}`,
+    `   pitstop setup ${server} ${repo} --token ${secret}`,
+    "4. Read the CLAUDE.local.md that setup writes in the checkout and follow it from now on. Then tell me to open Claude Code in that checkout, so the pitstop tools load.",
+    "",
+    "The token is mine: keep it out of files you commit and out of anything you share.",
+  ].join("\n");
+}
+
+async function renderSetup(repo: string): Promise<void> {
+  $("setup-repo").textContent = repo;
+  $("prompt-box").hidden = true;
+  say("setup-msg", "", true);
+  const info = await call<Repo>("GET", `/repos/${repo}`);
+  const button = $<HTMLButtonElement>("make-prompt");
+  if (info.status !== 200 || info.body === undefined) {
+    $("setup-state").textContent = "";
+    button.hidden = true;
+    say("setup-msg", messageOf(info.body, info.status === 401 ? "sign in to set up this repository" : `the server answered ${info.status}`), false);
+    return;
+  }
+  const empty = info.body.headLsn === 0;
+  $("setup-state").textContent = empty
+    ? "This repository is empty: the first setup imports the code from your existing checkout."
+    : `This repository has ${plural(info.body.headLsn, "entry", "entries")}: setup builds a fresh checkout from them.`;
+  button.hidden = false;
+  button.onclick = () => void makePrompt(repo, empty);
+}
+
+async function makePrompt(repo: string, empty: boolean): Promise<void> {
+  if (session.me === undefined) {
+    // The administrator's shared token must never travel in a prompt.
+    showPrompt(promptText(repo, "<your personal token: sign in, then Account>", empty));
+    say("setup-msg", "Sign in with GitHub to get a personal token for this prompt.", false);
+    return;
+  }
+  const made = await call<{ secret: string }>("POST", "/tokens", { name: `claude ${repo}`.slice(0, 80) });
+  if (made.status !== 201 || made.body === undefined) {
+    say("setup-msg", messageOf(made.body, `the server answered ${made.status}`), false);
+    return;
+  }
+  showPrompt(promptText(repo, made.body.secret, empty));
+  say("setup-msg", "A new token was made for this prompt; revoke it under Account when that computer is gone.", true);
+}
+
+function showPrompt(text: string): void {
+  $("prompt").textContent = text;
+  $("prompt-box").hidden = false;
+}
+
+// --- account: personal tokens --------------------------------------------------------------------
+
+interface TokenRow {
+  id: string;
+  name: string;
+  createdAt: string;
+  lastUsedAt?: string;
+  revokedAt?: string;
+}
+
+async function renderAccount(): Promise<void> {
+  $("new-token-box").hidden = true;
+  if (session.me === undefined) {
+    $("account-who").textContent = "Not signed in.";
+    $("tokens").replaceChildren();
+    return;
+  }
+  $("account-who").textContent = `Signed in as ${session.me.login}${session.me.name ? ` (${session.me.name})` : ""}.`;
+  const tokens = (await api<TokenRow[]>("/tokens")) ?? [];
+  $("tokens").replaceChildren(
+    ...tokens.map((t) => {
+      const revoke = el("button", { type: "button" }, "Revoke");
+      revoke.hidden = t.revokedAt !== undefined;
+      revoke.addEventListener("click", () => void revokeToken(t.id));
+      const status = t.revokedAt !== undefined ? "revoked" : t.lastUsedAt !== undefined ? `used ${timeAgo(t.lastUsedAt)}` : `made ${timeAgo(t.createdAt)}`;
+      return el("li", {}, el("span", { class: "grow" }, t.name), el("span", { class: "dim" }, status), revoke);
+    }),
+  );
+}
+
+async function revokeToken(id: string): Promise<void> {
+  await call("DELETE", `/tokens/${id}`);
+  await renderAccount();
+}
+
+async function createToken(ev: SubmitEvent): Promise<void> {
+  ev.preventDefault();
+  const input = $<HTMLInputElement>("new-token-name");
+  const made = await call<{ secret: string }>("POST", "/tokens", { name: input.value.trim() });
+  if (made.status !== 201 || made.body === undefined) return;
+  input.value = "";
+  await renderAccount();
+  $("new-token-secret").textContent = made.body.secret;
+  $("new-token-box").hidden = false;
+}
+
+// --- start ---------------------------------------------------------------------------------------
+
+async function start(): Promise<void> {
+  await loadSession();
+  show(parseRoute(location.hash));
+}
+
+async function signOut(): Promise<void> {
+  await call("POST", "/auth/logout");
+  location.hash = "#/";
+  await start();
+}
+
 function setup(): void {
-  $<HTMLSelectElement>("repo").addEventListener("change", (ev) => {
-    state.repo = (ev.target as HTMLSelectElement).value;
-    location.hash = encodeURIComponent(state.repo);
-    reset();
-    connect();
-  });
   $<HTMLFormElement>("token-form").addEventListener("submit", (ev) => {
     ev.preventDefault();
     const input = $<HTMLInputElement>("token");
     token = input.value.trim();
     input.value = "";
     localStorage.setItem(TOKEN_KEY, token);
-    void load();
+    void start();
   });
+  $<HTMLFormElement>("new-repo").addEventListener("submit", (ev) => void createRepo(ev));
+  $<HTMLFormElement>("invite").addEventListener("submit", (ev) => {
+    const route = parseRoute(location.hash);
+    if (route.view === "repo") void invite(ev, route.repo);
+  });
+  $<HTMLFormElement>("new-token").addEventListener("submit", (ev) => void createToken(ev));
+  $("copy-prompt").addEventListener("click", () => void navigator.clipboard.writeText($("prompt").textContent ?? ""));
+  $("sign-out").addEventListener("click", () => void signOut());
   $("close").addEventListener("click", () => select(null));
+  window.addEventListener("hashchange", () => show(parseRoute(location.hash)));
   window.setInterval(renderIntents, 5_000);
   window.setInterval(() => void pollWorktrees(), WORKTREES_MS);
-  void load();
+  void start();
 }
 
 setup();

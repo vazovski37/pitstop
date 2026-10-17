@@ -103,7 +103,9 @@ const MirrorBody = z.object({
   baseCommit: z.string().regex(/^[0-9a-f]{40}$/, "expected a commit sha").optional(),
 });
 const TokenBody = z.object({ name: z.string().min(1).max(80) });
-const MemberBody = z.object({ role: z.enum(["owner", "writer", "reader"]) });
+const MemberBody = z.object({ role: z.enum(["owner", "writer", "reader"]), resolver: z.boolean().optional() });
+/** A GitHub login: letters, digits and single hyphens, up to 39 characters. */
+const GitHubLogin = z.string().regex(/^[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}$/, "not a GitHub login");
 const RepoPatch = z.object({ visibility: z.enum(["private", "public"]) });
 
 type RepoParams = { Params: { owner: string; name: string } };
@@ -218,7 +220,8 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     return reply.code(db ? 200 : 503).send(body);
   });
 
-  app.get("/version", async () => ({ version: deps.version }));
+  // `accounts` tells the web page whether to offer sign in with GitHub.
+  app.get("/version", async () => ({ version: deps.version, accounts }));
 
   // Sign in with GitHub (auth.ts): the OAuth web flow, then a signed session cookie.
   app.get("/auth/github", async (req, reply) => {
@@ -239,6 +242,8 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     }
     const profile = await auth.oauth.exchange(req.query.code, redirectUri(req));
     const user = await deps.store.upsertUser(profile);
+    // Invited before they had an account: they join those repositories now.
+    await deps.store.acceptInvites(user);
     reply.clearCookie(STATE_COOKIE, { path: "/auth/github" });
     reply.setCookie(SESSION_COOKIE, sessionValue(user), { ...cookieBase, signed: true, path: "/", maxAge: SESSION_SECONDS });
     return reply.redirect(auth.webUrl ?? "/");
@@ -437,7 +442,9 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     const repo = repoParam(req);
     if ((await deps.store.getRepo(repo)) === undefined) return reply.code(404).send({ error: "unknown_repo" });
     if (!(await guard(req, reply, repo, "reader"))) return reply;
-    return (await deps.store.listMembers(repo)).map((m) => ({ login: m.login, role: m.role }));
+    const members = (await deps.store.listMembers(repo)).map((m) => ({ login: m.login, role: m.role, ...(m.resolver ? { resolver: true } : {}) }));
+    const invites = (await deps.store.listInvites(repo)).map((i) => ({ login: i.login, role: i.role, pending: true }));
+    return [...members, ...invites];
   });
 
   app.put<{ Params: { owner: string; name: string; login: string } }>("/repos/:owner/:name/members/:login", async (req, reply) => {
@@ -446,13 +453,21 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     if (!(await guard(req, reply, repo, "owner"))) return reply;
     const parsed = MemberBody.safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: "invalid_request", message: issues(parsed.error) });
-    const user = await deps.store.getUserByLogin(req.params.login);
-    if (user === undefined) return reply.code(404).send({ error: "unknown_user", message: `${req.params.login} has not signed in here yet` });
+    const login = GitHubLogin.safeParse(req.params.login);
+    if (!login.success) return reply.code(400).send({ error: "invalid_request", message: `${req.params.login} is not a GitHub login` });
+    const user = await deps.store.getUserByLogin(login.data);
+    if (user === undefined) {
+      // Not signed in here yet: an invite, which becomes membership at their first sign-in.
+      await deps.store.setInvite(repo, login.data, parsed.data.role, currentUser(req)?.id);
+      return reply.code(202).send({ login: login.data.toLowerCase(), role: parsed.data.role, pending: true });
+    }
     if (parsed.data.role !== "owner" && (await lastOwner(repo, user.id))) {
       return reply.code(409).send({ error: "last_owner", message: "a repository needs an owner: make someone else owner first" });
     }
     await deps.store.setMember(repo, user.id, parsed.data.role);
-    return { login: user.login, role: parsed.data.role };
+    if (parsed.data.resolver !== undefined) await deps.store.setResolver(repo, user.id, parsed.data.resolver);
+    const member = (await deps.store.listMembers(repo)).find((m) => m.userId === user.id);
+    return { login: user.login, role: parsed.data.role, ...(member?.resolver ? { resolver: true } : {}) };
   });
 
   app.delete<{ Params: { owner: string; name: string; login: string } }>("/repos/:owner/:name/members/:login", async (req, reply) => {
@@ -466,7 +481,8 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
       return reply.code(409).send({ error: "last_owner", message: "a repository needs an owner: make someone else owner first" });
     }
     const removed = user === undefined ? false : await deps.store.removeMember(repo, user.id);
-    return reply.code(removed ? 204 : 404).send();
+    const uninvited = leaving ? false : await deps.store.deleteInvite(repo, req.params.login);
+    return reply.code(removed || uninvited ? 204 : 404).send();
   });
 
   // The git mirror of a repository: an export of its log to a GitHub branch (build plan, Phase 3).
