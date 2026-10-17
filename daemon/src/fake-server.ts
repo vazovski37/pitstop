@@ -6,6 +6,7 @@
  * Behaviour copied from server/src/stream.ts: `hello` on connect, then after `subscribe`
  * every entry above `fromLsn` in order, then entries appended by commits as they happen.
  */
+import { DEFAULT_REPO } from "@pitstop/protocol";
 import { readFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -107,6 +108,7 @@ export async function startFakeServer(opts: FakeServerOptions = {}): Promise<Fak
       const r = parsed.data;
       commits.push(r);
       const changeset: Changeset = {
+        repo: r.repo ?? DEFAULT_REPO,
         lsn: headLsn() + 1,
         baseLsn: r.baseLsn,
         author: r.author,
@@ -147,6 +149,7 @@ export async function startFakeServer(opts: FakeServerOptions = {}): Promise<Fak
       received.push(parsed.data);
       if (parsed.data.type === "subscribe") {
         subscribers.set(socket, { lastSentLsn: parsed.data.fromLsn });
+        sendTo(socket, { type: "head", repo: parsed.data.repo ?? DEFAULT_REPO, headLsn: headLsn() });
         deliver(socket);
       }
     });

@@ -5,6 +5,8 @@ export function describe(message: ServerMessage): string {
   switch (message.type) {
     case "hello":
       return `connected to server ${message.serverVersion}, head #${message.headLsn}`;
+    case "head":
+      return `${message.repo} is at #${message.headLsn}`;
     case "entry":
       return `#${message.changeset.lsn} ${message.changeset.intent}`;
     case "intent":
