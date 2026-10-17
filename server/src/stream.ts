@@ -14,8 +14,20 @@ interface Subscriber {
   lastSentLsn: Lsn | null;
   /** From heartbeats; the live view shows it against the head. */
   appliedLsn: Lsn | null;
+  /** The open intent the last heartbeat named, if it named one: how the live view puts a name on the worktree. */
+  intentId: string | null;
   /** One delivery at a time per socket, so entries never interleave. */
   sending: Promise<void>;
+}
+
+/**
+ * What a connected worktree has told the server about itself through heartbeats. Answered by
+ * `GET /repos/:owner/:name/worktrees` (app.ts), where the open intent adds the agent's name. A
+ * server query, not a server↔daemon message, so its shape lives here and not in the protocol.
+ */
+export interface Worktree {
+  appliedLsn: Lsn;
+  intentId?: string;
 }
 
 /**
@@ -42,7 +54,7 @@ export class Stream {
    * daemon asks for. `canRead` decides which repositories this socket may follow (auth.ts).
    */
   connect(socket: WebSocket, canRead: (repo: RepoId) => Promise<boolean> = async () => true): void {
-    const sub: Subscriber = { socket, repo: null, lastSentLsn: null, appliedLsn: null, sending: Promise.resolve() };
+    const sub: Subscriber = { socket, repo: null, lastSentLsn: null, appliedLsn: null, intentId: null, sending: Promise.resolve() };
     this.subs.add(sub);
     socket.on("close", () => this.subs.delete(sub));
     socket.on("error", (err) => this.log?.warn({ err }, "stream socket error"));
@@ -63,9 +75,14 @@ export class Stream {
     for (const sub of this.subs) if (sub.repo === repo) this.send(sub, message);
   }
 
-  /** Applied LSN of every connected worktree of `repo` that reported one. */
-  worktrees(repo: RepoId): Lsn[] {
-    return [...this.subs].flatMap((s) => (s.repo === repo && s.appliedLsn !== null ? [s.appliedLsn] : []));
+  /**
+   * Every connected worktree of `repo` that has reported an applied LSN, in connection order. A
+   * socket that never heartbeats (the live view itself) is not a worktree and is left out.
+   */
+  worktrees(repo: RepoId): Worktree[] {
+    return [...this.subs].flatMap((s) =>
+      s.repo === repo && s.appliedLsn !== null ? [{ appliedLsn: s.appliedLsn, ...(s.intentId === null ? {} : { intentId: s.intentId }) }] : [],
+    );
   }
 
   private async onMessage(sub: Subscriber, raw: RawData, canRead: (repo: RepoId) => Promise<boolean>): Promise<void> {
@@ -101,6 +118,9 @@ export class Stream {
       }
       case "heartbeat":
         if (message.appliedLsn !== undefined) sub.appliedLsn = message.appliedLsn;
+        // The daemon names its open intent on every heartbeat while it has one, so a heartbeat
+        // without one means the task is over: the worktree loses its name until the next intent.
+        sub.intentId = message.intentId ?? null;
         if (message.intentId !== undefined) await this.store.heartbeat(message.intentId);
         break;
     }

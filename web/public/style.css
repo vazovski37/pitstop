@@ -50,9 +50,15 @@ ol, ul { list-style: none; margin: 0; padding: 0; }
 .badge.warn { border-color: var(--warn); color: var(--warn); }
 .badge.repair { border-color: var(--repair); color: var(--repair); background: #2a1f3d; }
 
-/* intents and events */
-#intents li, #events li { padding: 8px 0; border-top: 1px solid var(--line); }
-#intents li:first-child, #events li:first-child { border-top: 0; }
+/* intents, worktrees and events */
+#intents li, #worktrees li, #events li { padding: 8px 0; border-top: 1px solid var(--line); }
+#intents li:first-child, #worktrees li:first-child, #events li:first-child { border-top: 0; }
+#worktrees li { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+#worktrees .mark { font-size: 10px; }
+#worktrees .mark.ok { color: var(--ok); }
+#worktrees .mark.behind { color: var(--bad); }
+#worktrees .behind { color: var(--dim); }
+#worktrees .lag { color: var(--bad); font-size: 12px; }
 .agent { color: var(--warn); }
 .symbols { color: var(--dim); font-size: 12px; word-break: break-all; }
 #events li { font-size: 12px; display: grid; grid-template-columns: 64px 1fr; gap: 10px; }

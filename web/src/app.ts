@@ -10,7 +10,20 @@ import type { Changeset, ClientMessage, Intent, Repo, ServerMessage } from "@pit
 const DEFAULT_REPO = "local/default";
 const TOKEN_KEY = "pitstop.token";
 const RECONNECT_MS = 2_000;
+/** How often the worktrees are re-read while the stream is up; every entry re-reads them too. */
+const WORKTREES_MS = 3_000;
 const MAX_EVENTS = 200;
+
+/**
+ * One connected worktree, from `GET /repos/:owner/:name/worktrees` (`WorktreesResponse` in
+ * server/src/app.ts: a server query, not a protocol message). `agent` is there while the
+ * worktree has an open intent; between tasks the heartbeat names nobody.
+ */
+interface Worktree {
+  appliedLsn: number;
+  intentId?: string;
+  agent?: string;
+}
 
 type EventKind = "entry" | "repair" | "skew" | "intent" | "warning" | "info";
 interface Event {
@@ -25,6 +38,7 @@ const state = {
   head: null as number | null,
   entries: new Map<number, Changeset>(),
   intents: new Map<string, Intent>(),
+  worktrees: [] as Worktree[],
   events: [] as Event[],
   selected: null as number | null,
   /** Entries that landed while the page was watching: they get the landing animation. */
@@ -147,8 +161,31 @@ function connect(): void {
   ws.onclose = () => {
     if (socket !== ws) return; // replaced on purpose
     setConnected(false);
+    // What the worktrees had applied is as stale as the rest of the page now: shown again on reconnect.
+    state.worktrees = [];
+    renderWorktrees();
     reconnectTimer = window.setTimeout(connect, RECONNECT_MS);
   };
+}
+
+/**
+ * Re-reads the connected worktrees of the current repository. Their applied LSNs reach the server
+ * through heartbeats, not the stream, so the page asks: every WORKTREES_MS while the socket is up,
+ * on `head` after a subscribe, and after every entry that lands. One request at a time.
+ */
+let readingWorktrees = false;
+async function pollWorktrees(): Promise<void> {
+  if (readingWorktrees || socket?.readyState !== WebSocket.OPEN) return;
+  readingWorktrees = true;
+  const repo = state.repo;
+  try {
+    const res = await api<{ headLsn: number; worktrees: Worktree[] }>(`/repos/${repo}/worktrees`);
+    if (res === undefined || repo !== state.repo) return;
+    state.worktrees = res.worktrees;
+    renderWorktrees();
+  } finally {
+    readingWorktrees = false;
+  }
 }
 
 function handle(message: ServerMessage): void {
@@ -161,6 +198,7 @@ function handle(message: ServerMessage): void {
       state.headAtSubscribe = message.headLsn;
       if (state.head === null || message.headLsn > state.head) state.head = message.headLsn;
       renderHead();
+      void pollWorktrees();
       break;
     case "entry":
       onEntry(message.changeset);
@@ -195,6 +233,10 @@ function onEntry(cs: Changeset): void {
   }
   renderHead();
   renderLog();
+  // The head moved, so every worktree is behind until its daemon applies: show who has caught up.
+  // A replay is hundreds of entries at once; the `head` message already read the worktrees for it.
+  if (!replay) void pollWorktrees();
+  else renderWorktrees();
   if (state.selected === cs.lsn) renderDetail();
 }
 
@@ -322,6 +364,31 @@ function renderIntents(): void {
   );
 }
 
+/** `agent-b · applied #3 of #4`, one line per connected worktree, with a red mark on one behind the head. */
+function renderWorktrees(): void {
+  const head = state.head ?? 0;
+  // Named ones first, by name; the nameless (no open intent) after them, the furthest behind first.
+  const list = [...state.worktrees].sort((a, b) => {
+    if ((a.agent === undefined) !== (b.agent === undefined)) return a.agent === undefined ? 1 : -1;
+    return (a.agent ?? "").localeCompare(b.agent ?? "") || a.appliedLsn - b.appliedLsn;
+  });
+  $("worktree-count").textContent = list.length === 0 ? "" : String(list.length);
+  $("no-worktrees").hidden = list.length > 0;
+  $("worktrees").replaceChildren(
+    ...list.map((w) => {
+      const behind = Math.max(0, head - w.appliedLsn);
+      return el(
+        "li",
+        { class: behind > 0 ? "behind" : "", title: behind > 0 ? `${plural(behind, "entry", "entries")} behind the head` : "at the head" },
+        el("span", { class: `mark ${behind > 0 ? "behind" : "ok"}` }, "●"),
+        w.agent === undefined ? el("span", { class: "dim" }, "worktree") : el("span", { class: "agent" }, w.agent),
+        el("span", {}, `· applied #${w.appliedLsn} of #${head}`),
+        behind > 0 ? el("span", { class: "lag" }, `${behind} behind`) : null,
+      );
+    }),
+  );
+}
+
 function addEvent(kind: EventKind, text: string, lsn?: number): void {
   state.events.unshift({ at: new Date(), kind, text, ...(lsn === undefined ? {} : { lsn }) });
   if (state.events.length > MAX_EVENTS) state.events.length = MAX_EVENTS;
@@ -348,6 +415,7 @@ function reset(): void {
   state.head = null;
   state.entries.clear();
   state.intents.clear();
+  state.worktrees = [];
   state.events = [];
   state.selected = null;
   state.live.clear();
@@ -355,6 +423,7 @@ function reset(): void {
   renderLog();
   renderDetail();
   renderIntents();
+  renderWorktrees();
   renderEvents();
 }
 
@@ -384,6 +453,7 @@ function setup(): void {
   });
   $("close").addEventListener("click", () => select(null));
   window.setInterval(renderIntents, 5_000);
+  window.setInterval(() => void pollWorktrees(), WORKTREES_MS);
   void load();
 }
 
