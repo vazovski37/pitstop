@@ -10,8 +10,9 @@ import {
   type Health,
   type ServerMessage,
 } from "@pitstop/protocol";
-import { InvalidCommit, withBlobHashes, type Store } from "./store.js";
+import { InvalidCommit, RejectedCommit, withBlobHashes, type RejectReason, type Store } from "./store.js";
 import { Stream } from "./stream.js";
+import { decideCommit, describeSkew, type SkewVerdict, type ValidationMode } from "./validate.js";
 
 export interface AppDeps {
   /** Version string shown on /healthz. The deploy smoke test compares it with the git SHA. */
@@ -26,6 +27,8 @@ export interface AppDeps {
    * cannot set headers (the live view's `/stream`). Unset means open, for local work.
    */
   token?: string;
+  /** What the validator does with write skew until AI repair exists: `warn` (default) records it, `enforce` refuses it, `off` skips validation. */
+  validation?: ValidationMode;
   logger?: boolean;
 }
 
@@ -80,17 +83,35 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
 
   app.get("/version", async () => ({ version: deps.version }));
 
-  // Phase 1 fast path: no validation yet, every well-formed commit is appended (design doc section 6.2, step 7).
+  // Validate, then append, both under the store's append lock (design doc section 6.2, steps 6 and 7).
+  const mode = deps.validation ?? "warn";
   app.post("/commit", async (req, reply) => {
     const parsed = CommitRequest.safeParse(req.body);
-    if (!parsed.success) return rejected(reply, issues(parsed.error));
+    if (!parsed.success) return rejected(reply, "invalid_request", issues(parsed.error));
     try {
-      const changeset = await deps.store.append(withBlobHashes(parsed.data));
+      const request = withBlobHashes(parsed.data);
+      let skew: SkewVerdict | undefined;
+      const changeset = await deps.store.append(request, (gap, head) => {
+        const outcome = decideCommit(request, gap, head, mode);
+        skew = outcome.skew;
+        return outcome.decision;
+      });
       stream.notify();
+      if (skew) {
+        // Until repair exists the skew lands as is; the daemon and the live view hear about it.
+        stream.broadcast({
+          type: "warning",
+          agent: request.author.agent,
+          kind: "dependency_changed",
+          message: `#${changeset.lsn} landed with write skew, not repaired: ${describeSkew(skew)}`,
+          symbols: skew.symbols.map((s) => s.symbolId),
+        });
+      }
       const body: CommitResponse = { status: "accepted", changeset };
       return reply.code(200).send(body);
     } catch (err) {
-      if (err instanceof InvalidCommit) return rejected(reply, err.message);
+      if (err instanceof InvalidCommit) return rejected(reply, "invalid_request", err.message);
+      if (err instanceof RejectedCommit) return rejected(reply, err.reason, err.message, err.conflictsWith);
       throw err;
     }
   });
@@ -122,9 +143,10 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   return app;
 }
 
-const rejected = (reply: FastifyReply, message: string) => {
-  const body: CommitResponse = { status: "rejected", reason: "invalid_request", message, conflictsWith: [] };
-  return reply.code(400).send(body);
+/** 400 when the request itself is wrong; 409 when it is fine but cannot land on the current log. */
+const rejected = (reply: FastifyReply, reason: RejectReason, message: string, conflictsWith: Lsn[] = []) => {
+  const body: CommitResponse = { status: "rejected", reason, message, conflictsWith };
+  return reply.code(reason === "invalid_request" ? 400 : 409).send(body);
 };
 
 const issues = (error: { issues: { path: PropertyKey[]; message: string }[] }): string =>

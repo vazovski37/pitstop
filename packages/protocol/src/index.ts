@@ -64,7 +64,14 @@ export type Checks = z.infer<typeof Checks>;
 export const CommitRequest = z.object({
   /** Same key on a retry = same commit; the server never appends it twice. */
   idempotencyKey: z.string().min(8),
+  /** The entry the file contents are based on: the worktree's applied LSN when the commit was made. */
   baseLsn: Lsn,
+  /**
+   * The entry the transaction began at, when the daemon applied entries to the worktree while the
+   * agent worked. The server checks reads from here and writes from `baseLsn` (section 7.3).
+   * Absent means the same as `baseLsn`.
+   */
+  readBaseLsn: Lsn.optional(),
   author: Author,
   intent: z.string().min(1),
   /** The open intent this commit closes (from `POST /intents`). Absent when none was declared. */

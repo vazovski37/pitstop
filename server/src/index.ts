@@ -4,6 +4,7 @@ import { createPool, ping } from "./db.js";
 import { migrate } from "./migrate.js";
 import { PgStore } from "./pg-store.js";
 import { MemoryStore, type Store } from "./store.js";
+import { parseValidationMode } from "./validate.js";
 
 const port = Number(process.env.PORT ?? 8080);
 // GIT_SHA is baked into the image by CI; the smoke test checks /healthz reports it.
@@ -36,7 +37,10 @@ if (process.env.PITSTOP_STORE === "memory") {
 const token = process.env.PITSTOP_TOKEN || undefined;
 if (token === undefined) console.log("pitstop server: PITSTOP_TOKEN is not set, every route is open");
 
-const app = await buildApp({ version, pingDb, store, token, logger: true });
+const validation = parseValidationMode(process.env.PITSTOP_VALIDATE);
+console.log(`pitstop server: validation ${validation} (PITSTOP_VALIDATE)`);
+
+const app = await buildApp({ version, pingDb, store, token, validation, logger: true });
 
 const shutdown = async (signal: string) => {
   app.log.info(`${signal} received, shutting down`);

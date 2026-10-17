@@ -133,4 +133,27 @@ describe("GET /stream", () => {
     expect(await withQuery.next()).toMatchObject({ type: "hello" });
     withQuery.close();
   });
+
+  it("warns every socket when a commit lands with write skew", async () => {
+    const { app, commit, url } = await listen();
+    const inbox = await connect(url);
+    await inbox.next(); // hello
+    inbox.send({ type: "subscribe", fromLsn: 0 });
+    await commit("one");
+    expect(await inbox.next()).toMatchObject({ type: "entry", changeset: { lsn: 1 } });
+
+    await app.inject({
+      method: "POST",
+      url: "/commit",
+      payload: { ...request("two"), readSet: ["src/one.ts#one"] },
+    });
+    const messages = [await inbox.next(), await inbox.next()];
+    expect(messages.map((m) => m.type).sort()).toEqual(["entry", "warning"]);
+    expect(messages.find((m) => m.type === "warning")).toMatchObject({
+      kind: "dependency_changed",
+      agent: "agent-a",
+      symbols: ["src/one.ts#one"],
+    });
+    inbox.close();
+  });
 });
