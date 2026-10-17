@@ -20,6 +20,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   const app = Fastify({ logger: deps.logger ?? false });
   await app.register(websocket);
 
+  // The deploy smoke test (infra/smoke.sh) polls this until it reports the new version with db: true.
   app.get("/healthz", async (_req, reply) => {
     let db = false;
     try {
