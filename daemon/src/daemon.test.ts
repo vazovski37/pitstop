@@ -74,6 +74,25 @@ describe("daemon with its local API", () => {
     await expect(new LocalClient(worktree).status()).rejects.toBeInstanceOf(NoDaemon);
   });
 
+  it("starts in a fresh worktree with no .pitstop yet", async () => {
+    server = await startFakeServer({ messages: fixtureMessages() });
+    daemon = new Daemon({ serverUrl: server.url, worktree, applier, author, reconnectMs: 0, heartbeatMs: 0 });
+    port = await daemon.start();
+    expect(await readDaemonInfo(worktree)).toMatchObject({ port });
+  });
+
+  it("keeps the read base where the work began through a safe point; only a skew refusal moves it", async () => {
+    await start();
+    await waitFor(() => applier.lsns.includes(122));
+    await writeState(worktree, { appliedLsn: 122, readBaseLsn: 120, intentId: "int_09" });
+    await safePoint(); // attaches the agent, applies nothing
+    server.append(entryAt(123));
+    await waitFor(async () => (await status()).pending === 1);
+    expect((await safePoint()).applied).toEqual([123]);
+    // The notes only see edits, not what the agent read before editing: the server still checks from #120.
+    expect(await readState(worktree)).toEqual({ appliedLsn: 123, readBaseLsn: 120, intentId: "int_09" });
+  });
+
   it("holds entries between safe points once an agent is attached", async () => {
     await start();
     await waitFor(() => applier.lsns.includes(122));

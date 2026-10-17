@@ -23,7 +23,7 @@ import { commit, CommitRejected } from "./commit.js";
 import { serverHeaders, streamUrl } from "./config.js";
 import { declareIntent } from "./intents.js";
 import type { Applier } from "./jj.js";
-import { readState, STATE_DIR } from "./state.js";
+import { readState, STATE_DIR, stateDir } from "./state.js";
 import { StreamClient, type Applied, type Warning } from "./stream.js";
 import { hasTsProject, symbolSets, type SymbolSets } from "./symbols.js";
 
@@ -139,6 +139,7 @@ export class Daemon {
     });
     this.port = (http.address() as AddressInfo).port;
     const info: DaemonInfo = { port: this.port, pid: process.pid, startedAt: new Date().toISOString() };
+    await stateDir(this.opts.worktree); // a fresh worktree has no .pitstop/ yet
     await writeFile(daemonInfoPath(this.opts.worktree), `${JSON.stringify(info, null, 2)}\n`);
     return this.port;
   }
@@ -154,6 +155,9 @@ export class Daemon {
     this.attachedUntil = Date.now() + (this.opts.attachMs ?? 10 * 60_000);
     const applied = await this.stream.applyPending();
     const notes = await this.notes(applied);
+    // The read base stays where the work began: the notes see the agent's edits, not what it read
+    // before editing, and that read-before-edit is the skew the server checks for. Only a skew
+    // refusal moves it (commit.ts), once the server has named what to re-read.
     return { applied: applied.map((a) => a.changeset.lsn), pending: this.stream.pending, notes };
   }
 
