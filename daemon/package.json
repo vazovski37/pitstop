@@ -15,6 +15,7 @@
   },
   "dependencies": {
     "@pitstop/protocol": "0.1.0",
+    "typescript": "^5.7.0",
     "ws": "^8.18.0"
   },
   "devDependencies": {

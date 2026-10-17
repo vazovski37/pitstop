@@ -17,6 +17,10 @@ export interface Applier {
   apply(changeset: Changeset): Promise<ApplyResult>;
   /** The agent's unfinished work in `@`, as the file changes a commit request carries. */
   diffAgainstMain(): Promise<FileChange[]>;
+  /** Whether `@` holds any change against its parent. */
+  hasChanges(): Promise<boolean>;
+  /** Every tracked file at `main` or at `@`: posix path relative to the worktree -> text. */
+  treeFiles(rev: "main" | "@"): Promise<Map<string, string>>;
 }
 
 /** The entry cannot be applied as sent (missing content, wrong blob hash). Nothing was changed. */
@@ -78,9 +82,30 @@ export class JjWorktree implements Applier {
     }
   }
 
-  async diffAgainstMain(): Promise<FileChange[]> {
+  async hasChanges(): Promise<boolean> {
     await this.jj(["util", "snapshot"]);
-    const at = (await this.jj(["log", "-r", "@", "--no-graph", "-T", "commit_id"])).trim();
+    const out = await this.jj(["log", "-r", "@", "--no-graph", "-T", 'if(empty, "empty", "changed")']);
+    return out.trim() === "changed";
+  }
+
+  async treeFiles(rev: "main" | "@"): Promise<Map<string, string>> {
+    const commit = rev === "@" ? await this.workingCopyCommit() : `refs/heads/${this.bookmark}`;
+    const paths = (await this.git(["ls-tree", "-r", "-z", "--name-only", commit]))
+      .split("\0")
+      .filter((p) => p.length > 0 && !p.startsWith(".pitstop/"));
+    const files = new Map<string, string>();
+    for (const path of paths) files.set(path, await this.git(["show", `${commit}:${path}`]));
+    return files;
+  }
+
+  /** Snapshots the working copy and returns the git commit of `@`. */
+  private async workingCopyCommit(): Promise<string> {
+    await this.jj(["util", "snapshot"]);
+    return (await this.jj(["log", "-r", "@", "--no-graph", "-T", "commit_id"])).trim();
+  }
+
+  async diffAgainstMain(): Promise<FileChange[]> {
+    const at = await this.workingCopyCommit();
     const out = await this.git(["diff", "--name-status", "-M", "-z", `refs/heads/${this.bookmark}`, at]);
     const fields = out.split("\0");
     const files: FileChange[] = [];

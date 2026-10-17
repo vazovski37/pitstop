@@ -21,6 +21,13 @@ describe("daemon state", () => {
     expect(await readFile(join(dir, ".pitstop", ".gitignore"), "utf8")).toBe("*\n");
   });
 
+  it("keeps readBaseLsn only while it is set", async () => {
+    await writeState(dir, { appliedLsn: 122, readBaseLsn: 120 });
+    expect(await readState(dir)).toEqual({ appliedLsn: 122, readBaseLsn: 120 });
+    await writeState(dir, { appliedLsn: 123 });
+    expect(await readState(dir)).toEqual({ appliedLsn: 123 });
+  });
+
   it("refuses a file that is not a state file", async () => {
     await writeState(dir, { appliedLsn: 1 });
     await (await import("node:fs/promises")).writeFile(join(dir, ".pitstop", "state.json"), '{"appliedLsn":"x"}');
