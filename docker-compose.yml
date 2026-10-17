@@ -29,6 +29,8 @@ services:
       PORT: "8080"
       # The rest comes from .env next to this file (for developing Pitstop itself); empty means off/open.
       PITSTOP_TOKEN: ${PITSTOP_TOKEN:-}
+      # Local development only: the image runs in production mode, which refuses to start open.
+      PITSTOP_ALLOW_OPEN: "1"
       PITSTOP_REPAIR: ${PITSTOP_REPAIR:-}
       GROQ_API_KEY: ${GROQ_API_KEY:-}
       GROQ_MODEL: ${GROQ_MODEL:-}

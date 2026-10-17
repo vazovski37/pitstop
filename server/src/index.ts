@@ -79,8 +79,9 @@ if (oauth !== undefined && sessionSecret === undefined) {
 console.log(`pitstop server: accounts ${oauth === undefined ? "off (no GITHUB_OAUTH_CLIENT_ID)" : "on"}`);
 // A hosted server with neither a shared token nor accounts would be open to anyone with the URL:
 // a Provision run without the secrets must fail loudly, not serve every repository.
-if (process.env.NODE_ENV === "production" && token === undefined && oauth === undefined) {
-  console.error("refusing to start in production with neither PITSTOP_TOKEN nor accounts: every repository would be open");
+// PITSTOP_ALLOW_OPEN=1 is for the image on a laptop (docker compose), never for Azure.
+if (process.env.NODE_ENV === "production" && token === undefined && oauth === undefined && process.env.PITSTOP_ALLOW_OPEN !== "1") {
+  console.error("refusing to start in production with neither PITSTOP_TOKEN nor accounts: every repository would be open (PITSTOP_ALLOW_OPEN=1 on a laptop)");
   process.exit(1);
 }
 
