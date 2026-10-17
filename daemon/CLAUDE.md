@@ -30,9 +30,17 @@ In a worktree that is `jj git init --colocate`d with a `main` bookmark:
 
 Symbol sets (`symbols.ts`): two TypeScript programs from the worktree's own `tsconfig.json`, the tree at `main` and the tree at `@`, both in memory. A symbol is a top-level declaration or a class member, `path#qualified.name`. Write set: text changed, added or removed. Signature write set: the checker's signature or type string changed, or the symbol was removed. Read set: every project symbol a changed declaration refers to, types included, lib and `node_modules` excluded. A declaration's text excludes the comments above it, so a doc-comment-only edit is not a write; whitespace inside the declaration is. `src/symbols.test.ts` runs the two laptops' edits from `demo/scenario.md` against `demo/teamdb`.
 
+## The agent side (Phase 4)
+`pitstop daemon` also serves a local HTTP API on `127.0.0.1`, port in `.pitstop/daemon.json`, for the MCP tools and the hook in `mcp/` (`daemon.ts`; `local-client.ts` finds and calls it):
+- `POST /safe-point`: the agent is between tools. Pending entries are applied now, and the answer carries notes for the agent: entries that changed symbols its change reads or writes (from `symbols.ts` on `@`), files it is editing that an entry touched, conflict markers an apply left, and the server's `warning`s for this agent since the last safe point. Once a safe point has been seen, entries wait for the next one; a daemon that has seen none for ten minutes applies as they arrive, as in Phase 1.
+- `POST /intents {text, symbols?}`: opens a transaction on the server (`intents.ts`); the id goes into the state file, heartbeats carry it, the next commit closes it. Declaring also fixes `readBaseLsn` at the applied LSN of that moment.
+- `POST /commit {intent}`: the same as the CLI; 200 with the changeset, or 409 with the server's rejection verbatim (`reason`, `message`, `conflictsWith`), which the commit tool shows the agent.
+- `GET /status`, `GET /why?path=`, `GET /callers?symbol=` (the last two from `GET /log`, until the server has a query API).
+- CLI: `pitstop intent -m "<text>" [-s a#b,c#d]`, `pitstop safe-point` (the hook's command), `pitstop status`.
+
 The daemon and `pitstop commit` are separate processes on one worktree, and the server pushes an accepted entry on the stream before it answers the commit, so both would apply the same entry at once. Every apply runs under `.pitstop/lock` (`state.ts`, `withWorktreeLock`) and re-reads the state once it holds the lock; the second one finds the entry applied. A lock older than a minute belongs to a dead process and is taken over. Found by the Phase 1 gate on 2026-10-17.
 
-Source map: `stream.ts` (subscribe, order, gaps, readBaseLsn), `jj.ts` (the apply sequence below, `@` as file changes, trees at `main` and `@`), `symbols.ts`, `commit.ts` (commit and import), `state.ts` (state file and lock), `fake-server.ts`, `index.ts` (CLI).
+Source map: `stream.ts` (subscribe, order, gaps, readBaseLsn, holding for safe points), `daemon.ts` (the process: local API, safe points, notes), `intents.ts`, `jj.ts` (the apply sequence below, `@` as file changes, trees at `main` and `@`), `symbols.ts`, `commit.ts` (commit and import), `state.ts` (state file and lock), `config.ts`, `local-client.ts`, `fake-server.ts` (now also `POST /intents`, `GET /log`, scripted rejections), `index.ts` (CLI).
 
 ## jj apply sequence
 Tested on Windows 11 with jj 0.46.0 (`winget install jj-vcs.jj`) and git 2.x, in a colocated repo (`jj git init --colocate`), on 2026-10-17. The daemon runs these as child processes with the worktree as cwd; no shell is involved, so quote nothing.
@@ -75,4 +83,5 @@ Rollback, two levels:
 Windows 11 gotchas:
 - jj stores index segments as 128-character file names under `.jj/repo/index/segments/`. Under a long worktree path (about 100 characters or more) `jj git init` fails with "The system cannot find the path specified (os error 3)". Keep worktrees short, like `C:\Users\<you>\Desktop\pitstop`. A `subst` drive letter does not help because jj canonicalizes the path.
 - The jj identity must be set (`jj config set --user user.name/user.email`) or `@` is created with an empty author.
+- Replacing `.pitstop/state.json` by rename fails with `EPERM` for a few milliseconds while another process (the daemon, the CLI, a test) still has it open for reading; `state.ts` retries both the read and the rename.
 - When git made the repository's first commits (as `demo/scripts/reset.sh` does) and `jj git init --colocate` came after, git HEAD stays a symbolic ref to `main`. Step 2 would then move HEAD as well, and jj treats a moved HEAD as a `git checkout` the user already did, so step 3 leaves the files on disk untouched. The daemon detaches HEAD at its current commit before step 0 (`git update-ref --no-deref HEAD <commit>`), which jj does not notice. Found by the Phase 1 gate on 2026-10-17.

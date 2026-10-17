@@ -12,6 +12,8 @@ export interface State {
    * server checks the agent's reads from there; cleared when the commit lands.
    */
   readBaseLsn?: number;
+  /** The open intent declared for the current task; heartbeats keep it alive, the next commit closes it. */
+  intentId?: string;
 }
 
 export const STATE_DIR = ".pitstop";
@@ -66,20 +68,39 @@ const isLsn = (v: unknown): v is number => typeof v === "number" && Number.isInt
 
 /** The worktree's state; `appliedLsn: 0` when the daemon has never run here. */
 export async function readState(worktree: string): Promise<State> {
-  let text: string;
-  try {
-    text = await readFile(statePath(worktree), "utf8");
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") return { appliedLsn: 0 };
-    throw err;
+  let text: string | undefined;
+  // Another pitstop process may be renaming a fresh state file into place right now; on Windows
+  // that shows as EPERM or EBUSY for a moment.
+  for (let attempt = 0; ; attempt++) {
+    try {
+      text = await readFile(statePath(worktree), "utf8");
+      break;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === "ENOENT") return { appliedLsn: 0 };
+      if ((code === "EPERM" || code === "EBUSY") && attempt < 20) {
+        await new Promise((r) => setTimeout(r, 10));
+        continue;
+      }
+      throw err;
+    }
   }
-  const raw = JSON.parse(text) as { appliedLsn?: unknown; readBaseLsn?: unknown } | null;
+  const raw = JSON.parse(text) as { appliedLsn?: unknown; readBaseLsn?: unknown; intentId?: unknown } | null;
   const appliedLsn = raw?.appliedLsn;
   const readBaseLsn = raw?.readBaseLsn;
-  if (!isLsn(appliedLsn) || (readBaseLsn !== undefined && !isLsn(readBaseLsn))) {
+  const intentId = raw?.intentId;
+  if (
+    !isLsn(appliedLsn) ||
+    (readBaseLsn !== undefined && !isLsn(readBaseLsn)) ||
+    (intentId !== undefined && typeof intentId !== "string")
+  ) {
     throw new Error(`${statePath(worktree)} is not a daemon state file`);
   }
-  return readBaseLsn === undefined ? { appliedLsn } : { appliedLsn, readBaseLsn };
+  return {
+    appliedLsn,
+    ...(readBaseLsn === undefined ? {} : { readBaseLsn }),
+    ...(intentId === undefined ? {} : { intentId }),
+  };
 }
 
 /**
@@ -92,5 +113,20 @@ export async function writeState(worktree: string, state: State): Promise<void> 
   const target = statePath(worktree);
   const tmp = `${target}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
   await writeFile(tmp, `${JSON.stringify(state, null, 2)}\n`);
-  await rename(tmp, target);
+  // On Windows the rename fails with EPERM while any other handle (a reader in the daemon, the
+  // CLI, a test) still has the old file open; that lasts milliseconds, so wait it out.
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await rename(tmp, target);
+      return;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if ((code === "EPERM" || code === "EBUSY" || code === "EACCES") && attempt < 50) {
+        await new Promise((r) => setTimeout(r, 10));
+        continue;
+      }
+      await rm(tmp, { force: true });
+      throw err;
+    }
+  }
 }
