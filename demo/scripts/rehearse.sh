@@ -25,7 +25,7 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/../.." && pwd)"
-azure="https://bravebay-485f06a6.swedencentral.azurecontainerapps.io"
+azure="https://pitstop-server.bravebay-485f06a6.swedencentral.azurecontainerapps.io"
 
 role="${1:-}"
 case "$role" in

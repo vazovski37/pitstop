@@ -15,7 +15,7 @@ Who is who:
 | Task | fix the expired-session bug (issue #58) | show last-seen on the profile page (issue #61) |
 | Work dir | `~/pitstop-A` | `~/pitstop-B` |
 
-The server: `https://bravebay-485f06a6.swedencentral.azurecontainerapps.io`. Its live view is the
+The server: `https://pitstop-server.bravebay-485f06a6.swedencentral.azurecontainerapps.io`. Its live view is the
 root URL; its log is `GET /log?repo=teamdb/demo` with the shared token. Below, `$S` stands for the
 server URL and `$T` for the token.
 
