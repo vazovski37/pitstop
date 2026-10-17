@@ -3,7 +3,7 @@ import { readDaemonInfo, type SafePointResult, type Status } from "./daemon.js";
 
 export class NoDaemon extends Error {
   constructor(worktree: string) {
-    super(`no daemon is running in ${worktree} (start one with \`pitstop daemon\`)`);
+    super(`no daemon is running in ${worktree} (start one with \`pitstop start\`)`);
   }
 }
 

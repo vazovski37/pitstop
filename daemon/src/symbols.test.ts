@@ -7,7 +7,9 @@ const ROUTER = "src/router.ts";
 const HOME = "src/pages/HomePage.ts";
 const PROFILE = "src/pages/ProfilePage.ts";
 
-describe("symbol sets on the demo slice (demo/scenario.md)", () => {
+// Each case builds two TypeScript programs; under a full parallel `npm test` the first, cold one
+// (lib.d.ts parsed from scratch) can take well over vitest's default 5 s.
+describe("symbol sets on the demo slice (demo/scenario.md)", { timeout: 30_000 }, () => {
   const base = demoTree();
 
   it("sees no change between identical trees", () => {

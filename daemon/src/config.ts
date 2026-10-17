@@ -18,6 +18,8 @@ export interface FileConfig {
   serverUrl?: string;
   token?: string;
   repo?: string;
+  /** The agent name on this checkout's commits (written by `pitstop setup --agent`); PITSTOP_AGENT wins. */
+  agent?: string;
 }
 
 export const CONFIG_FILE = "config.json";
@@ -31,9 +33,11 @@ export async function readFileConfig(worktree: string): Promise<FileConfig> {
     const serverUrl = pick("serverUrl");
     const token = pick("token");
     const repo = pick("repo");
+    const agent = pick("agent");
     if (serverUrl !== undefined) out.serverUrl = serverUrl;
     if (token !== undefined) out.token = token;
     if (repo !== undefined) out.repo = repo;
+    if (agent !== undefined) out.agent = agent;
     return out;
   } catch {
     return {};
@@ -51,7 +55,7 @@ export async function writeFileConfig(worktree: string, config: FileConfig): Pro
  *   PITSTOP_TOKEN      shared token, when the server has one
  *   PITSTOP_REPO       owner/name; absent means the server's default repository
  *   PITSTOP_DEVELOPER  author.developer, defaults to the OS user name
- *   PITSTOP_AGENT      author.agent, defaults to "claude-code"
+ *   PITSTOP_AGENT      author.agent, else the file's `agent`, else "claude-code"
  *   PITSTOP_JJ_BIN / PITSTOP_GIT_BIN / PITSTOP_MERGIRAF_BIN  the executables, when not on PATH
  */
 export function configFrom(file: FileConfig, env: NodeJS.ProcessEnv = process.env, cwd: string = process.cwd()): Config {
@@ -64,7 +68,7 @@ export function configFrom(file: FileConfig, env: NodeJS.ProcessEnv = process.en
     ...(token ? { token } : {}),
     ...(repo ? { repo } : {}),
     worktree: cwd,
-    author: { developer: env.PITSTOP_DEVELOPER ?? userInfo().username, agent: env.PITSTOP_AGENT ?? "claude-code" },
+    author: { developer: env.PITSTOP_DEVELOPER ?? userInfo().username, agent: env.PITSTOP_AGENT ?? file.agent ?? "claude-code" },
   };
 }
 
