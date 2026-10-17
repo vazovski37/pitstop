@@ -19,6 +19,9 @@ The single source of truth: the write-ahead log, the commit API, the WebSocket s
 ## Validation
 `src/validate.ts` runs inside `Store.append`, under the append lock, against the entries after the commit's base (writes from `baseLsn`, reads from `readBaseLsn`). Write-write on a file or symbol: `rejected constraint_failed` with `conflictsWith`; the daemon rebases and retries. Write skew (a read symbol changed in the gap): `PITSTOP_VALIDATE=warn` (default) lands it with the skew in `checks.details` and a `warning` on the stream, `enforce` answers `rejected repair_failed`, `off` skips the validator. AI repair and the type-check gate replace `warn` in Phase 4.
 
+## Checks
+`src/checks.ts` runs `tsc --noEmit` on `Store.treeAt(head)` plus the commit's files, in a temp folder, with the server's own TypeScript (a dependency, so the image has it). The tree must carry its own `tsconfig.json` and need nothing from `node_modules`: the demo slice does, the pitstop repo itself does not. `PITSTOP_CHECK=always` gates every commit (a failure is `rejected constraint_failed` with tsc's errors); `off` (default) leaves it to the repair path. `treeAt` needs the repository to have entered the log as a full import at its first entry.
+
 ## Known constraint
 The stream keeps subscribers in memory, so the Container App runs exactly one replica (`infra/main.bicep`). To scale out later, fan new entries out through Postgres `LISTEN/NOTIFY`.
 

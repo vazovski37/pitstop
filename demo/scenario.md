@@ -6,6 +6,8 @@ Two agents, two laptops, one TeamDB slice (`demo/teamdb`). Agent A fixes a bug i
 
 Both laptops hold the same copy of the slice, made by `demo/scripts/reset.sh <dir>` (a fresh git + jj repo, dependencies installed, typecheck and tests green), with a daemon running in it and the live view open. Nothing is in flight.
 
+The log starts with the slice itself: the first daemon's first commit adds every file (`tsconfig.json`, `package.json`, `src/**`), so the server can rebuild the tree at any entry and type-check a repair against it. The second laptop's daemon then subscribes from 0 and receives that import.
+
 The slice, at the symbols that matter:
 
 | Symbol | At the start |

@@ -1,6 +1,15 @@
 import type pg from "pg";
 import type { Changeset, Checks, CommitRequest, FileChange, Intent, IntentRequest, Lsn, Repair } from "@pitstop/protocol";
-import { GAP_LIMIT, gapStart, InvalidCommit, newIntentId, SKIPPED_CHECKS, type Decide, type Store } from "./store.js";
+import {
+  GAP_LIMIT,
+  gapStart,
+  InvalidCommit,
+  newIntentId,
+  SKIPPED_CHECKS,
+  type Decide,
+  type Store,
+  type Tree,
+} from "./store.js";
 
 /** Every append takes this transaction-scoped advisory lock, so two commits never share or skip an LSN. */
 const APPEND_LOCK_ID = 7_301_421;
@@ -69,7 +78,7 @@ export class PgStore implements Store {
 
       // The validator runs here, under the lock, so nothing lands between its look at the gap and this append.
       const gap = decide ? await this.read(client, gapStart(req), GAP_LIMIT + 1) : [];
-      const decision = decide ? decide(gap, lsn - 1) : {};
+      const decision = decide ? await decide(gap, lsn - 1) : {};
 
       await client.query(
         `insert into changesets
@@ -133,6 +142,24 @@ export class PgStore implements Store {
 
   headLsn(): Promise<Lsn> {
     return this.head(this.pool);
+  }
+
+  async treeAt(lsn: Lsn): Promise<Tree> {
+    // The latest change per path up to `lsn`; a rename also ends its old path there.
+    const rows = await this.pool.query<{ path: string; content: string }>(
+      `with changes as (
+         select path, lsn, op, blob_hash from changeset_files where lsn <= $1
+         union all
+         select from_path as path, lsn, 'delete' as op, null as blob_hash
+         from changeset_files where lsn <= $1 and from_path is not null
+       ),
+       latest as (select distinct on (path) path, op, blob_hash from changes order by path, lsn desc)
+       select l.path, convert_from(b.bytes, 'UTF8') as content
+       from latest l join blobs b on b.hash = l.blob_hash
+       where l.op <> 'delete' order by l.path`,
+      [lsn],
+    );
+    return new Map(rows.rows.map((r) => [r.path, r.content]));
   }
 
   async openIntent(req: IntentRequest): Promise<Intent> {

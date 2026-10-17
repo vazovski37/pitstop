@@ -10,7 +10,16 @@ import {
   type Health,
   type ServerMessage,
 } from "@pitstop/protocol";
-import { InvalidCommit, RejectedCommit, withBlobHashes, type RejectReason, type Store } from "./store.js";
+import { typecheckGate } from "./checks.js";
+import {
+  InvalidCommit,
+  RejectedCommit,
+  SKIPPED_CHECKS,
+  withBlobHashes,
+  type Decision,
+  type RejectReason,
+  type Store,
+} from "./store.js";
 import { Stream } from "./stream.js";
 import { decideCommit, describeSkew, type SkewVerdict, type ValidationMode } from "./validate.js";
 
@@ -29,6 +38,8 @@ export interface AppDeps {
   token?: string;
   /** What the validator does with write skew until AI repair exists: `warn` (default) records it, `enforce` refuses it, `off` skips validation. */
   validation?: ValidationMode;
+  /** `always` runs the type-check gate on every commit (section 7.4); `off` (default) runs it only where repair asks for it. */
+  check?: "off" | "always";
   logger?: boolean;
 }
 
@@ -85,16 +96,28 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
 
   // Validate, then append, both under the store's append lock (design doc section 6.2, steps 6 and 7).
   const mode = deps.validation ?? "warn";
+  const check = deps.check ?? "off";
   app.post("/commit", async (req, reply) => {
     const parsed = CommitRequest.safeParse(req.body);
     if (!parsed.success) return rejected(reply, "invalid_request", issues(parsed.error));
     try {
       const request = withBlobHashes(parsed.data);
       let skew: SkewVerdict | undefined;
-      const changeset = await deps.store.append(request, (gap, head) => {
+      const changeset = await deps.store.append(request, async (gap, head): Promise<Decision> => {
         const outcome = decideCommit(request, gap, head, mode);
         skew = outcome.skew;
-        return outcome.decision;
+        if (check !== "always") return outcome.decision;
+        // The constraint of section 7.4: the merged tree must type-check, or the commit does not land.
+        const gate = await typecheckGate(await deps.store.treeAt(head), request.files);
+        if (gate.typecheck === "fail") {
+          throw new RejectedCommit("constraint_failed", `type check failed on the merged tree:\n${gate.details ?? ""}`);
+        }
+        const checks = outcome.decision.checks ?? SKIPPED_CHECKS;
+        const details = [checks.details, gate.details].filter((d) => d !== undefined).join("; ");
+        return {
+          ...outcome.decision,
+          checks: { ...checks, typecheck: gate.typecheck, ...(details === "" ? {} : { details }) },
+        };
       });
       stream.notify();
       if (skew) {

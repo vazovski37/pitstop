@@ -257,3 +257,47 @@ describe("validation (PITSTOP_VALIDATE)", () => {
     await app.close();
   });
 });
+
+describe("the type-check gate (PITSTOP_CHECK=always)", () => {
+  const tsconfig = JSON.stringify({ compilerOptions: { strict: true, noEmit: true, target: "ES2022", module: "NodeNext", moduleResolution: "NodeNext" }, include: ["src"] });
+  const importRepo: Partial<CommitRequest> = {
+    intent: "import",
+    files: [
+      { path: "tsconfig.json", op: "add", content: tsconfig },
+      { path: "src/a.ts", op: "add", content: "export const a: number = 1;\n" },
+    ],
+    writeSet: ["src/a.ts#a"],
+  };
+
+  it("records a passing type check, and refuses a commit that breaks the tree", async () => {
+    const { app, commit } = await start(true, { check: "always" });
+    const imported = CommitResponse.parse((await commit("import", importRepo)).json());
+    expect(imported.status).toBe("accepted");
+    if (imported.status === "accepted") expect(imported.changeset.checks.typecheck).toBe("pass");
+
+    const broken = await commit("break", {
+      baseLsn: 1,
+      files: [{ path: "src/b.ts", op: "add", content: 'import { a } from "./a.js";\nexport const b: string = a;\n' }],
+      writeSet: ["src/b.ts#b"],
+    });
+    expect(broken.statusCode).toBe(409);
+    expect(broken.json()).toMatchObject({ status: "rejected", reason: "constraint_failed" });
+    expect(broken.json().message).toContain("error TS2322");
+    expect((await app.inject({ method: "GET", url: "/log" })).json()).toHaveLength(1);
+
+    const fine = await commit("fine", {
+      baseLsn: 1,
+      files: [{ path: "src/b.ts", op: "add", content: 'import { a } from "./a.js";\nexport const b: number = a;\n' }],
+      writeSet: ["src/b.ts#b"],
+    });
+    expect(fine.statusCode).toBe(200);
+    await app.close();
+  }, 120_000);
+
+  it("skips, and says so, when the tree has no tsconfig", async () => {
+    const { app, commit } = await start(true, { check: "always" });
+    const res = CommitResponse.parse((await commit("notes", { files: [{ path: "NOTES.md", op: "add", content: "# notes\n" }], writeSet: [] })).json());
+    if (res.status === "accepted") expect(res.changeset.checks).toMatchObject({ typecheck: "skipped", details: "no tsconfig.json at the root of the tree" });
+    await app.close();
+  });
+});
