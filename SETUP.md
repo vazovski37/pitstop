@@ -105,7 +105,7 @@ Add a second Container App or an Azure Static Web App in `infra/main.bicep`, and
 
 | Symptom | Cause and fix |
 | --- | --- |
-| `AADSTS700213: No matching federated identity record found` | The job's environment or repo name does not match the federated credential. It must be `repo:<owner>/pitstop:environment:production`. Re-run `bootstrap.sh` with the exact `GITHUB_REPO`. |
+| `AADSTS700213: No matching federated identity record found` | The job's environment or repo name does not match the federated credential. New repositories use immutable subjects with numeric IDs: `repo:<owner>@<owner-id>/pitstop@<repo-id>:environment:production` (the error message shows the exact one). Re-run `bootstrap.sh` with the exact `GITHUB_REPO`; it builds that subject from the GitHub API. |
 | `AuthorizationFailed` on `roleAssignments/write` | The service principal lacks "Role Based Access Control Administrator" on the resource group. Re-run `bootstrap.sh`, or assign it in the portal (or "User Access Administrator"). |
 | Postgres: `LocationIsOfferRestricted` or capacity error | Some regions limit new database servers on credit-based subscriptions. Re-run `bootstrap.sh` with `RG=pitstop-rg2 LOCATION=germanywestcentral` (or `swedencentral`, `northeurope`), then Provision. |
 | `MissingSubscriptionRegistration` | Providers not registered yet. `bootstrap.sh` does it; wait a few minutes and re-run Provision. |

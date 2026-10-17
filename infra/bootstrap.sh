@@ -18,6 +18,8 @@
 set -euo pipefail
 # Stops Git Bash (MSYS) on Windows rewriting Azure IDs like /subscriptions/... into Windows paths.
 export MSYS_NO_PATHCONV=1
+# az on Windows ends its output lines with CRLF; strip the \r so captured IDs and secrets stay clean.
+az() { command az "$@" | tr -d '\r'; }
 
 : "${GITHUB_REPO:?Set GITHUB_REPO=owner/repo}"
 RG="${RG:-pitstop-rg}"
@@ -62,14 +64,23 @@ for role in "Contributor" "Role Based Access Control Administrator"; do
 done
 
 echo "==> Federated credential: trust GitHub OIDC tokens from environment '$GH_ENV'"
+# Repos created after 2026-07-15 get immutable OIDC subjects: owner and repo names carry their
+# numeric IDs, e.g. repo:octo-org@123/octo-repo@456:environment:production. Build it from the API.
+OIDC_REPO="$(gh api "repos/$GITHUB_REPO" --jq '"\(.owner.login)@\(.owner.id)/\(.name)@\(.id)"')"
+SUBJECT="repo:$OIDC_REPO:environment:$GH_ENV"
 CRED_NAME="github-$GH_ENV"
-if ! az ad app federated-credential show --id "$APP_ID" --federated-credential-id "$CRED_NAME" >/dev/null 2>&1; then
-  az ad app federated-credential create --id "$APP_ID" --parameters "{
+CRED_JSON="{
     \"name\": \"$CRED_NAME\",
     \"issuer\": \"https://token.actions.githubusercontent.com\",
-    \"subject\": \"repo:$GITHUB_REPO:environment:$GH_ENV\",
+    \"subject\": \"$SUBJECT\",
     \"audiences\": [\"api://AzureADTokenExchange\"]
-  }" >/dev/null
+  }"
+CURRENT_SUBJECT="$(az ad app federated-credential show --id "$APP_ID" --federated-credential-id "$CRED_NAME" --query subject -o tsv 2>/dev/null || true)"
+if [[ -z "$CURRENT_SUBJECT" ]]; then
+  az ad app federated-credential create --id "$APP_ID" --parameters "$CRED_JSON" >/dev/null
+elif [[ "$CURRENT_SUBJECT" != "$SUBJECT" ]]; then
+  echo "    (updating subject: $CURRENT_SUBJECT -> $SUBJECT)"
+  az ad app federated-credential update --id "$APP_ID" --federated-credential-id "$CRED_NAME" --parameters "$CRED_JSON" >/dev/null
 fi
 
 echo "==> GitHub environment, secrets and variables"
