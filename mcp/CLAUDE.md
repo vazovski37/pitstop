@@ -11,6 +11,8 @@ Connects coding agents (Claude Code for the hackathon) to the daemon: MCP tools 
 - `src/hook.ts`: the Claude Code `PostToolUse` hook. It posts a safe point to the daemon, which applies pending entries then, and returns the daemon's notes (entries that touched the agent's work, conflicts, warnings) as `additionalContext`. Without a daemon it prints nothing and exits 0.
 - `src/setup.ts`: `pitstop-agent-setup <worktree>` writes the MCP server into the worktree's `.mcp.json` and the hook into `.claude/settings.json`, keeping whatever else is there.
 
+For a team that is not us: [daemon/README.md](../daemon/README.md) walks through install, `init` or `clone`, the Claude Code wiring and the daily loop.
+
 ## Setup, per laptop and worktree
 1. From the pitstop repo, once: `npm run build` (the daemon's and this package's `dist/`).
 2. In the worktree the agent will edit (for the demo, the slice from `demo/scripts/reset.sh`): `node <pitstop>/mcp/dist/setup.js .` Then check `.mcp.json` and `.claude/settings.json` in that worktree.
