@@ -37,6 +37,8 @@ export class FakeApplier implements Applier {
   applied: Changeset[] = [];
   /** Throw when asked to apply this LSN. */
   failOn: number | undefined;
+  /** Report a conflict in a.txt when applying this LSN. */
+  conflictOn: number | undefined;
   /** What `diffAgainstMain` reports. */
   files: FileChange[] = [];
   /** What `hasChanges` reports, on top of `files` being non-empty. */
@@ -47,7 +49,7 @@ export class FakeApplier implements Applier {
   async apply(changeset: Changeset): Promise<ApplyResult> {
     if (changeset.lsn === this.failOn) throw new Error(`cannot apply #${changeset.lsn}`);
     this.applied.push(changeset);
-    return { commit: `commit-${changeset.lsn}`, conflicted: [] };
+    return { commit: `commit-${changeset.lsn}`, conflicted: this.conflictOn === changeset.lsn ? ["zzzz"] : [], conflictedFiles: this.conflictOn === changeset.lsn ? ["a.txt"] : [] };
   }
 
   async diffAgainstMain(): Promise<FileChange[]> {
@@ -67,9 +69,9 @@ export class FakeApplier implements Applier {
   }
 }
 
-export async function waitFor(check: () => boolean, ms = 3_000): Promise<void> {
+export async function waitFor(check: () => boolean | Promise<boolean>, ms = 3_000): Promise<void> {
   const until = Date.now() + ms;
-  while (!check()) {
+  while (!(await check())) {
     if (Date.now() > until) throw new Error("timed out waiting");
     await new Promise((r) => setTimeout(r, 10));
   }

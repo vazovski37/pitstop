@@ -16,10 +16,19 @@ import {
   ClientMessage,
   CommitRequest,
   DEFAULT_REPO,
+  IntentRequest,
   ServerMessage,
   type Changeset,
   type CommitResponse,
+  type Intent,
 } from "@pitstop/protocol";
+
+/** A scripted answer for the next `POST /commit`. */
+export interface Rejection {
+  reason: "constraint_failed" | "repair_failed" | "escalated" | "invalid_request";
+  message: string;
+  conflictsWith?: number[];
+}
 
 export interface FakeServerOptions {
   /** Defaults to the shared fixture. */
@@ -40,8 +49,12 @@ export interface FakeServer {
   received: ClientMessage[];
   /** Every commit request accepted, in order. */
   commits: CommitRequest[];
+  /** Every intent opened through `POST /intents`, in order. */
+  intents: Intent[];
   /** Appends an entry as if another worktree had committed it, and pushes it to subscribers. */
   append(changeset: Changeset): void;
+  /** Makes the next `POST /commit` answer `rejected` with this, like the validator or repair would. */
+  rejectNextCommit(rejection: Rejection): void;
   close(): Promise<void>;
 }
 
@@ -60,8 +73,10 @@ export async function startFakeServer(opts: FakeServerOptions = {}): Promise<Fak
   const headLsn = () => entries.at(-1)?.lsn ?? 0;
   const received: ClientMessage[] = [];
   const commits: CommitRequest[] = [];
+  const intents: Intent[] = [];
   const subscribers = new Map<WebSocket, { lastSentLsn: number | null }>();
   let dropped = false;
+  let rejectNext: Rejection | undefined;
 
   const authorized = (req: IncomingMessage): boolean => {
     if (opts.token === undefined) return true;
@@ -107,6 +122,11 @@ export async function startFakeServer(opts: FakeServerOptions = {}): Promise<Fak
         return json(res, 400, body);
       }
       const r = parsed.data;
+      if (rejectNext !== undefined) {
+        const body: CommitResponse = { status: "rejected", conflictsWith: [], ...rejectNext };
+        rejectNext = undefined;
+        return json(res, 409, body);
+      }
       commits.push(r);
       const changeset: Changeset = {
         repo: r.repo ?? DEFAULT_REPO,
@@ -126,6 +146,29 @@ export async function startFakeServer(opts: FakeServerOptions = {}): Promise<Fak
       append(changeset);
       const body: CommitResponse = { status: "accepted", changeset };
       return json(res, 200, body);
+    }
+    if (req.method === "POST" && req.url === "/intents") {
+      const parsed = IntentRequest.safeParse(await readJson(req));
+      if (!parsed.success) return json(res, 400, { error: "invalid_request", message: parsed.error.message });
+      const intent: Intent = {
+        id: `int_${(intents.length + 1).toString().padStart(2, "0")}`,
+        repo: parsed.data.repo ?? DEFAULT_REPO,
+        author: parsed.data.author,
+        baseLsn: parsed.data.baseLsn,
+        text: parsed.data.text,
+        declaredSymbols: parsed.data.declaredSymbols,
+        status: "open",
+        heartbeatAt: new Date().toISOString(),
+      };
+      intents.push(intent);
+      for (const socket of subscribers.keys()) sendTo(socket, { type: "intent", intent });
+      return json(res, 201, intent);
+    }
+    if (req.method === "GET" && req.url?.startsWith("/log")) {
+      const query = new URL(req.url, "http://fake").searchParams;
+      const fromLsn = Number(query.get("fromLsn") ?? 0);
+      const limit = Number(query.get("limit") ?? 100);
+      return json(res, 200, entries.filter((e) => e.lsn > fromLsn).slice(0, limit));
     }
     if (req.method === "GET" && req.url === "/healthz") {
       return json(res, 200, { ok: true, version: serverVersion, db: true });
@@ -164,7 +207,11 @@ export async function startFakeServer(opts: FakeServerOptions = {}): Promise<Fak
     headLsn,
     received,
     commits,
+    intents,
     append,
+    rejectNextCommit: (rejection) => {
+      rejectNext = rejection;
+    },
     close: () =>
       new Promise<void>((resolve, reject) => {
         for (const socket of subscribers.keys()) socket.terminate();

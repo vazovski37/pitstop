@@ -51,7 +51,9 @@ export async function commit(opts: CommitOptions): Promise<Changeset> {
   const sets = await setsOf(opts);
   const readBaseLsn =
     state.readBaseLsn !== undefined && state.readBaseLsn < state.appliedLsn ? state.readBaseLsn : undefined;
-  return send(opts, {
+  // The intent declared for this task (daemon state) unless the caller names one.
+  const intentId = opts.intentId ?? state.intentId;
+  return send({ ...opts, ...(intentId === undefined ? {} : { intentId }) }, {
     baseLsn: state.appliedLsn,
     ...(readBaseLsn === undefined ? {} : { readBaseLsn }),
     intent: opts.intent,
@@ -120,7 +122,7 @@ async function send(opts: Omit<CommitOptions, "intent">, body: Body): Promise<Ch
   const changeset = answer.data.changeset;
   // The server has already pushed the entry to the stream, so a running daemon may be applying it
   // right now: take the lock and look at the state again. Either way the transaction is over, so
-  // the state drops readBaseLsn.
+  // the state drops readBaseLsn and the intent.
   await withWorktreeLock(opts.worktree, async () => {
     const now = await readState(opts.worktree);
     if (now.appliedLsn >= changeset.lsn) {

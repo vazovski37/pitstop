@@ -10,6 +10,8 @@ export interface ApplyResult {
   commit: string;
   /** jj change ids (of `@` and anything between it and `main`) left with conflicts; empty when clean. */
   conflicted: string[];
+  /** The files in `@` that carry conflict markers now; empty when clean. */
+  conflictedFiles: string[];
 }
 
 /** The worktree operations the daemon needs. `JjWorktree` is the real one; tests substitute a fake. */
@@ -76,7 +78,8 @@ export class JjWorktree implements Applier {
         .split("\n")
         .map((line) => line.trim())
         .filter((line) => line.length > 0);
-      return { commit: newMain, conflicted };
+      const conflictedFiles = conflicted.length === 0 ? [] : await this.conflictedFiles();
+      return { commit: newMain, conflicted, conflictedFiles };
     } catch (err) {
       await this.jj(["op", "restore", restoreOp]);
       throw err;
@@ -99,6 +102,21 @@ export class JjWorktree implements Applier {
     if (symbolic === "") return;
     const commit = (await this.git(["rev-parse", "HEAD"])).trim();
     await this.git(["update-ref", "--no-deref", "HEAD", commit]);
+  }
+
+  /** `jj resolve --list` prints one line per conflicted file in `@`: the path, spaces, "N-sided conflict". */
+  async conflictedFiles(): Promise<string[]> {
+    let out: string;
+    try {
+      out = await this.jj(["resolve", "--list"]);
+    } catch {
+      return []; // "No conflicts found" exits non-zero
+    }
+    return out
+      .split("\n")
+      .map((line) => /^(.*?)\s{2,}\d+-sided conflict/.exec(line)?.[1]?.trim() ?? "")
+      .filter((path) => path.length > 0)
+      .map((path) => path.replace(/\\/g, "/"));
   }
 
   async hasChanges(): Promise<boolean> {
@@ -128,6 +146,8 @@ export class JjWorktree implements Applier {
     const out = await this.git(["diff", "--name-status", "-M", "-z", `refs/heads/${this.bookmark}`, at]);
     const fields = out.split("\0");
     const files: FileChange[] = [];
+    // The daemon's own directory is never part of a commit, even if git happens to track it.
+    const own = (path: string) => path === ".pitstop" || path.startsWith(".pitstop/");
     for (let i = 0; i < fields.length; ) {
       const status = fields[i];
       if (status === undefined || status === "") break;
@@ -135,11 +155,13 @@ export class JjWorktree implements Applier {
         const fromPath = fields[i + 1] ?? "";
         const path = fields[i + 2] ?? "";
         i += 3;
+        if (own(path) || own(fromPath)) continue;
         files.push({ path, op: "rename", fromPath, ...(await this.contentOf(at, path)) });
         continue;
       }
       const path = fields[i + 1] ?? "";
       i += 2;
+      if (own(path)) continue;
       if (status.startsWith("D")) files.push({ path, op: "delete" });
       else files.push({ path, op: status.startsWith("A") ? "add" : "modify", ...(await this.contentOf(at, path)) });
     }
