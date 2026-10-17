@@ -1,3 +1,6 @@
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { CommitResponse, Health, Intent, type CommitRequest } from "@pitstop/protocol";
 import { buildApp, type AppDeps } from "./app.js";
@@ -33,6 +36,39 @@ const start = async (dbUp = true, extra: Partial<AppDeps> = {}) => {
     app.inject({ method: "POST", url: "/commit", payload: request(key, extra), ...(headers === undefined ? {} : { headers }) });
   return { app, store, commit };
 };
+
+describe("the live view", () => {
+  const withPage = async (run: (webDir: string) => Promise<void>) => {
+    const dir = await mkdtemp(join(tmpdir(), "pitstop-web-"));
+    try {
+      await writeFile(join(dir, "index.html"), "<!doctype html><title>Pitstop</title>");
+      await writeFile(join(dir, "app.js"), "console.log('pitstop');\n");
+      await run(dir);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  };
+
+  it("serves the page at / and its files, open even on a shared-token server, while the API stays guarded", () =>
+    withPage(async (webDir) => {
+      const { app } = await start(true, { token: "s3cret", webDir });
+      const page = await app.inject({ method: "GET", url: "/" });
+      expect(page.statusCode).toBe(200);
+      expect(page.headers["content-type"]).toContain("text/html");
+      expect(page.body).toContain("Pitstop");
+      const script = await app.inject({ method: "GET", url: "/app.js" });
+      expect(script.statusCode).toBe(200);
+      expect(script.headers["content-type"]).toContain("javascript");
+      expect((await app.inject({ method: "GET", url: "/nope.js" })).statusCode).toBe(404);
+      expect((await app.inject({ method: "GET", url: "/repos" })).statusCode).toBe(401);
+      expect((await app.inject({ method: "GET", url: "/healthz" })).statusCode).toBe(200);
+    }));
+
+  it("has no page without a web directory", async () => {
+    const { app } = await start(true);
+    expect((await app.inject({ method: "GET", url: "/" })).statusCode).toBe(404);
+  });
+});
 
 describe("GET /healthz", () => {
   it("returns 200 with the version when the database answers", async () => {

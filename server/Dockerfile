@@ -15,7 +15,8 @@ RUN npm ci --no-audit --no-fund
 
 COPY packages/protocol packages/protocol
 COPY server server
-RUN npm run build -w @pitstop/protocol -w @pitstop/server \
+COPY web web
+RUN npm run build -w @pitstop/protocol -w @pitstop/server -w @pitstop/web \
  && npm prune --omit=dev --no-audit --no-fund
 
 FROM node:22-alpine AS runtime
@@ -31,6 +32,8 @@ COPY --from=build /app/packages/protocol/dist ./packages/protocol/dist
 COPY --from=build /app/server/package.json ./server/
 COPY --from=build /app/server/dist ./server/dist
 COPY --from=build /app/server/migrations ./server/migrations
+# The live view, served by the server at / (web/CLAUDE.md).
+COPY --from=build /app/web/dist ./web/dist
 
 USER node
 EXPOSE 8080

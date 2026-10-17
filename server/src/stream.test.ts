@@ -101,6 +101,25 @@ describe("GET /stream", () => {
     inbox.close();
   });
 
+  it("sends the open intents right after head, so a late subscriber sees them", async () => {
+    const { app, commit, url } = await listen();
+    await commit("one");
+    const opened = await app.inject({
+      method: "POST",
+      url: "/intents",
+      payload: { author: { developer: "vaz", agent: "agent-a" }, baseLsn: 1, text: "Fix session expiry", declaredSymbols: [] },
+    });
+    expect(opened.statusCode).toBe(201);
+    const inbox = await connect(url);
+    await inbox.next(); // hello
+    inbox.send({ type: "subscribe", fromLsn: 1 });
+    expect(await inbox.next()).toMatchObject({ type: "head", headLsn: 1 });
+    expect(await inbox.next()).toMatchObject({ type: "intent", intent: { status: "open", text: "Fix session expiry", author: { agent: "agent-a" } } });
+    await commit("two");
+    expect(await inbox.next()).toMatchObject({ type: "entry", changeset: { lsn: 2 } });
+    inbox.close();
+  });
+
   it("refuses a subscription to a repository that does not exist", async () => {
     const { url } = await listen();
     const inbox = await connect(url);

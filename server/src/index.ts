@@ -1,3 +1,6 @@
+import { existsSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import type pg from "pg";
 import { buildApp } from "./app.js";
 import { createPool, ping } from "./db.js";
@@ -75,6 +78,11 @@ if (oauth !== undefined && sessionSecret === undefined) {
 }
 console.log(`pitstop server: accounts ${oauth === undefined ? "off (no GITHUB_OAUTH_CLIENT_ID)" : "on"}`);
 
+// Phase 5: the live view (web/, built to web/dist) served at /. Nothing there means no page.
+const webDir = process.env.PITSTOP_WEB_DIR || resolve(dirname(fileURLToPath(import.meta.url)), "../../web/dist");
+const web = existsSync(join(webDir, "index.html")) ? webDir : undefined;
+console.log(`pitstop server: live view ${web === undefined ? `off (no index.html in ${webDir})` : `from ${web}`}`);
+
 const app = await buildApp({
   version,
   pingDb,
@@ -90,6 +98,7 @@ const app = await buildApp({
   repair,
   repairer,
   github,
+  webDir: web,
   logger: true,
 });
 

@@ -87,9 +87,13 @@ export class Stream {
           return;
         }
         sub.repo = repo;
-        // `head` first, so the daemon knows where the log stands before the entries arrive.
+        // `head` first, so the daemon knows where the log stands before the entries arrive; then the
+        // open intents, so a subscriber that arrives late (the live view, a restarted daemon) sees them.
         sub.sending = sub.sending
-          .then(async () => this.send(sub, { type: "head", repo, headLsn: await this.store.headLsn(repo) }))
+          .then(async () => {
+            this.send(sub, { type: "head", repo, headLsn: await this.store.headLsn(repo) });
+            for (const intent of await this.store.openIntents(repo)) this.send(sub, { type: "intent", intent });
+          })
           .catch((err) => this.fail(sub, err));
         sub.lastSentLsn = message.fromLsn;
         this.deliver(sub);

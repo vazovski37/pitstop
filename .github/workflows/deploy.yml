@@ -7,6 +7,7 @@ on:
     branches: [main]
     paths:
       - "server/**"
+      - "web/**" # the live view is built into the server image
       - "packages/protocol/**"
       - "package.json"
       - "package-lock.json"
