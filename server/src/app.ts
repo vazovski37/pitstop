@@ -3,6 +3,7 @@ import websocket from "@fastify/websocket";
 import Fastify, { type FastifyInstance, type FastifyReply } from "fastify";
 import {
   CommitRequest,
+  DEFAULT_REPO,
   IntentRequest,
   Lsn,
   type Changeset,
@@ -108,6 +109,9 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   app.post("/commit", async (req, reply) => {
     const parsed = CommitRequest.safeParse(req.body);
     if (!parsed.success) return rejected(reply, "invalid_request", issues(parsed.error));
+    if (parsed.data.repo !== undefined && parsed.data.repo !== DEFAULT_REPO) {
+      return rejected(reply, "invalid_request", `only ${DEFAULT_REPO} exists on this server yet`);
+    }
     try {
       const request = withBlobHashes(parsed.data);
       let skew: SkewVerdict | undefined;
@@ -145,6 +149,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
         // Until repair exists the skew lands as is; the daemon and the live view hear about it.
         stream.broadcast({
           type: "warning",
+          repo: changeset.repo,
           agent: request.author.agent,
           kind: "dependency_changed",
           message: `#${changeset.lsn} landed with write skew, not repaired: ${describeSkew(skew)}`,
@@ -164,6 +169,9 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   app.post("/intents", async (req, reply) => {
     const parsed = IntentRequest.safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: "invalid_request", message: issues(parsed.error) });
+    if (parsed.data.repo !== undefined && parsed.data.repo !== DEFAULT_REPO) {
+      return reply.code(400).send({ error: "invalid_request", message: `only ${DEFAULT_REPO} exists on this server yet` });
+    }
     const intent = await deps.store.openIntent(parsed.data);
     const message: ServerMessage = { type: "intent", intent };
     stream.broadcast(message);

@@ -1,6 +1,6 @@
 import type { FastifyBaseLogger } from "fastify";
 import type { RawData, WebSocket } from "ws";
-import { ClientMessage, type Lsn, type ServerMessage } from "@pitstop/protocol";
+import { ClientMessage, DEFAULT_REPO, type Lsn, type ServerMessage } from "@pitstop/protocol";
 import type { Store } from "./store.js";
 
 /** Entries read from the store per delivery round. */
@@ -72,6 +72,14 @@ export class Stream {
     const message = parsed.data;
     switch (message.type) {
       case "subscribe":
+        if (message.repo !== undefined && message.repo !== DEFAULT_REPO) {
+          sub.socket.close(1008, `only ${DEFAULT_REPO} exists on this server yet`);
+          return;
+        }
+        // `head` first, so the daemon knows where the log stands before the entries arrive.
+        sub.sending = sub.sending
+          .then(async () => this.send(sub, { type: "head", repo: DEFAULT_REPO, headLsn: await this.store.headLsn() }))
+          .catch((err) => this.fail(sub, err));
         sub.lastSentLsn = message.fromLsn;
         this.deliver(sub);
         break;

@@ -16,6 +16,7 @@ const base: Tree = new Map([["tsconfig.json", tsconfig], ["src/dep.ts", depBefor
 const head: Tree = new Map([["tsconfig.json", tsconfig], ["src/dep.ts", depAfter]]);
 
 const culprit: Changeset = {
+  repo: "teamdb/demo",
   lsn: 2,
   baseLsn: 1,
   author: { developer: "vazovski", agent: "agent-a" },

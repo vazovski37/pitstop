@@ -21,6 +21,21 @@ export type SymbolId = z.infer<typeof SymbolId>;
 export const BlobHash = z.string().regex(/^sha256:[0-9a-f]{64}$/);
 export type BlobHash = z.infer<typeof BlobHash>;
 
+/** A repository on the server: `owner/name`, lowercase, e.g. `vazovski37/pitstop`. LSNs count per repository. */
+export const RepoId = z.string().regex(/^[a-z0-9][a-z0-9-]*\/[a-z0-9][a-z0-9._-]*$/, "expected owner/name in lowercase");
+export type RepoId = z.infer<typeof RepoId>;
+
+/** The repository a request without `repo` means: one server, one repo, as in Phase 1. */
+export const DEFAULT_REPO: RepoId = "local/default";
+
+/** A repository as the server lists it (`GET /repos`, `POST /repos`). */
+export const Repo = z.object({
+  id: RepoId,
+  headLsn: Lsn,
+  createdAt: z.string().datetime(),
+});
+export type Repo = z.infer<typeof Repo>;
+
 export const Author = z.object({
   developer: z.string().min(1),
   agent: z.string().min(1),
@@ -64,6 +79,8 @@ export type Checks = z.infer<typeof Checks>;
 export const CommitRequest = z.object({
   /** Same key on a retry = same commit; the server never appends it twice. */
   idempotencyKey: z.string().min(8),
+  /** The repository to commit to. Absent means `DEFAULT_REPO`. */
+  repo: RepoId.optional(),
   /** The entry the file contents are based on: the worktree's applied LSN when the commit was made. */
   baseLsn: Lsn,
   /**
@@ -86,6 +103,7 @@ export type CommitRequest = z.infer<typeof CommitRequest>;
 
 /** A changeset as stored in the log (section 5.2). */
 export const Changeset = z.object({
+  repo: RepoId,
   lsn: Lsn,
   baseLsn: Lsn,
   author: Author,
@@ -117,6 +135,7 @@ export type CommitResponse = z.infer<typeof CommitResponse>;
 /** An open transaction in the catalog (section 9.3). */
 export const Intent = z.object({
   id: z.string().min(1),
+  repo: RepoId,
   author: Author,
   baseLsn: Lsn,
   text: z.string().min(1),
@@ -128,6 +147,8 @@ export type Intent = z.infer<typeof Intent>;
 
 /** What a daemon sends to open a transaction: `POST /intents`, answered with an `Intent` (section 6.2, step 1). */
 export const IntentRequest = z.object({
+  /** Absent means `DEFAULT_REPO`. */
+  repo: RepoId.optional(),
   author: Author,
   baseLsn: Lsn,
   text: z.string().min(1),
@@ -139,16 +160,20 @@ export type IntentRequest = z.infer<typeof IntentRequest>;
 /**
  * Messages the server pushes to daemons over the WebSocket (section 8.2).
  *
- * Order on a connection: `hello` first; then, after `subscribe`, one `entry` per log position
- * after `fromLsn`, in LSN order with no gaps; then live entries as they are appended.
- * `intent` and `warning` can arrive at any time after `hello`.
+ * Order on a connection: `hello` first (its `headLsn` is `DEFAULT_REPO`'s); then, after
+ * `subscribe`, a `head` for the subscribed repository, one `entry` per log position after
+ * `fromLsn`, in LSN order with no gaps, then live entries as they are appended. A socket follows
+ * one repository. `intent` and `warning` for that repository can arrive at any time after `hello`.
  */
 export const ServerMessage = z.discriminatedUnion("type", [
   z.object({ type: z.literal("hello"), serverVersion: z.string(), headLsn: Lsn }),
+  /** Answers `subscribe`: where the repository's log stands at that moment. */
+  z.object({ type: z.literal("head"), repo: RepoId, headLsn: Lsn }),
   z.object({ type: z.literal("entry"), changeset: Changeset }),
   z.object({ type: z.literal("intent"), intent: Intent }),
   z.object({
     type: z.literal("warning"),
+    repo: RepoId,
     /** Who the warning is for. */
     agent: z.string(),
     kind: z.enum(["overlapping_intent", "similar_symbol", "dependency_changed"]),
@@ -164,7 +189,12 @@ export const ClientMessage = z.discriminatedUnion("type", [
    * Start streaming every entry after `fromLsn` (the worktree's applied LSN; 0 for an empty worktree).
    * A daemon that sees a gap in LSNs subscribes again from its last applied LSN.
    */
-  z.object({ type: z.literal("subscribe"), fromLsn: Lsn }),
+  z.object({
+    type: z.literal("subscribe"),
+    /** Absent means `DEFAULT_REPO`. */
+    repo: RepoId.optional(),
+    fromLsn: Lsn,
+  }),
   z.object({
     type: z.literal("heartbeat"),
     /** The open intent to keep alive, if any. */
