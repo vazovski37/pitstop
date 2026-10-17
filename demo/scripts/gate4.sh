@@ -49,14 +49,13 @@ wait_log() { # file, pattern
   echo "never saw '$2' in $1:"; cat "$1"; return 1
 }
 
-echo "== A: fresh slice, imported as #1; B: a copy; daemons in both"
+echo "== A: fresh slice; pitstop init creates teamdb/demo and imports A as #1; B: a copy, configured; daemons in both"
 bash "$root/demo/scripts/reset.sh" "$work/A" >/dev/null
 cp -R "$work/A" "$work/B"
-a "${daemon[@]}" import -m "import teamdb"
-# A fresh worktree has no .pitstop/ yet, and the daemon writes daemon.json (its local API port) before
-# anything creates the folder, then carries on without the API. Until the daemon makes the folder
-# itself, make it here. (Found by this gate on 2026-10-17; the daemon is the teammate's.)
-mkdir -p "$work/B/.pitstop"
+a "${daemon[@]}" init "$server" --repo teamdb/demo
+# init also creates .pitstop/ in B; without it the daemon used to fail writing daemon.json (its local
+# API port) into a folder that did not exist yet and ran without its API. Found 2026-10-17.
+b "${daemon[@]}" init "$server" --repo teamdb/demo --no-import
 (cd "$work/A" && PITSTOP_AGENT=gate-a exec "${daemon[@]}" daemon >"$work/daemon-a.log" 2>&1) &
 daemon_a_pid=$!
 (cd "$work/B" && PITSTOP_AGENT=gate-b exec "${daemon[@]}" daemon >"$work/daemon-b.log" 2>&1) &
@@ -282,7 +281,7 @@ grep -q "#3" "$work/b-commit-2.txt" || { echo "B's adapted commit did not land a
 echo "== A receives #3; the trees agree"
 wait_log "$work/daemon-a.log" "applied #3"
 echo "== the log"
-curl -s "$server/log" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{for(const e of JSON.parse(s))console.log(`  #${e.lsn} ${e.intent} by ${e.author.agent} (base #${e.baseLsn}; ${e.files.length} files; writes ${e.writeSet.length}, signatures ${e.sigWriteSet.length}, reads ${e.readSet.length})`)})'
+curl -s "$server/log?repo=teamdb/demo" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{for(const e of JSON.parse(s))console.log(`  #${e.lsn} ${e.intent} by ${e.author.agent} (base #${e.baseLsn}; ${e.files.length} files; writes ${e.writeSet.length}, signatures ${e.sigWriteSet.length}, reads ${e.readSet.length})`)})'
 if diff -r --exclude=.git --exclude=.jj --exclude=.pitstop --exclude=node_modules "$work/A" "$work/B"; then
   echo "A and B are identical: Phase 4 gate PASSED (write skew caught, the agent repaired it)"
 else

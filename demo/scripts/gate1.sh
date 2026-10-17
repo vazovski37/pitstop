@@ -42,10 +42,11 @@ curl -sf "$server/healthz" >/dev/null || { echo "the server did not start:"; cat
 
 export PITSTOP_SERVER="$server" PITSTOP_DEVELOPER=gate JJ_USER=gate JJ_EMAIL=gate@example.com
 
-echo "== worktree A: a fresh copy of the slice, imported as entry #1"
+echo "== worktree A: a fresh copy of the slice; pitstop init creates teamdb/demo on the server and imports A as entry #1"
 bash "$root/demo/scripts/reset.sh" "$work/A" >/dev/null
 cp -R "$work/A" "$work/B" # the same start state; B has applied nothing yet
-(cd "$work/A" && PITSTOP_AGENT=gate-a "${daemon[@]}" import -m "import teamdb")
+(cd "$work/A" && PITSTOP_AGENT=gate-a "${daemon[@]}" init "$server" --repo teamdb/demo)
+(cd "$work/B" && PITSTOP_AGENT=gate-b "${daemon[@]}" init "$server" --repo teamdb/demo --no-import)
 
 echo "== worktree B: its daemon catches up"
 # exec, so the pid recorded is node's and the cleanup really stops it
@@ -62,7 +63,7 @@ for _ in $(seq 1 30); do grep -q "applied #2" "$work/daemon-b.log" 2>/dev/null &
 grep -q "applied #2" "$work/daemon-b.log" || { echo "B never applied #2:"; cat "$work/daemon-b.log"; exit 1; }
 
 echo "== the log"
-curl -s "$server/log" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{for(const e of JSON.parse(s))console.log(`  #${e.lsn} ${e.intent} (${e.files.length} files, ${e.writeSet.length} written, ${e.readSet.length} read)`)})'
+curl -s "$server/log?repo=teamdb/demo" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{for(const e of JSON.parse(s))console.log(`  #${e.lsn} ${e.intent} (${e.files.length} files, ${e.writeSet.length} written, ${e.readSet.length} read)`)})'
 
 echo "== compare A and B"
 if diff -r --exclude=.git --exclude=.jj --exclude=.pitstop --exclude=node_modules "$work/A" "$work/B"; then
