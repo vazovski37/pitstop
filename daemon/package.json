@@ -5,14 +5,19 @@
   "type": "module",
   "main": "dist/index.js",
   "bin": {
-    "pitstop-daemon": "dist/index.js"
+    "pitstop": "dist/index.js"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "dev": "tsx watch --env-file-if-exists=../.env src/index.ts"
+    "dev": "tsx --env-file-if-exists=../.env src/index.ts",
+    "fake-server": "tsx src/fake-server.ts"
   },
   "dependencies": {
-    "@pitstop/protocol": "0.1.0"
+    "@pitstop/protocol": "0.1.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/ws": "^8.5.0"
   }
 }

@@ -20,6 +20,15 @@ One process per worktree. It keeps the local folder in sync with the server's lo
 ## Phases owned here
 1: stream + apply into a jj worktree + send commits. 2: read/write sets. 4: safe points, rebase of unfinished work, agent notifications.
 
+## Running Phase 1
+In a worktree that is `jj git init --colocate`d with a `main` bookmark:
+- `pitstop daemon` (`npm run dev -w @pitstop/daemon -- daemon` from the repo) connects to `PITSTOP_SERVER` (default `http://localhost:8080`), subscribes from the LSN in `.pitstop/state.json`, applies entries in order and stops on the first failure.
+- `pitstop commit -m "<intent>"` sends `@` against `main` as a `CommitRequest` with file contents and, for now, empty read and write sets. If the accepted entry is the next one for this worktree it is applied at once; otherwise the running daemon applies it in order.
+- Environment: `PITSTOP_TOKEN`, `PITSTOP_DEVELOPER`, `PITSTOP_AGENT`, and `PITSTOP_JJ_BIN` / `PITSTOP_GIT_BIN` when the executables are not on PATH.
+- No server at hand: `npm run fake-server -w @pitstop/daemon` replays `packages/protocol/fixtures/server-messages.json` on port 8081 and accepts commits. The tests use the same fake (`src/fake-server.ts`); the ones against a real jj repo (`src/jj.test.ts`) skip themselves where jj is not installed.
+
+Source map: `stream.ts` (subscribe, order, gaps), `jj.ts` (the apply sequence below, and `@` as file changes), `commit.ts`, `state.ts`, `fake-server.ts`, `index.ts` (CLI).
+
 ## jj apply sequence
 Tested on Windows 11 with jj 0.46.0 (`winget install jj-vcs.jj`) and git 2.x, in a colocated repo (`jj git init --colocate`), on 2026-10-17. The daemon runs these as child processes with the worktree as cwd; no shell is involved, so quote nothing.
 
