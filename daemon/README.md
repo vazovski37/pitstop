@@ -94,6 +94,7 @@ The server's owner chooses: `PITSTOP_VALIDATE` is `warn` by default (a commit wi
 
 - **`constraint_failed`**: a file or symbol you changed was also changed by an entry that landed first. The daemon has applied that entry to your checkout; re-read the named files, adapt, and commit again.
 - **`escalated`** (or `repair_failed`): write skew. You read something, for example a function's signature, that another entry changed after you read it. The message names the entries and the symbols. Re-read them at the current head, adapt your change, and commit again. From then on your reads are checked from the entry you were told about, so the adapted commit is not refused for the same reason.
+- **`escalated` that says a resolver decides**: on a repository with members, write skew waits for the member marked resolver (or the owners) on the website. Do not commit the change again (the server refuses it while it waits); at a later safe point the note says whether it landed as it is or was sent back, and with what to change.
 - **`invalid_request`**: the request itself was wrong: a repository that does not exist on the server (`pitstop init` first), a base LSN ahead of the log, a malformed file. The message says which. "Nothing to commit" is raised on your side before any request, and a token that may not write the repository is a plain `401`/`403` (see "When something is off").
 
 ## What lives where

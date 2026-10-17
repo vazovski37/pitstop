@@ -1,5 +1,6 @@
 import type pg from "pg";
 import type {
+  Author,
   Changeset,
   Checks,
   CommitRequest,
@@ -21,11 +22,16 @@ import {
   unknownRepo,
   newTokenId,
   newTokenSecret,
+  newParkedId,
   newUserId,
   tokenHash,
   type Decide,
   type Invite,
   type Member,
+  type ParkDecision,
+  type Parked,
+  type ParkInput,
+  type ParkStatus,
   type Mirror,
   type MirrorConfig,
   type MirrorPatch,
@@ -47,6 +53,40 @@ interface UserRow {
   avatar_url: string | null;
   created_at: Date;
 }
+const PARKED_COLUMNS =
+  "id, repo, user_id, request, skew, conflicts_with, head_lsn, status, note, decided_by, landed_lsn, created_at, decided_at";
+interface ParkedRow {
+  id: string;
+  repo: RepoId;
+  user_id: string | null;
+  request: CommitRequest;
+  skew: string;
+  conflicts_with: number[];
+  head_lsn: number;
+  status: ParkStatus;
+  note: string | null;
+  decided_by: string | null;
+  landed_lsn: number | null;
+  created_at: Date;
+  decided_at: Date | null;
+}
+const parkedOf = (row: ParkedRow): Parked => ({
+  id: row.id,
+  repo: row.repo,
+  ...(row.user_id === null ? {} : { userId: row.user_id }),
+  request: row.request,
+  author: row.request.author,
+  skew: row.skew,
+  conflictsWith: row.conflicts_with,
+  headLsn: row.head_lsn,
+  status: row.status,
+  ...(row.note === null ? {} : { note: row.note }),
+  ...(row.decided_by === null ? {} : { decidedBy: row.decided_by }),
+  ...(row.landed_lsn === null ? {} : { landedLsn: row.landed_lsn }),
+  createdAt: row.created_at.toISOString(),
+  ...(row.decided_at === null ? {} : { decidedAt: row.decided_at.toISOString() }),
+});
+
 const USER_COLUMNS = "id, github_id, login, name, avatar_url, created_at";
 const userOf = (row: UserRow): User => ({
   id: row.id,
@@ -161,6 +201,8 @@ export class PgStore implements Store {
       );
       const seenRow = seen.rows[0];
       if (seenRow !== undefined) {
+        // A key belongs to one repository: another repository's commit is never answered here.
+        if (seenRow.repo !== repo) throw new InvalidCommit("idempotency key already used by another commit");
         const [existing] = await this.read(client, seenRow.repo, seenRow.lsn - 1, 1);
         await client.query("commit");
         if (!existing) throw new Error(`changeset ${seenRow.repo}#${seenRow.lsn} vanished`);
@@ -172,7 +214,7 @@ export class PgStore implements Store {
       const lsn = (await this.head(client, repo)) + 1;
       if (req.baseLsn >= lsn) throw new InvalidCommit(`baseLsn ${req.baseLsn} is not below the next LSN ${lsn}`);
       if (req.intentId !== undefined) {
-        const intent = await client.query("select 1 from intents where id = $1", [req.intentId]);
+        const intent = await client.query("select 1 from intents where id = $1 and repo = $2", [req.intentId, repo]);
         if ((intent.rowCount ?? 0) === 0) throw new InvalidCommit(`unknown intent ${req.intentId}`);
       }
       const brain = await client.query<{ version: number | null }>("select max(version) as version from brain_versions");
@@ -224,7 +266,7 @@ export class PgStore implements Store {
         );
       }
       if (req.intentId !== undefined) {
-        await client.query("update intents set status = 'committed' where id = $1 and status = 'open'", [req.intentId]);
+        await client.query("update intents set status = 'committed' where id = $1 and repo = $2 and status = 'open'", [req.intentId, repo]);
       }
 
       const [changeset] = await this.read(client, repo, lsn - 1, 1);
@@ -343,8 +385,8 @@ export class PgStore implements Store {
     }));
   }
 
-  async heartbeat(intentId: string): Promise<void> {
-    await this.pool.query("update intents set heartbeat_at = now() where id = $1 and status = 'open'", [intentId]);
+  async heartbeat(repo: RepoId, intentId: string): Promise<void> {
+    await this.pool.query("update intents set heartbeat_at = now() where id = $1 and repo = $2 and status = 'open'", [intentId, repo]);
   }
 
   async getMirror(repo: RepoId): Promise<Mirror | undefined> {
@@ -504,6 +546,57 @@ export class PgStore implements Store {
 
   async deleteInvite(repo: RepoId, login: string): Promise<boolean> {
     const res = await this.pool.query("delete from repo_invites where repo = $1 and login = lower($2)", [repo, login]);
+    return (res.rowCount ?? 0) > 0;
+  }
+
+  async park(input: ParkInput): Promise<Parked> {
+    const known = await this.pool.query("select 1 from repos where id = $1", [input.repo]);
+    if ((known.rowCount ?? 0) === 0) throw unknownRepo(input.repo);
+    const res = await this.pool.query<ParkedRow>(
+      `insert into parked_commits (id, repo, user_id, author_developer, author_agent, request, skew, conflicts_with, head_lsn)
+       values ($1, $2, $3, $4, $5, $6, $7, $8, $9) returning ${PARKED_COLUMNS}`,
+      [
+        newParkedId(),
+        input.repo,
+        input.userId ?? null,
+        input.request.author.developer,
+        input.request.author.agent,
+        JSON.stringify(input.request),
+        input.skew,
+        input.conflictsWith,
+        input.headLsn,
+      ],
+    );
+    return parkedOf(res.rows[0] as ParkedRow);
+  }
+
+  async listParked(repo: RepoId): Promise<Parked[]> {
+    const res = await this.pool.query<ParkedRow>(`select ${PARKED_COLUMNS} from parked_commits where repo = $1 order by created_at desc, id desc`, [repo]);
+    return res.rows.map(parkedOf);
+  }
+
+  async getParked(repo: RepoId, id: string): Promise<Parked | undefined> {
+    const res = await this.pool.query<ParkedRow>(`select ${PARKED_COLUMNS} from parked_commits where repo = $1 and id = $2`, [repo, id]);
+    const row = res.rows[0];
+    return row === undefined ? undefined : parkedOf(row);
+  }
+
+  async openParkedBy(repo: RepoId, author: Author): Promise<Parked | undefined> {
+    const res = await this.pool.query<ParkedRow>(
+      `select ${PARKED_COLUMNS} from parked_commits
+       where repo = $1 and status = 'open' and author_developer = $2 and author_agent = $3 limit 1`,
+      [repo, author.developer, author.agent],
+    );
+    const row = res.rows[0];
+    return row === undefined ? undefined : parkedOf(row);
+  }
+
+  async decideParked(repo: RepoId, id: string, decision: ParkDecision): Promise<boolean> {
+    const res = await this.pool.query(
+      `update parked_commits set status = $3, decided_by = $4, note = $5, landed_lsn = $6, decided_at = now()
+       where repo = $1 and id = $2 and status = 'open'`,
+      [repo, id, decision.status, decision.decidedBy, decision.note ?? null, decision.landedLsn ?? null],
+    );
     return (res.rowCount ?? 0) > 0;
   }
 

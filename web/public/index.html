@@ -57,6 +57,7 @@
     <section id="view-repo" class="view" hidden>
       <nav class="tabs">
         <a id="tab-live">Live</a>
+        <a id="tab-conflicts">Conflicts <span id="conflict-count" class="badge warn" hidden></span></a>
         <a id="tab-members">Members</a>
         <a id="tab-setup">Set up Claude</a>
       </nav>
@@ -88,6 +89,20 @@
           </article>
         </section>
       </main>
+
+      <section id="pane-conflicts" class="pane" hidden>
+        <article>
+          <h2>Conflicts</h2>
+          <p class="dim">
+            A commit waits here when it relied on something another change altered after its agent read it (write skew).
+            The repository's resolver decides: <strong>let it through</strong> as it is, or <strong>send it back</strong> with
+            a note, and the author's agent adapts and commits again.
+          </p>
+          <p id="conflicts-msg" class="msg"></p>
+          <ul id="conflicts" class="cards"></ul>
+          <p id="no-conflicts" class="dim">Nothing is waiting.</p>
+        </article>
+      </section>
 
       <section id="pane-members" class="pane" hidden>
         <article>

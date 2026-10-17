@@ -29,7 +29,7 @@ describe.skipIf(!url)("PgStore against a real Postgres", () => {
 
   beforeAll(async () => {
     await migrate(pool);
-    await pool.query("truncate changesets, changeset_files, changeset_symbols, blobs, intents, leases cascade");
+    await pool.query("truncate changesets, changeset_files, changeset_symbols, blobs, intents, leases, parked_commits, repo_invites, repo_members, repo_mirrors cascade");
     await pool.query("delete from repos where id <> $1", [DEFAULT_REPO]);
     await pool.query("insert into repos (id) values ($1) on conflict (id) do nothing", [DEFAULT_REPO]);
   });
@@ -190,6 +190,35 @@ describe.skipIf(!url)("PgStore against a real Postgres", () => {
     expect(await store.removeMember("pg-test/members", alice.id)).toBe(false);
     await expect(store.setMember("no/such", alice.id, "reader")).rejects.toThrow(/unknown repo/);
     expect(await store.visibility("no/such")).toBeUndefined();
+  });
+
+  it("keeps invites until the login signs in, and the resolver flag across role changes", async () => {
+    await store.createRepo("pg-test/invites");
+    const owner = await store.upsertUser({ githubId: 7001, login: "owner7" });
+    await store.setMember("pg-test/invites", owner.id, "owner");
+    await store.setInvite("pg-test/invites", "Newcomer7", "writer", owner.id);
+    expect(await store.listInvites("pg-test/invites")).toEqual([expect.objectContaining({ login: "newcomer7", role: "writer" })]);
+    const newcomer = await store.upsertUser({ githubId: 7002, login: "NewComer7" });
+    expect(await store.acceptInvites(newcomer)).toEqual(["pg-test/invites"]);
+    expect(await store.listInvites("pg-test/invites")).toEqual([]);
+    expect(await store.roleOf("pg-test/invites", newcomer.id)).toBe("writer");
+    expect(await store.getUserByLogin("newcomer7")).toMatchObject({ id: newcomer.id });
+    expect(await store.setResolver("pg-test/invites", newcomer.id, true)).toBe(true);
+    await store.setMember("pg-test/invites", newcomer.id, "owner");
+    expect((await store.listMembers("pg-test/invites")).find((m) => m.userId === newcomer.id)).toMatchObject({ role: "owner", resolver: true });
+  });
+
+  it("parks a commit and records the decision once", async () => {
+    await store.createRepo("pg-test/parked");
+    const req = { ...request("parked-1"), repo: "pg-test/parked" };
+    const parked = await store.park({ repo: "pg-test/parked", request: req, skew: "#1 changed a", conflictsWith: [1], headLsn: 1 });
+    expect(parked).toMatchObject({ id: expect.stringMatching(/^pk_/), status: "open", author: req.author, request: req, conflictsWith: [1] });
+    expect(await store.openParkedBy("pg-test/parked", req.author)).toMatchObject({ id: parked.id });
+    expect(await store.listParked("pg-test/parked")).toEqual([expect.objectContaining({ id: parked.id })]);
+    expect(await store.decideParked("pg-test/parked", parked.id, { status: "sent_back", decidedBy: "owner7", note: "guard it" })).toBe(true);
+    expect(await store.decideParked("pg-test/parked", parked.id, { status: "accepted", decidedBy: "owner7" })).toBe(false);
+    expect(await store.getParked("pg-test/parked", parked.id)).toMatchObject({ status: "sent_back", decidedBy: "owner7", note: "guard it" });
+    expect(await store.openParkedBy("pg-test/parked", req.author)).toBeUndefined();
   });
 
   it("keeps a mirror per repository", async () => {
