@@ -63,6 +63,30 @@ describe("pitstop commit", () => {
     expect(await readState(worktree)).toEqual({ appliedLsn: 123 });
   });
 
+  it("moves readBaseLsn past the entries a skew refusal named, so the adapted commit is not refused for the same skew", async () => {
+    await writeState(worktree, { appliedLsn: 122, readBaseLsn: 120 });
+    const log: string[] = [];
+    server.rejectNextCommit({
+      reason: "escalated",
+      message: "write skew: #121 changed getCurrentUser (signature). Re-read src/auth/session.ts at head #122 and commit again",
+      conflictsWith: [121, 122],
+    });
+    await expect(send(undefined, { log: (l) => log.push(l) })).rejects.toMatchObject({ reason: "escalated", conflictsWith: [121, 122] });
+    expect(await readState(worktree)).toEqual({ appliedLsn: 122, readBaseLsn: 122 });
+    expect(log).toContain("reads are checked from #122 from now on: the server named what to re-read");
+    await send(); // the fake records accepted commits only
+    expect(server.commits[0]).toMatchObject({ baseLsn: 122 });
+    expect(server.commits[0]?.readBaseLsn).toBeUndefined();
+    expect(await readState(worktree)).toEqual({ appliedLsn: 123 });
+  });
+
+  it("keeps readBaseLsn where it was on a write-write refusal, which names nothing the agent read", async () => {
+    await writeState(worktree, { appliedLsn: 122, readBaseLsn: 120 });
+    server.rejectNextCommit({ reason: "constraint_failed", message: "changed since #122 by #121: src/a.ts. Rebase onto #122 and retry", conflictsWith: [121] });
+    await expect(send()).rejects.toBeInstanceOf(CommitRejected);
+    expect(await readState(worktree)).toEqual({ appliedLsn: 122, readBaseLsn: 120 });
+  });
+
   it("does not apply an entry the daemon applied while the server was answering", async () => {
     await writeState(worktree, { appliedLsn: 122, readBaseLsn: 121 });
     // The server pushes the entry before it answers: here the daemon wins the race.

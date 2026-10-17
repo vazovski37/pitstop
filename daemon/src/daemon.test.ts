@@ -126,6 +126,8 @@ describe("daemon with its local API", () => {
       conflictsWith: [121],
     });
     expect(applier.lsns).toEqual([]);
+    // The refusal told the agent what to re-read, so its reads are checked from there next time.
+    expect(await readState(worktree)).toEqual({ appliedLsn: 122, readBaseLsn: 121 });
   });
 
   it("notes an applied entry that touched a file the agent is editing, and conflicts it left", async () => {

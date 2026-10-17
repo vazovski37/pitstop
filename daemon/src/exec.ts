@@ -34,6 +34,10 @@ export function run(file: string, args: string[], opts: RunOptions): Promise<str
         resolve(stdout);
       },
     );
+    // The callback reports what went wrong (ENOENT, a non-zero exit). Writing to the stdin of a
+    // child that never started or has already exited would otherwise surface as an unhandled
+    // EPIPE: CI without jj or Mergiraf hit it from the `--version` probes.
+    child.stdin?.on("error", () => undefined);
     child.stdin?.end(opts.input ?? "");
   });
 }
