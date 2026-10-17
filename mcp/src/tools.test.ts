@@ -143,17 +143,19 @@ describe("setup", () => {
       await writeFile(join(worktree, ".mcp.json"), JSON.stringify({ mcpServers: { other: { command: "x" } } }));
       await mkdir(join(worktree, ".claude"), { recursive: true });
       await writeFile(join(worktree, ".claude", "settings.json"), JSON.stringify({ permissions: { allow: ["Bash(npm test)"] }, hooks: { PostToolUse: [{ matcher: "Bash", hooks: [{ type: "command", command: "echo hi" }] }] } }));
-      const r = await setupWorktree(worktree, "C:\\pitstop\\mcp\\dist");
+      // The scripts folder as path.join spells it here, so the expectations hold on Windows and on Linux CI.
+      const scripts = join(worktree, "mcp-dist");
+      const r = await setupWorktree(worktree, scripts);
       const mcp = JSON.parse(await readFile(r.mcpConfig, "utf8")) as { mcpServers: Record<string, unknown> };
       expect(mcp.mcpServers.other).toEqual({ command: "x" });
-      expect(mcp.mcpServers.pitstop).toEqual({ command: "node", args: ["C:\\pitstop\\mcp\\dist\\index.js"], env: { PITSTOP_WORKTREE: worktree } });
+      expect(mcp.mcpServers.pitstop).toEqual({ command: "node", args: [join(scripts, "index.js")], env: { PITSTOP_WORKTREE: worktree } });
       const settings = JSON.parse(await readFile(r.settings, "utf8")) as { permissions: unknown; hooks: { PostToolUse: unknown[] } };
       expect(settings.permissions).toEqual({ allow: ["Bash(npm test)"] });
       expect(settings.hooks.PostToolUse).toEqual([
         { matcher: "Bash", hooks: [{ type: "command", command: "echo hi" }] },
-        { matcher: "", hooks: [{ type: "command", command: 'node "C:\\pitstop\\mcp\\dist\\hook.js"', timeout: 60 }] },
+        { matcher: "", hooks: [{ type: "command", command: `node "${join(scripts, "hook.js")}"`, timeout: 60 }] },
       ]);
-      await setupWorktree(worktree, "C:\\pitstop\\mcp\\dist");
+      await setupWorktree(worktree, scripts);
       const again = JSON.parse(await readFile(r.settings, "utf8")) as { hooks: { PostToolUse: unknown[] } };
       expect(again.hooks.PostToolUse).toHaveLength(2);
     } finally {
