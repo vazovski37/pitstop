@@ -1,8 +1,14 @@
-# web/ — live view
+# web/ — the website
 
 Owner: **Vazovski** (since 18 October 2026, every folder is).
 
-## What it shows (the screen judges look at during the demo)
+## Pages (hash routes)
+- `#/` home: signed out, the pitch and "Sign in with GitHub"; signed in, your repositories (`GET /repos`) and "New repository" under your login (`POST /repos`).
+- `#/r/<owner>/<name>` a repository: tabs **Live** (below), **Members** (`/repos/:o/:n/members`: roles, the resolver flag, invites by GitHub login that turn into membership at first sign-in, remove, leave) and **Set up Claude** (makes a personal token with `POST /tokens` and writes the prompt a developer pastes into Claude Code: install Node, git and jj, `npm install -g <server>/pitstop-cli.tgz`, `pitstop setup <server> <repo> --token …`). The administrator's shared token never goes into a prompt.
+- `#/account` personal tokens (make, list, revoke) and sign out.
+- On a server without accounts the header takes the shared token instead (kept in `localStorage`).
+
+## The Live tab (the screen judges look at during the demo)
 - The log, newest first: LSN, agent, intent, files, checks; repairs highlighted, with the repair's summary under the entry.
 - Open intents: agent, text, declared symbols, base LSN, last heartbeat.
 - Worktrees: one line per connected daemon, `agent-b · applied #3 of #4`, a green mark at the head and a red one with the lag when behind. The name comes from the worktree's open intent; between tasks it is just "worktree".
@@ -15,7 +21,7 @@ No framework and no bundler: `public/index.html` + `public/style.css`, and `src/
 Data: `GET /version`, `GET /me`, `GET /repos`, then one WebSocket to `/stream` subscribed from LSN 0, which replays the whole log and then stays live (`head`, `entry`, `intent`, `warning`). Switching repositories reconnects; a dropped socket reconnects from the last LSN seen. The worktrees are not on the stream: the page reads `GET /repos/:owner/:name/worktrees` (`WorktreesResponse` in `server/src/app.ts`, a server query rather than a protocol message) on `head`, after every live entry and every 3 s while the socket is up. The Dockerfile builds this workspace into the server image.
 
 ## Rules
-- Read-only client of the server's `/stream` and query API. It never writes.
+- It writes only through the API, as the signed-in user (repositories, members, tokens); the session cookie authenticates it, so no token sits in the page except a shared one pasted on a server without accounts.
 - Message shapes come from `@pitstop/protocol` (type imports only).
 - Deployed by CI like the server; never from a laptop.
 - `npm run typecheck` covers it (the root script builds the protocol first).

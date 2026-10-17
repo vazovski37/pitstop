@@ -113,9 +113,9 @@ The server's root URL (`http://localhost:8080/` on a laptop, the Container App's
 Pitstop is a hosted service: one server, run by us on Azure, that any team signs in to. Nobody installs a server; developers install only the client (the daemon and the agent tools, `daemon/README.md`). Joining, once accounts are on (see "Accounts" below):
 
 1. Open the server's URL in a browser and sign in with GitHub.
-2. Create a personal token on the page (it starts with `pst_` and is shown once) and keep it in `PITSTOP_TOKEN` on your machine.
-3. In a checkout of your repository: `pitstop init <server-url> --repo <owner>/<name>` creates the repository on the server and imports the checkout as the log's first entry; your teammates build their worktrees from the log with `pitstop clone <server-url> <owner>/<name>`.
-4. Add them as members of the repository (`PUT /repos/<owner>/<name>/members/<login>`; a page for it is on the plan) and start the daemon; everything else is in the guide.
+2. Create a repository (it lives under your GitHub login), or ask its owner to invite your login: an invite turns into membership the first time you sign in.
+3. Open the repository, go to **Set up Claude**, and paste the prompt it writes into Claude Code on your computer. It installs the client from the server (`npm install -g <server>/pitstop-cli.tgz`), runs `pitstop setup`, which imports your checkout into an empty repository or builds a fresh checkout of a non-empty one, wires the Pitstop tools into Claude Code and starts the background daemon. The prompt carries a personal token made for it; revoke it under **Account** when that computer is gone.
+4. Under **Members**, owners invite people, set roles, and mark the **resolver**: the member who decides when a commit would break what another change relied on (with none marked, the owners decide).
 
 The local stack (`npm run dev:server`, `docker compose up --build`) exists for developing Pitstop itself, not as a way to run it.
 
