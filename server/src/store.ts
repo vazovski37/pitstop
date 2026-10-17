@@ -4,6 +4,7 @@ import type {
   Checks,
   CommitRequest,
   CommitResponse,
+  FileChange,
   Intent,
   IntentRequest,
   Lsn,
@@ -25,17 +26,26 @@ export interface Store {
   /** Entries with `lsn > fromLsn`, in LSN order, at most `limit` of them. */
   entriesAfter(fromLsn: Lsn, limit: number): Promise<Changeset[]>;
   headLsn(): Promise<Lsn>;
+  /**
+   * Every file at `lsn`, path to text: the log folded up to that entry (the latest change per
+   * path, deletes and renames applied). Needs the repository to have entered the log as a full
+   * import at its first entry.
+   */
+  treeAt(lsn: Lsn): Promise<Tree>;
   openIntent(req: IntentRequest): Promise<Intent>;
   /** Refreshes an open intent's heartbeat. Unknown or closed intents are ignored. */
   heartbeat(intentId: string): Promise<void>;
 }
+
+/** Path to text. */
+export type Tree = Map<string, string>;
 
 /** What a decision records with the changeset. Defaults: skipped checks, no repairs. */
 export interface Decision {
   checks?: Checks;
   repairs?: Repair[];
 }
-export type Decide = (gap: Changeset[], head: Lsn) => Decision;
+export type Decide = (gap: Changeset[], head: Lsn) => Decision | Promise<Decision>;
 
 /** How far behind head a commit may be before the daemon must rebase first. */
 export const GAP_LIMIT = 500;
@@ -43,7 +53,7 @@ export const GAP_LIMIT = 500;
 /** The start of the window a commit is checked against: reads may be older than the files' base. */
 export const gapStart = (req: CommitRequest): Lsn => Math.min(req.baseLsn, req.readBaseLsn ?? req.baseLsn);
 
-/** Recorded until the type-check gate exists (Phase 4). */
+/** Recorded until the checks run (Phase 4). */
 export const SKIPPED_CHECKS: Checks = { typecheck: "skipped", tests: "skipped", adr: "skipped" };
 
 export const blobHash = (content: string): string =>
@@ -80,6 +90,23 @@ export function withBlobHashes(req: CommitRequest): CommitRequest {
   return { ...req, files };
 }
 
+/** Applies a changeset's files to a tree, in place. A change without content keeps what was there. */
+export function applyFiles(tree: Tree, files: FileChange[]): Tree {
+  for (const f of files) {
+    if (f.op === "delete") {
+      tree.delete(f.path);
+      continue;
+    }
+    if (f.op === "rename" && f.fromPath !== undefined) {
+      const moved = tree.get(f.fromPath);
+      tree.delete(f.fromPath);
+      if (f.content === undefined && moved !== undefined) tree.set(f.path, moved);
+    }
+    if (f.content !== undefined) tree.set(f.path, f.content);
+  }
+  return tree;
+}
+
 export class MemoryStore implements Store {
   private readonly entries: Changeset[] = [];
   private readonly byKey = new Map<string, Changeset>();
@@ -94,7 +121,7 @@ export class MemoryStore implements Store {
       throw new InvalidCommit(`unknown intent ${req.intentId}`);
     }
     const gap = this.entries.filter((e) => e.lsn > gapStart(req)).slice(0, GAP_LIMIT + 1);
-    const decision = decide ? decide(gap, lsn - 1) : {};
+    const decision = decide ? await decide(gap, lsn - 1) : {};
     const changeset: Changeset = {
       lsn,
       baseLsn: req.baseLsn,
@@ -122,6 +149,12 @@ export class MemoryStore implements Store {
 
   async headLsn(): Promise<Lsn> {
     return this.entries.length;
+  }
+
+  async treeAt(lsn: Lsn): Promise<Tree> {
+    const tree: Tree = new Map();
+    for (const entry of this.entries) if (entry.lsn <= lsn) applyFiles(tree, entry.files);
+    return tree;
   }
 
   async openIntent(req: IntentRequest): Promise<Intent> {

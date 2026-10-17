@@ -96,6 +96,25 @@ describe.skipIf(!url)("PgStore against a real Postgres", () => {
     expect(back?.checks.details).toBe("decided");
   });
 
+  it("folds the log into the tree at an LSN, with deletes and renames", async () => {
+    const head = await store.headLsn();
+    const added = await store.append(request("tree-add", 0, { files: [{ path: "tree/x.ts", op: "add", content: "x1" }, { path: "tree/y.ts", op: "add", content: "y1" }] }));
+    const edited = await store.append(request("tree-edit", 0, { files: [{ path: "tree/x.ts", op: "modify", content: "x2" }] }));
+    const moved = await store.append(request("tree-move", 0, { files: [{ path: "tree/z.ts", op: "rename", fromPath: "tree/y.ts", content: "y1" }] }));
+    const before = await store.treeAt(head);
+    expect([...before.keys()].filter((p) => p.startsWith("tree/"))).toEqual([]);
+    const afterAdd = await store.treeAt(added.lsn);
+    expect(afterAdd.get("tree/x.ts")).toBe("x1");
+    expect(afterAdd.get("tree/y.ts")).toBe("y1");
+    const afterEdit = await store.treeAt(edited.lsn);
+    expect(afterEdit.get("tree/x.ts")).toBe("x2");
+    const afterMove = await store.treeAt(moved.lsn);
+    expect(afterMove.has("tree/y.ts")).toBe(false);
+    expect(afterMove.get("tree/z.ts")).toBe("y1");
+    await store.append(request("tree-del", 0, { files: [{ path: "tree/x.ts", op: "delete" }] }));
+    expect((await store.treeAt(await store.headLsn())).has("tree/x.ts")).toBe(false);
+  });
+
   it("a rejecting decision appends nothing", async () => {
     const head = await store.headLsn();
     await expect(

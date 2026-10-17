@@ -38,9 +38,10 @@ const token = process.env.PITSTOP_TOKEN || undefined;
 if (token === undefined) console.log("pitstop server: PITSTOP_TOKEN is not set, every route is open");
 
 const validation = parseValidationMode(process.env.PITSTOP_VALIDATE);
-console.log(`pitstop server: validation ${validation} (PITSTOP_VALIDATE)`);
+const check = process.env.PITSTOP_CHECK === "always" ? "always" : "off";
+console.log(`pitstop server: validation ${validation} (PITSTOP_VALIDATE), type-check gate ${check} (PITSTOP_CHECK)`);
 
-const app = await buildApp({ version, pingDb, store, token, validation, logger: true });
+const app = await buildApp({ version, pingDb, store, token, validation, check, logger: true });
 
 const shutdown = async (signal: string) => {
   app.log.info(`${signal} received, shutting down`);

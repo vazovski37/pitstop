@@ -15,7 +15,8 @@
     "@fastify/websocket": "^11.0.0",
     "@pitstop/protocol": "0.1.0",
     "fastify": "^5.2.0",
-    "pg": "^8.13.0"
+    "pg": "^8.13.0",
+    "typescript": "^5.9.3"
   },
   "devDependencies": {
     "@types/pg": "^8.11.0",
