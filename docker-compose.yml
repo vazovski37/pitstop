@@ -9,7 +9,7 @@ services:
       POSTGRES_PASSWORD: pitstop
       POSTGRES_DB: pitstop
     ports:
-      - "5432:5432"
+      - "${PITSTOP_DB_PORT:-5432}:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
