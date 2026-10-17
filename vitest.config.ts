@@ -10,6 +10,7 @@ export default defineConfig({
   },
   test: {
     include: ["**/src/**/*.test.ts"],
-    exclude: ["**/node_modules/**", "**/dist/**"],
+    // .claude/worktrees holds other Claude sessions' checkouts of this repository: their tests are not ours.
+    exclude: ["**/node_modules/**", "**/dist/**", "**/.claude/**"],
   },
 });

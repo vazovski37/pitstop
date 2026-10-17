@@ -154,11 +154,11 @@ curl -X PUT "$SERVER/repos/<owner>/<name>/mirror" -H "authorization: Bearer $PIT
 
 **AI repair (Phase 4)**
 
-Write skew is resolved by whoever `PITSTOP_REPAIR` names. The default, `agent`, needs nothing: the coding agent that committed is told what changed and commits again. For the server to repair with a model, get a free key at console.groq.com and store it:
+Write skew is resolved by whoever `PITSTOP_REPAIR` names. Unset, it is `off`: the validator alone handles skew (`PITSTOP_VALIDATE`, `warn` by default, lands it with a warning). `.env.example` and `infra/main.bicep` set `agent`, which needs nothing: the coding agent that committed is told what changed and commits again; that is what a laptop with `.env` and the Azure server run. For the server to repair with a model, get a free key at console.groq.com and store it:
 ```bash
 gh secret set GROQ_API_KEY --repo <you>/pitstop
 ```
-Then run **Provision infrastructure** with `repairMode=groq` (edit the default in `infra/main.bicep`, or pass it when running the deployment by hand). Locally, set `PITSTOP_REPAIR=groq` and `GROQ_API_KEY` in `.env`. Your Claude Max plan covers Claude Code on the laptops; the server's own model calls go to Groq.
+Then change the `repairMode` default in `infra/main.bicep` from `'agent'` to `'groq'` (and `groqModel` there for another model) and merge it to `main`: that push runs **Provision infrastructure**, which is the only way the mode reaches Azure. The workflow passes no `repairMode` of its own and takes no inputs when run by hand, a plain **Deploy** keeps whatever the last Provision set, and laptops never run `az deployment` (`CLAUDE.md`). Locally, set `PITSTOP_REPAIR=groq` and `GROQ_API_KEY` in `.env`. Your Claude Max plan covers Claude Code on the laptops; the server's own model calls go to Groq.
 
 **Live view (Phase 5)**
 Add a second Container App or an Azure Static Web App in `infra/main.bicep`, and a deploy job for `web/` in `deploy.yml`.
