@@ -28,9 +28,16 @@ param deployApp bool = false
 @description('Full image reference, e.g. myacr.azurecr.io/server:<sha>. Required when deployApp is true.')
 param containerImage string = ''
 
-@description('Claude API key for AI repair (Phase 4). Leave empty until then.')
+@description('Groq Cloud API key for AI repair (PITSTOP_REPAIR=groq). Empty leaves repair to the agent.')
 @secure()
-param anthropicApiKey string = ''
+param groqApiKey string = ''
+
+@description('Who resolves write skew: agent (default), groq, or off. groq needs groqApiKey.')
+@allowed(['agent', 'groq', 'off'])
+param repairMode string = 'agent'
+
+@description('Groq production model id used by AI repair.')
+param groqModel string = 'openai/gpt-oss-120b'
 
 @description('Shared token every daemon sends as Authorization: Bearer (Phase 2). Empty leaves the server open.')
 @secure()
@@ -149,15 +156,18 @@ var databaseUrl = 'postgresql://${pgAdminUser}:${pgAdminPassword}@${pg.propertie
 var baseSecrets = [
   { name: 'database-url', value: databaseUrl }
 ]
-var aiSecrets = empty(anthropicApiKey) ? [] : [
-  { name: 'anthropic-api-key', value: anthropicApiKey }
+var aiSecrets = empty(groqApiKey) ? [] : [
+  { name: 'groq-api-key', value: groqApiKey }
 ]
 var baseEnv = [
   { name: 'DATABASE_URL', secretRef: 'database-url' }
   { name: 'PORT', value: '8080' }
+  // groq without a key would refuse to start, so the mode falls back to agent then.
+  { name: 'PITSTOP_REPAIR', value: (repairMode == 'groq' && empty(groqApiKey)) ? 'agent' : repairMode }
+  { name: 'GROQ_MODEL', value: groqModel }
 ]
-var aiEnv = empty(anthropicApiKey) ? [] : [
-  { name: 'ANTHROPIC_API_KEY', secretRef: 'anthropic-api-key' }
+var aiEnv = empty(groqApiKey) ? [] : [
+  { name: 'GROQ_API_KEY', secretRef: 'groq-api-key' }
 ]
 var tokenSecrets = empty(pitstopToken) ? [] : [
   { name: 'pitstop-token', value: pitstopToken }

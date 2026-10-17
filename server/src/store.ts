@@ -40,10 +40,12 @@ export interface Store {
 /** Path to text. */
 export type Tree = Map<string, string>;
 
-/** What a decision records with the changeset. Defaults: skipped checks, no repairs. */
+/** What a decision records with the changeset. Defaults: skipped checks, no repairs, the files as sent. */
 export interface Decision {
   checks?: Checks;
   repairs?: Repair[];
+  /** The files to land instead of the request's: a repair's output, hashes filled in. */
+  files?: FileChange[];
 }
 export type Decide = (gap: Changeset[], head: Lsn) => Decision | Promise<Decision>;
 
@@ -79,16 +81,17 @@ export class RejectedCommit extends Error {
 
 /** Fills in a missing `blob` from `content`, and refuses a `blob` that is not its sha256. */
 export function withBlobHashes(req: CommitRequest): CommitRequest {
-  const files = req.files.map((f) => {
-    if (f.content === undefined) return f;
+  for (const f of req.files) {
+    if (f.content === undefined || f.blob === undefined) continue;
     const hash = blobHash(f.content);
-    if (f.blob !== undefined && f.blob !== hash) {
-      throw new InvalidCommit(`${f.path}: blob ${f.blob} is not the sha256 of its content (${hash})`);
-    }
-    return { ...f, blob: hash };
-  });
-  return { ...req, files };
+    if (f.blob !== hash) throw new InvalidCommit(`${f.path}: blob ${f.blob} is not the sha256 of its content (${hash})`);
+  }
+  return { ...req, files: hashedFiles(req.files) };
 }
+
+/** The same files with `blob` set from `content` wherever there is content. */
+export const hashedFiles = (files: FileChange[]): FileChange[] =>
+  files.map((f) => (f.content === undefined ? f : { ...f, blob: blobHash(f.content) }));
 
 /** Applies a changeset's files to a tree, in place. A change without content keeps what was there. */
 export function applyFiles(tree: Tree, files: FileChange[]): Tree {
@@ -127,7 +130,7 @@ export class MemoryStore implements Store {
       baseLsn: req.baseLsn,
       author: req.author,
       intent: req.intent,
-      files: req.files,
+      files: decision.files ?? req.files,
       writeSet: req.writeSet,
       sigWriteSet: req.sigWriteSet,
       readSet: req.readSet,

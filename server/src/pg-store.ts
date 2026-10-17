@@ -97,7 +97,8 @@ export class PgStore implements Store {
           brain.rows[0]?.version ?? 0,
         ],
       );
-      for (const f of req.files) {
+      const files = decision.files ?? req.files;
+      for (const f of files) {
         if (f.content !== undefined && f.blob !== undefined) {
           await client.query("insert into blobs (hash, bytes) values ($1, $2) on conflict (hash) do nothing", [
             f.blob,

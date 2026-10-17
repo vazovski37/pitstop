@@ -116,11 +116,13 @@ gh secret set PITSTOP_TOKEN --repo <you>/pitstop
 ```
 Put the same value in each laptop's `.env` as `PITSTOP_TOKEN`; the daemon sends it as `Authorization: Bearer <token>` (a browser uses `?token=<token>` on `/stream`). Until the secret exists the server runs open.
 
-**Claude API key for AI repair (Phase 4)**
+**AI repair (Phase 4)**
+
+Write skew is resolved by whoever `PITSTOP_REPAIR` names. The default, `agent`, needs nothing: the coding agent that committed is told what changed and commits again. For the server to repair with a model, get a free key at console.groq.com and store it:
 ```bash
-gh secret set ANTHROPIC_API_KEY --repo <you>/pitstop
+gh secret set GROQ_API_KEY --repo <you>/pitstop
 ```
-Then run **Provision infrastructure** again; it adds the key to the app as a secret. Your Claude Max plan covers Claude Code on your laptops, but the server's own model calls need this separate key (or a Microsoft Foundry deployment; check whether your Azure credits cover Claude there first).
+Then run **Provision infrastructure** with `repairMode=groq` (edit the default in `infra/main.bicep`, or pass it when running the deployment by hand). Locally, set `PITSTOP_REPAIR=groq` and `GROQ_API_KEY` in `.env`. Your Claude Max plan covers Claude Code on the laptops; the server's own model calls go to Groq.
 
 **Live view (Phase 5)**
 Add a second Container App or an Azure Static Web App in `infra/main.bicep`, and a deploy job for `web/` in `deploy.yml`.

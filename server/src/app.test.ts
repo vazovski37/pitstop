@@ -301,3 +301,88 @@ describe("the type-check gate (PITSTOP_CHECK=always)", () => {
     await app.close();
   });
 });
+
+describe("repair (PITSTOP_REPAIR)", () => {
+  // The demo in miniature: an import, the auth fix that changes getCurrentUser's signature,
+  // then the profile change that read the old signature.
+  const tsconfig = JSON.stringify({ compilerOptions: { strict: true, noEmit: true, target: "ES2022", module: "NodeNext", moduleResolution: "NodeNext" }, include: ["src"] });
+  const sessionBefore = "export interface User { name: string }\nexport function getCurrentUser(): User { return { name: \"nino\" }; }\n";
+  const sessionAfter = "export interface User { name: string }\nexport function getCurrentUser(): User | null { return null; }\n";
+  const profileBroken = 'import { getCurrentUser } from "../auth/session.js";\nexport function renderProfile(): string { return getCurrentUser().name; }\n';
+  const profileFixed = 'import { getCurrentUser } from "../auth/session.js";\nexport function renderProfile(): string { const user = getCurrentUser(); return user ? user.name : "/login"; }\n';
+
+  const importRepo: Partial<CommitRequest> = {
+    intent: "import",
+    files: [
+      { path: "tsconfig.json", op: "add", content: tsconfig },
+      { path: "src/auth/session.ts", op: "add", content: sessionBefore },
+    ],
+    writeSet: ["src/auth/session.ts#getCurrentUser", "src/auth/session.ts#User"],
+  };
+  const authFix: Partial<CommitRequest> = {
+    baseLsn: 1,
+    intent: "Fix the expired-session bug in auth",
+    files: [{ path: "src/auth/session.ts", op: "modify", content: sessionAfter }],
+    writeSet: ["src/auth/session.ts#getCurrentUser"],
+    sigWriteSet: ["src/auth/session.ts#getCurrentUser"],
+  };
+  const profile: Partial<CommitRequest> = {
+    baseLsn: 1,
+    intent: "Show last-seen on the profile page",
+    files: [{ path: "src/pages/ProfilePage.ts", op: "add", content: profileBroken }],
+    writeSet: ["src/pages/ProfilePage.ts#renderProfile"],
+    readSet: ["src/auth/session.ts#getCurrentUser"],
+  };
+
+  it("agent: hands the skew back to the committing agent as escalated", async () => {
+    const { app, commit } = await start(true, { repair: "agent" });
+    await commit("import", importRepo);
+    await commit("auth-fix", authFix);
+    const res = await commit("profile", profile);
+    expect(res.statusCode).toBe(409);
+    expect(res.json()).toMatchObject({ status: "rejected", reason: "escalated", conflictsWith: [2] });
+    expect(res.json().message).toContain("#2 changed src/auth/session.ts#getCurrentUser (signature)");
+    expect(res.json().message).toContain("commit again with baseLsn 2");
+    expect((await app.inject({ method: "GET", url: "/log" })).json()).toHaveLength(2);
+    await app.close();
+  });
+
+  it("groq: lands the repaired entry when the model's patch type-checks", async () => {
+    const repairer = { propose: async () => ({ files: [{ path: "src/pages/ProfilePage.ts", content: profileFixed }], summary: "redirect when the session is gone" }) };
+    const { app, commit } = await start(true, { repair: "groq", repairer });
+    await commit("import", importRepo);
+    await commit("auth-fix", authFix);
+    const res = await commit("profile", profile);
+    expect(res.statusCode).toBe(200);
+    const body = CommitResponse.parse(res.json());
+    if (body.status === "accepted") {
+      expect(body.changeset.lsn).toBe(3);
+      expect(body.changeset.files[0]?.content).toBe(profileFixed);
+      expect(body.changeset.repairs).toEqual([{ againstLsn: 2, kind: "semantic", summary: "redirect when the session is gone" }]);
+      expect(body.changeset.checks.typecheck).toBe("pass");
+    }
+    const log = (await app.inject({ method: "GET", url: "/log?fromLsn=2" })).json() as { files: { content?: string }[] }[];
+    expect(log[0]?.files[0]?.content).toBe(profileFixed);
+    await app.close();
+  }, 120_000);
+
+  it("groq: escalates when the model cannot fix it", async () => {
+    const repairer = { propose: async () => ({ files: [{ path: "src/pages/ProfilePage.ts", content: profileBroken }], summary: "nothing" }) };
+    const { app, commit } = await start(true, { repair: "groq", repairer });
+    await commit("import", importRepo);
+    await commit("auth-fix", authFix);
+    const res = await commit("profile", profile);
+    expect(res.statusCode).toBe(409);
+    expect(res.json()).toMatchObject({ status: "rejected", reason: "escalated", conflictsWith: [2] });
+    expect(res.json().message).toContain("after 2 attempts");
+    await app.close();
+  }, 120_000);
+
+  it("stays out of the way of commits without skew", async () => {
+    const { app, commit } = await start(true, { repair: "groq", repairer: { propose: async () => { throw new Error("must not be called"); } } });
+    await commit("import", importRepo);
+    expect((await commit("auth-fix", authFix)).statusCode).toBe(200);
+    await app.close();
+  });
+
+});
