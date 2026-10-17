@@ -20,6 +20,9 @@ git add -A
 git -c user.name=teamdb -c user.email=teamdb@example.com commit -q -m "TeamDB slice at the demo's start state"
 if command -v jj >/dev/null 2>&1; then
   jj git init --colocate >/dev/null 2>&1 && echo "jj: colocated with git"
+  # Detach git's HEAD. The daemon moves refs/heads/main with update-ref; a symbolic HEAD would move
+  # with it, and jj then assumes git already wrote the files (it has not). Detached, only the ref moves.
+  git update-ref --no-deref HEAD "$(git rev-parse HEAD)"
 else
   echo "jj is not installed: git only (the daemon needs jj, see SETUP.md)"
 fi
