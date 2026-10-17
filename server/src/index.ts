@@ -3,6 +3,8 @@ import { buildApp } from "./app.js";
 import { createPool, ping } from "./db.js";
 import { migrate } from "./migrate.js";
 import { PgStore } from "./pg-store.js";
+import { GroqClient } from "./groq.js";
+import { modelRepairer, parseRepairMode, type Repairer } from "./repair.js";
 import { MemoryStore, type Store } from "./store.js";
 import { parseValidationMode } from "./validate.js";
 
@@ -39,9 +41,23 @@ if (token === undefined) console.log("pitstop server: PITSTOP_TOKEN is not set, 
 
 const validation = parseValidationMode(process.env.PITSTOP_VALIDATE);
 const check = process.env.PITSTOP_CHECK === "always" ? "always" : "off";
-console.log(`pitstop server: validation ${validation} (PITSTOP_VALIDATE), type-check gate ${check} (PITSTOP_CHECK)`);
+const repair = parseRepairMode(process.env.PITSTOP_REPAIR);
+let repairer: Repairer | undefined;
+if (repair === "groq") {
+  const apiKey = process.env.GROQ_API_KEY;
+  if (!apiKey) {
+    console.error("PITSTOP_REPAIR=groq needs GROQ_API_KEY (SETUP.md, \"AI repair\")");
+    process.exit(1);
+  }
+  const client = new GroqClient({ apiKey, model: process.env.GROQ_MODEL || undefined });
+  repairer = modelRepairer(client);
+  console.log(`pitstop server: AI repair through Groq, model ${client.model}`);
+}
+console.log(
+  `pitstop server: validation ${validation} (PITSTOP_VALIDATE), type-check gate ${check} (PITSTOP_CHECK), repair ${repair} (PITSTOP_REPAIR)`,
+);
 
-const app = await buildApp({ version, pingDb, store, token, validation, check, logger: true });
+const app = await buildApp({ version, pingDb, store, token, validation, check, repair, repairer, logger: true });
 
 const shutdown = async (signal: string) => {
   app.log.info(`${signal} received, shutting down`);
