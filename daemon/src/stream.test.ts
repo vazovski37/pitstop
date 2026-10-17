@@ -1,10 +1,9 @@
-import { rm } from "node:fs/promises";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { ServerMessage } from "@pitstop/protocol";
 import { startFakeServer, type FakeServer } from "./fake-server.js";
 import { readState, writeState } from "./state.js";
 import { GAP_RETRIES, GapError, StreamClient } from "./stream.js";
-import { entryAt, FakeApplier, fixtureMessages, sleep, tempDir, waitFor } from "./test-support.js";
+import { entryAt, FakeApplier, fixtureMessages, removeDir, sleep, tempDir, waitFor } from "./test-support.js";
 
 const hello: ServerMessage = { type: "hello", serverVersion: "test", headLsn: 124 };
 const threeEntries: ServerMessage[] = [
@@ -46,7 +45,7 @@ describe("stream client", () => {
     client?.close();
     await server?.close();
     server = undefined;
-    await rm(worktree, { recursive: true, force: true });
+    await removeDir(worktree);
   });
 
   it("subscribes from the applied LSN and applies the fixture entry", async () => {
@@ -101,10 +100,11 @@ describe("stream client", () => {
   it("applies entries appended while it is connected", async () => {
     server = await startFakeServer({ messages: [hello, { type: "entry", changeset: entryAt(122) }] });
     await writeState(worktree, { appliedLsn: 121 });
-    await start();
-    await waitFor(() => applier.lsns.length === 1);
+    const applied: number[] = [];
+    await start({ onApplied: (lsn) => applied.push(lsn) });
+    await waitFor(() => applied.includes(122));
     server.append(entryAt(123));
-    await waitFor(() => applier.lsns.length === 2);
+    await waitFor(() => applied.includes(123));
     expect(applier.lsns).toEqual([122, 123]);
   });
 
@@ -123,14 +123,15 @@ describe("stream client", () => {
   it("trusts a state file advanced by another process", async () => {
     server = await startFakeServer({ messages: [hello, { type: "entry", changeset: entryAt(122) }] });
     await writeState(worktree, { appliedLsn: 121 });
-    await start();
-    await waitFor(() => applier.lsns.length === 1);
+    const applied: number[] = []; // onApplied fires once the state file is written
+    await start({ onApplied: (lsn) => applied.push(lsn) });
+    await waitFor(() => applied.includes(122));
     // `pitstop commit` applied #123 itself and advanced the state file.
     await writeState(worktree, { appliedLsn: 123 });
     applier.failOn = 123; // never reached: the daemon re-reads the state file first
     server.append(entryAt(123));
     server.append(entryAt(124));
-    await waitFor(() => applier.lsns.includes(124));
+    await waitFor(() => applied.includes(124));
     expect(applier.lsns).toEqual([122, 124]);
   });
 

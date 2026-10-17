@@ -58,6 +58,7 @@ export class JjWorktree implements Applier {
     for (const f of changeset.files) checkFile(changeset, f);
 
     // 0. Snapshot the agent's edits into @ and remember where to roll back to.
+    await this.detachHead();
     await this.jj(["util", "snapshot"]);
     const restoreOp = (await this.jj(["op", "log", "-n1", "--no-graph", "-T", "id"])).trim();
     try {
@@ -82,6 +83,24 @@ export class JjWorktree implements Applier {
     }
   }
 
+  /**
+   * In a repository whose first commits git made (demo/scripts/reset.sh), `jj git init --colocate`
+   * leaves git HEAD a symbolic ref to `main`. Moving `main` would then move HEAD too, and jj reads a
+   * moved HEAD as "someone ran git checkout, the files already match", so the rebase never updates
+   * the working copy. Detaching HEAD at the same commit changes nothing jj can see.
+   */
+  private async detachHead(): Promise<void> {
+    let symbolic: string;
+    try {
+      symbolic = (await this.git(["symbolic-ref", "-q", "HEAD"])).trim();
+    } catch {
+      return; // already detached
+    }
+    if (symbolic === "") return;
+    const commit = (await this.git(["rev-parse", "HEAD"])).trim();
+    await this.git(["update-ref", "--no-deref", "HEAD", commit]);
+  }
+
   async hasChanges(): Promise<boolean> {
     await this.jj(["util", "snapshot"]);
     const out = await this.jj(["log", "-r", "@", "--no-graph", "-T", 'if(empty, "empty", "changed")']);
@@ -92,7 +111,7 @@ export class JjWorktree implements Applier {
     const commit = rev === "@" ? await this.workingCopyCommit() : `refs/heads/${this.bookmark}`;
     const paths = (await this.git(["ls-tree", "-r", "-z", "--name-only", commit]))
       .split("\0")
-      .filter((p) => p.length > 0 && !p.startsWith(".pitstop/"));
+      .filter((p) => p.length > 0 && !p.startsWith(".pitstop/") && !p.split("/").includes("node_modules"));
     const files = new Map<string, string>();
     for (const path of paths) files.set(path, await this.git(["show", `${commit}:${path}`]));
     return files;
@@ -153,11 +172,15 @@ export class JjWorktree implements Applier {
         await this.git(["update-index", "--add", "--cacheinfo", `100644,${blob},${f.path}`], { env });
       }
       const tree = (await this.git(["write-tree"], { env })).trim();
+      // Author, committer and both dates come from the entry, so every worktree builds the same
+      // commit id for the same entry (the git mirror in Phase 3 relies on that).
       const identity = {
         GIT_AUTHOR_NAME: cs.author.agent,
         GIT_AUTHOR_EMAIL: `${cs.author.developer}@pitstop.local`,
+        GIT_AUTHOR_DATE: cs.createdAt,
         GIT_COMMITTER_NAME: "pitstop daemon",
         GIT_COMMITTER_EMAIL: "daemon@pitstop.local",
+        GIT_COMMITTER_DATE: cs.createdAt,
       };
       return (await this.git(["commit-tree", tree, "-p", parent, "-m", `#${cs.lsn} ${cs.intent}`], { env: identity })).trim();
     } finally {

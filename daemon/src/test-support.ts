@@ -1,6 +1,6 @@
 /** Shared by the daemon's tests only; excluded from the build. */
 import { readdirSync, readFileSync, statSync } from "node:fs";
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -78,6 +78,10 @@ export async function waitFor(check: () => boolean, ms = 3_000): Promise<void> {
 export const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
 export const tempDir = (): Promise<string> => mkdtemp(join(tmpdir(), "pitstop-"));
+
+/** Removes a temp worktree; retries while a daemon still touches `.pitstop` (Windows: ENOTEMPTY, EBUSY). */
+export const removeDir = (dir: string): Promise<void> =>
+  rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
 
 /** The demo slice (demo/teamdb) as a tree: tsconfig.json and every file under src. */
 export function demoTree(): Tree {

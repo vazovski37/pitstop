@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { run } from "./exec.js";
 import { ApplyError, binariesFromEnv, blobHash, JjWorktree } from "./jj.js";
 import { writeState } from "./state.js";
-import { entryAt, tempDir } from "./test-support.js";
+import { entryAt, removeDir, tempDir } from "./test-support.js";
 
 // Runs only where jj and git are installed (PITSTOP_JJ_BIN / PITSTOP_GIT_BIN point at them when not on PATH).
 const bin = binariesFromEnv();
@@ -17,7 +17,8 @@ const available = await Promise.all([
   () => false,
 );
 
-describe.skipIf(!available)("JjWorktree against a real colocated repo", () => {
+// Each test spawns a dozen jj and git processes; under the full suite's load that passes 5 s.
+describe.skipIf(!available)("JjWorktree against a real colocated repo", { timeout: 30_000 }, () => {
   let dir: string;
   let wt: JjWorktree;
   const git = (...args: string[]) => run(bin.git, args, { cwd: dir });
@@ -39,7 +40,7 @@ describe.skipIf(!available)("JjWorktree against a real colocated repo", () => {
     process.env.JJ_EMAIL = "agent@test";
     wt = new JjWorktree(dir, bin);
   });
-  afterEach(() => rm(dir, { recursive: true, force: true }));
+  afterEach(() => removeDir(dir));
 
   const entry = (lsn: number, path: string, content: string) =>
     entryAt(lsn, { files: [{ path, op: "modify", blob: blobHash(content), content }] });
@@ -52,6 +53,33 @@ describe.skipIf(!available)("JjWorktree against a real colocated repo", () => {
     expect(await file("b.txt")).toBe("b1\nb2-local\n");
     expect((await git("log", "-1", "--format=%s", "main")).trim()).toBe("#122 entry #122");
     expect((await git("rev-parse", "main")).trim()).toBe(result.commit);
+  });
+
+  it("updates the working copy even when git made the first commit and HEAD still points at main", async () => {
+    // demo/scripts/reset.sh: git init + commit, then jj git init --colocate. HEAD stays symbolic.
+    const repo = await tempDir();
+    try {
+      const g = (...args: string[]) => run(bin.git, args, { cwd: repo });
+      await g("init", "-q", "-b", "main");
+      await g("config", "user.name", "test");
+      await g("config", "user.email", "test@test");
+      await writeFile(join(repo, "a.txt"), "a1\na2\na3\n");
+      await g("add", "-A");
+      await g("commit", "-q", "-m", "base");
+      await run(bin.jj, ["git", "init", "--colocate"], { cwd: repo, env: { JJ_USER: "agent", JJ_EMAIL: "agent@test" } });
+      expect((await g("symbolic-ref", "-q", "HEAD")).trim()).toBe("refs/heads/main");
+
+      const other = new JjWorktree(repo, bin);
+      await other.apply(entry(2, "a.txt", "a1\na2-server\na3\n"));
+      expect(await readFile(join(repo, "a.txt"), "utf8")).toBe("a1\na2-server\na3\n");
+      await expect(g("symbolic-ref", "-q", "HEAD")).rejects.toThrow();
+      // and a second apply keeps working (the first one must not have confused jj about main)
+      await other.apply(entry(3, "a.txt", "a1\na2-server\na3\na4\n"));
+      expect(await readFile(join(repo, "a.txt"), "utf8")).toBe("a1\na2-server\na3\na4\n");
+      expect((await g("log", "--format=%s", "main")).trim().split("\n")).toEqual(["#3 entry #3", "#2 entry #2", "base"]);
+    } finally {
+      await removeDir(repo);
+    }
   });
 
   it("reports a conflict and keeps both sides in the working copy", async () => {
