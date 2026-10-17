@@ -94,11 +94,44 @@ export const newState = (): string => randomBytes(16).toString("hex");
 const sameSecret = (presented: string, expected: string): boolean =>
   presented.length === expected.length && timingSafeEqual(Buffer.from(presented), Buffer.from(expected));
 
-/** The bearer token a request presents: the header, or `?token=` where a browser cannot set one. */
+/**
+ * The bearer token a request presents: the header, or `?token=` on `/stream` only, where a
+ * browser's WebSocket cannot set a header. Anywhere else a token in the URL would end up in
+ * logs and browser history, so it is not accepted there (the request logger drops query strings).
+ */
 export function presentedToken(req: FastifyRequest): string | undefined {
   const header = req.headers.authorization;
   if (header?.startsWith("Bearer ")) return header.slice("Bearer ".length);
+  if (req.routeOptions.url !== "/stream") return undefined;
   return (req.query as { token?: string } | undefined)?.token;
+}
+
+/** The server's administrator: the shared token, or anyone on an open server. */
+export const isAdmin = (identity: Identity, config: AuthConfig): boolean => identity.kind === "shared" || openServer(config);
+
+/**
+ * A browser's WebSocket to `/stream` carries the session cookie of whatever site opened it, so a
+ * cookie-identified upgrade must come from this server's own pages. Non-browser clients (the
+ * daemon) send no Origin and present a token instead.
+ */
+export function sameOrigin(req: FastifyRequest, config: AuthConfig): boolean {
+  const origin = req.headers.origin;
+  if (origin === undefined) return true;
+  let host: string;
+  try {
+    host = new URL(origin).host;
+  } catch {
+    return false;
+  }
+  const own = [req.headers["x-forwarded-host"], req.headers.host, config.publicUrl, config.webUrl].flatMap((h) => {
+    if (typeof h !== "string" || h === "") return [];
+    try {
+      return [h.includes("://") ? new URL(h).host : h];
+    } catch {
+      return [];
+    }
+  });
+  return own.includes(host);
 }
 
 /** The value a session cookie carries. */
@@ -133,18 +166,18 @@ export async function identify(req: FastifyRequest, store: Store, config: AuthCo
 
 /**
  * Whether the identity may act at `role` on the repository. The shared token may do anything,
- * so may everyone on an open server. A member acts at their role; a repository with no members
- * at all is open to any signed-in user (local/default, a fresh self-host); a public repository
- * can be read by anyone.
+ * so may everyone on an open server. A member acts at their role, and a public repository can be
+ * read by anyone. A repository with no members (one the shared token made, local/default) is
+ * closed to every user: the administrator adds its owner. It used to be open to any signed-in
+ * user, which on a hosted server meant the first stranger could make themselves its owner.
  */
 export async function allowed(identity: Identity, repo: RepoId, role: Role, store: Store, config: AuthConfig): Promise<boolean> {
-  if (identity.kind === "shared" || openServer(config)) return true;
+  if (isAdmin(identity, config)) return true;
   const visibility = await store.visibility(repo);
   if (visibility === undefined) return false;
   if (identity.kind === "user") {
     const own = await store.roleOf(repo, identity.user.id);
     if (own !== undefined) return ROLE_RANK[own] >= ROLE_RANK[role];
-    if ((await store.listMembers(repo)).length === 0) return true;
   }
   return visibility === "public" && role === "reader";
 }

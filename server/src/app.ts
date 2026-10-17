@@ -19,7 +19,10 @@ import {
   accountsEnabled,
   allowed,
   identify,
+  isAdmin,
   newState,
+  presentedToken,
+  sameOrigin,
   sessionValue,
   SESSION_COOKIE,
   SESSION_SECONDS,
@@ -121,7 +124,21 @@ export interface WorktreesResponse {
  */
 export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   // A commit carries whole files, and an import carries a whole repository: well past Fastify's 1 MiB default.
-  const app = Fastify({ logger: deps.logger ?? false, bodyLimit: 32 * 1024 * 1024 });
+  // Request logs keep the path, never the query string: `/stream?token=` would otherwise put
+  // tokens into the logs (on Azure, Log Analytics).
+  const logger = deps.logger
+    ? {
+        serializers: {
+          req: (req: { method: string; url: string; hostname?: string; ip?: string }) => ({
+            method: req.method,
+            url: req.url.split("?")[0],
+            hostname: req.hostname,
+            remoteAddress: req.ip,
+          }),
+        },
+      }
+    : false;
+  const app = Fastify({ logger, bodyLimit: 32 * 1024 * 1024 });
   await app.register(websocket);
   await app.register(cookie, deps.sessionSecret === undefined ? {} : { secret: deps.sessionSecret });
   const stream = new Stream(deps.store, deps.version, app.log);
@@ -170,6 +187,18 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     return false;
   };
   const currentUser = (req: FastifyRequest): User | undefined => (req.identity.kind === "user" ? req.identity.user : undefined);
+  /** Answers 401 or 403 and returns false unless the caller is the server's administrator. */
+  const adminOnly = (req: FastifyRequest, reply: FastifyReply): boolean => {
+    if (isAdmin(req.identity, auth)) return true;
+    const code = req.identity.kind === "anonymous" ? 401 : 403;
+    void reply.code(code).send({ error: code === 401 ? "unauthorized" : "forbidden", message: "only the server's administrator may do this" });
+    return false;
+  };
+  /** Whether `userId` is the repository's only owner, so taking their ownership away would orphan it. */
+  const lastOwner = async (repo: string, userId: string): Promise<boolean> => {
+    const owners = (await deps.store.listMembers(repo)).filter((m) => m.role === "owner");
+    return owners.length === 1 && owners[0]?.userId === userId;
+  };
   const repoParam = (req: FastifyRequest<RepoParams>): string => `${req.params.owner}/${req.params.name}`;
   const redirectUri = (req: FastifyRequest): string => {
     const proto = (req.headers["x-forwarded-proto"] as string | undefined) ?? req.protocol;
@@ -269,6 +298,12 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
         const outcome = decideCommit(request, gap, head, repair === "off" ? mode : "warn");
         let decision = outcome.decision;
         if (outcome.skew !== undefined && repair !== "off") {
+          // `agent`: the coding agent that committed is the resolver; it gets told what changed.
+          // No trees needed for that, and reading them here would ask the pool for a second
+          // connection while this one holds the repository's lock.
+          if (repair === "agent" || deps.repairer === undefined) {
+            throw escalation({ request, skew: outcome.skew, gap, headLsn: head });
+          }
           const input = {
             request,
             skew: outcome.skew,
@@ -277,8 +312,6 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
             head: await deps.store.treeAt(repo, head),
             base: await deps.store.treeAt(repo, gapStart(request)),
           };
-          // `agent`: the coding agent that committed is the resolver; it gets told what changed.
-          if (repair === "agent" || deps.repairer === undefined) throw escalation(input);
           decision = await repairCommit(input, deps.repairer);
         } else {
           skew = outcome.skew;
@@ -343,8 +376,20 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     const id = RepoId.safeParse(req.body?.id);
     if (!id.success) return reply.code(400).send({ error: "invalid_request", message: "id must be owner/name in lowercase" });
     if (req.identity.kind === "anonymous" && accounts) return reply.code(401).send({ error: "unauthorized", message: "sign in to create a repository" });
-    const { repo, created } = await deps.store.createRepo(id.data);
     const user = currentUser(req);
+    // A user creates repositories under their own GitHub login, so nobody can squat another's
+    // name; the administrator may use any owner.
+    if (user !== undefined && id.data.split("/")[0] !== user.login.toLowerCase()) {
+      return reply.code(403).send({ error: "forbidden", message: `repositories are created under your login: ${user.login.toLowerCase()}/<name>` });
+    }
+    const existing = await deps.store.getRepo(id.data);
+    if (existing !== undefined) {
+      // Idempotent for whoever may read it (pitstop init runs it every time); a name taken by
+      // someone else says only that.
+      if (await allowed(req.identity, existing.id, "reader", deps.store, auth)) return reply.code(200).send(existing);
+      return reply.code(409).send({ error: "taken", message: `${id.data} already exists` });
+    }
+    const { repo, created } = await deps.store.createRepo(id.data);
     if (created && user !== undefined) await deps.store.setMember(repo.id, user.id, "owner");
     return reply.code(created ? 201 : 200).send(repo);
   });
@@ -403,6 +448,9 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     if (!parsed.success) return reply.code(400).send({ error: "invalid_request", message: issues(parsed.error) });
     const user = await deps.store.getUserByLogin(req.params.login);
     if (user === undefined) return reply.code(404).send({ error: "unknown_user", message: `${req.params.login} has not signed in here yet` });
+    if (parsed.data.role !== "owner" && (await lastOwner(repo, user.id))) {
+      return reply.code(409).send({ error: "last_owner", message: "a repository needs an owner: make someone else owner first" });
+    }
     await deps.store.setMember(repo, user.id, parsed.data.role);
     return { login: user.login, role: parsed.data.role };
   });
@@ -410,8 +458,13 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   app.delete<{ Params: { owner: string; name: string; login: string } }>("/repos/:owner/:name/members/:login", async (req, reply) => {
     const repo = `${req.params.owner}/${req.params.name}`;
     if ((await deps.store.getRepo(repo)) === undefined) return reply.code(404).send({ error: "unknown_repo" });
-    if (!(await guard(req, reply, repo, "owner"))) return reply;
+    // Owners remove anyone; a member may remove themselves (leave).
+    const leaving = currentUser(req)?.login === req.params.login;
+    if (!(await guard(req, reply, repo, leaving ? "reader" : "owner"))) return reply;
     const user = await deps.store.getUserByLogin(req.params.login);
+    if (user !== undefined && (await lastOwner(repo, user.id))) {
+      return reply.code(409).send({ error: "last_owner", message: "a repository needs an owner: make someone else owner first" });
+    }
     const removed = user === undefined ? false : await deps.store.removeMember(repo, user.id);
     return reply.code(removed ? 204 : 404).send();
   });
@@ -423,7 +476,9 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     }
     const repo = repoParam(req);
     if ((await deps.store.getRepo(repo)) === undefined) return reply.code(404).send({ error: "unknown_repo" });
-    if (!(await guard(req, reply, repo, "owner"))) return reply;
+    // One server-wide GitHub token pushes every mirror, so only the administrator may aim it:
+    // a repository owner could otherwise point it at any branch that token can write.
+    if (!adminOnly(req, reply)) return reply;
     const parsed = MirrorBody.safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: "invalid_request", message: issues(parsed.error) });
     const baseCommit = parsed.data.baseCommit ?? (await deps.github.getRef(parsed.data.github, parsed.data.branch));
@@ -442,7 +497,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
 
   app.delete<RepoParams>("/repos/:owner/:name/mirror", async (req, reply) => {
     const repo = repoParam(req);
-    if (!(await guard(req, reply, repo, "owner"))) return reply;
+    if (!adminOnly(req, reply)) return reply;
     await deps.store.deleteMirror(repo);
     return reply.code(204).send();
   });
@@ -463,6 +518,11 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   // hello, then replay after the daemon's fromLsn, then live (section 8.2). See stream.ts.
   app.get("/stream", { websocket: true }, (socket, req) => {
     const identity = req.identity;
+    // A signed-in browser's cookie rides along with any site's WebSocket: only our own pages may use it.
+    if (identity.kind === "user" && presentedToken(req) === undefined && !sameOrigin(req, auth)) {
+      socket.close(1008, "cross-origin stream refused");
+      return;
+    }
     stream.connect(socket, (repo) => allowed(identity, repo, "reader", deps.store, auth));
   });
 

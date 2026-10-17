@@ -69,5 +69,5 @@ jobs:
         run: |
           docker run -d --name server --network host \
             -e DATABASE_URL=postgresql://pitstop:pitstop@localhost:5432/pitstop \
-            -e PORT=8080 pitstop-server:ci
+            -e PORT=8080 -e PITSTOP_TOKEN=ci-smoke-token pitstop-server:ci
           TRIES=12 bash infra/smoke.sh http://localhost:8080 "${{ github.sha }}" || { docker logs server; exit 1; }

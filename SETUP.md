@@ -127,17 +127,17 @@ The server on Azure is public, so one shared token guards everything except `/he
 ```bash
 gh secret set PITSTOP_TOKEN --repo <you>/pitstop
 ```
-Put the same value in each laptop's `.env` as `PITSTOP_TOKEN`; the daemon sends it as `Authorization: Bearer <token>` (a browser uses `?token=<token>` on `/stream`). Until the secret exists the server runs open.
+Put the same value in each laptop's `.env` as `PITSTOP_TOKEN`; the daemon sends it as `Authorization: Bearer <token>` (a browser uses `?token=<token>`, accepted on `/stream` only; request logs drop query strings). In production the server refuses to start without it, unless accounts are on.
 
 **Accounts (Phase 5)**
 
 People sign in with GitHub, make personal tokens for their daemons, and are members of repositories. Register an OAuth App at GitHub → Settings → Developer settings → OAuth Apps: homepage `https://<app>`, callback `https://<app>/auth/github/callback`. Then:
 ```bash
-gh variable set GITHUB_OAUTH_CLIENT_ID --repo <you>/pitstop --body <client id>
-gh secret set GITHUB_OAUTH_CLIENT_SECRET --repo <you>/pitstop
+gh variable set PITSTOP_OAUTH_CLIENT_ID --repo <you>/pitstop --body <client id>
+gh secret set PITSTOP_OAUTH_CLIENT_SECRET --repo <you>/pitstop
 gh secret set SESSION_SECRET --repo <you>/pitstop      # any long random string
 ```
-and run **Provision infrastructure**. From then on `GET /auth/github` signs in, `POST /tokens {"name": "laptop"}` (with the session cookie) answers a `pst_…` secret once, and that secret goes into the laptop's `.env` as `PITSTOP_TOKEN`: the daemon sends it like the shared one. `POST /repos` by a signed-in user makes them its owner; owners add members (`PUT /repos/<owner>/<name>/members/<login>` with `{"role": "writer"}`) and can make a repository public. The shared `PITSTOP_TOKEN` keeps working as the super-user, and a repository with no members is open to any signed-in user, so nothing breaks the day accounts go on.
+(GitHub refuses secret and variable names that start with `GITHUB_`; `infra.yml` hands these to the container as `GITHUB_OAUTH_CLIENT_ID` and `GITHUB_OAUTH_CLIENT_SECRET`.) Then run **Provision infrastructure**. From then on `GET /auth/github` signs in, `POST /tokens {"name": "laptop"}` (with the session cookie) answers a `pst_…` secret once, and that secret goes into the laptop's `.env` as `PITSTOP_TOKEN`: the daemon sends it like the shared one. A signed-in user creates repositories under their own login (`POST /repos {"id": "<login>/<name>"}`) and becomes their owner; owners add members (`PUT /repos/<owner>/<name>/members/<login>` with `{"role": "writer"}`), cannot remove or demote the last owner, and can make a repository public. A repository with no members (every one the shared token made) is closed to users: the shared `PITSTOP_TOKEN`, the administrator's, adds its owner once that person has signed in. Only the administrator configures mirrors. In production the server refuses to start with neither the shared token nor accounts.
 
 **Git mirror (Phase 3)**
 
