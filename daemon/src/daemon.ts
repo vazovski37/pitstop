@@ -23,7 +23,7 @@ import { commit, CommitRejected } from "./commit.js";
 import { serverHeaders, streamUrl } from "./config.js";
 import { declareIntent } from "./intents.js";
 import type { Applier } from "./jj.js";
-import { readState, STATE_DIR, stateDir, withWorktreeLock, writeState } from "./state.js";
+import { readState, STATE_DIR, stateDir } from "./state.js";
 import { StreamClient, type Applied, type Warning } from "./stream.js";
 import { hasTsProject, symbolSets, type SymbolSets } from "./symbols.js";
 
@@ -155,17 +155,9 @@ export class Daemon {
     this.attachedUntil = Date.now() + (this.opts.attachMs ?? 10 * 60_000);
     const applied = await this.stream.applyPending();
     const notes = await this.notes(applied);
-    if (applied.length > 0) {
-      // The agent has now been told what landed and re-reads from here: its reads are checked
-      // from this LSN on, not from where its edits began, or an adapted commit would be refused
-      // for the same write skew again (found by the Phase 4 gate).
-      await withWorktreeLock(this.opts.worktree, async () => {
-        const state = await readState(this.opts.worktree);
-        if (state.readBaseLsn !== undefined && state.readBaseLsn < state.appliedLsn) {
-          await writeState(this.opts.worktree, { ...state, readBaseLsn: state.appliedLsn });
-        }
-      });
-    }
+    // The read base stays where the work began: the notes see the agent's edits, not what it read
+    // before editing, and that read-before-edit is the skew the server checks for. Only a skew
+    // refusal moves it (commit.ts), once the server has named what to re-read.
     return { applied: applied.map((a) => a.changeset.lsn), pending: this.stream.pending, notes };
   }
 
