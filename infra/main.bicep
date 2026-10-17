@@ -80,9 +80,10 @@ resource pg 'Microsoft.DBforPostgreSQL/flexibleServers@2022-12-01' = {
   name: pgName
   location: location
   sku: {
-    // Standard_B1ms had no capacity in Sweden Central (October 2026). Compute can be scaled back down in place.
-    name: 'Standard_B2s'
-    tier: 'Burstable'
+    // Burstable (B1ms, B2s) had no capacity in Sweden Central (October 2026). Compute can be scaled back
+    // down in place (sku name + tier) once it does.
+    name: 'Standard_D2ds_v5'
+    tier: 'GeneralPurpose'
   }
   properties: {
     version: '16'
