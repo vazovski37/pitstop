@@ -142,6 +142,27 @@ describe("GET /stream", () => {
     inbox.close();
   });
 
+  it("warns both agents when a new intent overlaps an open one", async () => {
+    const { app, url } = await listen();
+    const inbox = await connect(url);
+    await inbox.next(); // hello
+    inbox.send({ type: "subscribe", fromLsn: 0 });
+    await inbox.next(); // head
+    const declare = (agent: string, text: string, declaredSymbols: string[]) =>
+      app.inject({ method: "POST", url: "/intents", payload: { author: { developer: "d", agent }, baseLsn: 0, text, declaredSymbols } });
+    await declare("agent-a", "Fix the expired-session bug in auth", ["src/auth/session.ts#getCurrentUser"]);
+    expect(await inbox.next()).toMatchObject({ type: "intent", intent: { author: { agent: "agent-a" } } });
+
+    await declare("agent-b", "Show last-seen on the profile page", ["src/pages/ProfilePage.ts#renderProfile", "src/auth/session.ts#getCurrentUser"]);
+    expect(await inbox.next()).toMatchObject({ type: "intent", intent: { author: { agent: "agent-b" } } });
+    const first = await inbox.next();
+    const second = await inbox.next();
+    expect([first, second].map((m) => m.type)).toEqual(["warning", "warning"]);
+    expect(first).toMatchObject({ kind: "overlapping_intent", agent: "agent-b", symbols: ["src/auth/session.ts#getCurrentUser"] });
+    expect(second).toMatchObject({ kind: "overlapping_intent", agent: "agent-a" });
+    inbox.close();
+  });
+
   it("closes a socket that sends something other than a ClientMessage", async () => {
     const { url } = await listen();
     const inbox = await connect(url);

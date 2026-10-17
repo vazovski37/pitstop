@@ -1,5 +1,37 @@
-import type { Changeset, CommitRequest, Lsn, SymbolId } from "@pitstop/protocol";
+import type { Changeset, CommitRequest, Intent, Lsn, ServerMessage, SymbolId } from "@pitstop/protocol";
 import { GAP_LIMIT, RejectedCommit, SKIPPED_CHECKS, type Decision } from "./store.js";
+
+/**
+ * Early warnings (design doc 9.3): when a new intent declares symbols an open intent of the same
+ * repository already declared, both agents hear about it before either writes a line. One
+ * `warning` per pair, addressed to each side.
+ */
+export function overlapWarnings(intent: Intent, open: Intent[]): ServerMessage[] {
+  const mine = new Set(intent.declaredSymbols);
+  const warnings: ServerMessage[] = [];
+  for (const other of open) {
+    if (other.id === intent.id || other.status !== "open") continue;
+    const shared = other.declaredSymbols.filter((s) => mine.has(s));
+    if (shared.length === 0) continue;
+    warnings.push({
+      type: "warning",
+      repo: intent.repo,
+      agent: intent.author.agent,
+      kind: "overlapping_intent",
+      message: `${other.author.agent} is already working on ${shared.join(", ")} (intent: ${other.text}); expect a conflict unless you coordinate`,
+      symbols: shared,
+    });
+    warnings.push({
+      type: "warning",
+      repo: intent.repo,
+      agent: other.author.agent,
+      kind: "overlapping_intent",
+      message: `${intent.author.agent} just started on ${shared.join(", ")} (intent: ${intent.text})`,
+      symbols: shared,
+    });
+  }
+  return warnings;
+}
 
 /** What `PITSTOP_VALIDATE` allows: `off` appends anything, `warn` records write skew, `enforce` refuses it. */
 export type ValidationMode = "off" | "warn" | "enforce";

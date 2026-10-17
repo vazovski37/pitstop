@@ -30,7 +30,7 @@ import {
   type Store,
 } from "./store.js";
 import { Stream } from "./stream.js";
-import { decideCommit, describeSkew, type SkewVerdict, type ValidationMode } from "./validate.js";
+import { decideCommit, describeSkew, overlapWarnings, type SkewVerdict, type ValidationMode } from "./validate.js";
 
 export interface AppDeps {
   /** Version string shown on /healthz. The deploy smoke test compares it with the git SHA. */
@@ -198,6 +198,10 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
       const intent = await deps.store.openIntent(parsed.data);
       const message: ServerMessage = { type: "intent", intent };
       stream.broadcast(intent.repo, message);
+      // Early warnings (section 9.3): the demo's "auth is changing getCurrentUser" moment.
+      for (const warning of overlapWarnings(intent, await deps.store.openIntents(intent.repo))) {
+        stream.broadcast(intent.repo, warning);
+      }
       return reply.code(201).send(intent);
     } catch (err) {
       if (err instanceof InvalidCommit) return reply.code(400).send({ error: "invalid_request", message: err.message });

@@ -43,6 +43,8 @@ export interface Store {
   listRepos(): Promise<Repo[]>;
   /** An unknown repository is an `InvalidCommit`. */
   openIntent(req: IntentRequest): Promise<Intent>;
+  /** The repository's open intents: the catalog's live view (design doc 9.3), for early warnings. */
+  openIntents(repo: RepoId): Promise<Intent[]>;
   /** Refreshes an open intent's heartbeat. Unknown or closed intents are ignored. */
   heartbeat(intentId: string): Promise<void>;
   getMirror(repo: RepoId): Promise<Mirror | undefined>;
@@ -246,6 +248,10 @@ export class MemoryStore implements Store {
     };
     this.intents.set(intent.id, intent);
     return intent;
+  }
+
+  async openIntents(repo: RepoId): Promise<Intent[]> {
+    return [...this.intents.values()].filter((i) => i.repo === repo && i.status === "open");
   }
 
   async heartbeat(intentId: string): Promise<void> {

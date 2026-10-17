@@ -149,6 +149,16 @@ describe.skipIf(!url)("PgStore against a real Postgres", () => {
     expect((await store.listRepos()).map((r) => r.id)).toEqual(expect.arrayContaining([DEFAULT_REPO, other]));
   });
 
+  it("lists a repository's open intents", async () => {
+    const a = await store.openIntent({ author: { developer: "vazovski", agent: "agent-a" }, baseLsn: 0, text: "open one", declaredSymbols: ["src/a.ts#a"] });
+    const b = await store.openIntent({ author: { developer: "teammate", agent: "agent-b" }, baseLsn: 0, text: "open two", declaredSymbols: [] });
+    await store.append(request("closes-b", 0, { intentId: b.id }));
+    const open = await store.openIntents(DEFAULT_REPO);
+    expect(open.map((i) => i.id)).toContain(a.id);
+    expect(open.map((i) => i.id)).not.toContain(b.id);
+    expect(open.find((i) => i.id === a.id)).toMatchObject({ repo: DEFAULT_REPO, status: "open", declaredSymbols: ["src/a.ts#a"], text: "open one" });
+  });
+
   it("keeps a mirror per repository", async () => {
     const config = { githubRepo: "vazovski37/pitstop", branch: "main", baseCommit: "a".repeat(40) };
     const mirror = await store.setMirror(DEFAULT_REPO, config);

@@ -270,6 +270,32 @@ export class PgStore implements Store {
     };
   }
 
+  async openIntents(repo: RepoId): Promise<Intent[]> {
+    const res = await this.pool.query<{
+      id: string;
+      developer: string;
+      agent: string;
+      base_lsn: number;
+      text: string;
+      declared_symbols: string[];
+      heartbeat_at: Date;
+    }>(
+      `select id, developer, agent, base_lsn::int as base_lsn, text, declared_symbols, heartbeat_at
+       from intents where repo = $1 and status = 'open' order by created_at`,
+      [repo],
+    );
+    return res.rows.map((row) => ({
+      id: row.id,
+      repo,
+      author: { developer: row.developer, agent: row.agent },
+      baseLsn: row.base_lsn,
+      text: row.text,
+      declaredSymbols: row.declared_symbols,
+      status: "open",
+      heartbeatAt: row.heartbeat_at.toISOString(),
+    }));
+  }
+
   async heartbeat(intentId: string): Promise<void> {
     await this.pool.query("update intents set heartbeat_at = now() where id = $1 and status = 'open'", [intentId]);
   }
