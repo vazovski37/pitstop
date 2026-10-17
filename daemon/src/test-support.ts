@@ -49,7 +49,8 @@ export class FakeApplier implements Applier {
   async apply(changeset: Changeset): Promise<ApplyResult> {
     if (changeset.lsn === this.failOn) throw new Error(`cannot apply #${changeset.lsn}`);
     this.applied.push(changeset);
-    return { commit: `commit-${changeset.lsn}`, conflicted: this.conflictOn === changeset.lsn ? ["zzzz"] : [], conflictedFiles: this.conflictOn === changeset.lsn ? ["a.txt"] : [] };
+    const conflict = this.conflictOn === changeset.lsn;
+    return { commit: `commit-${changeset.lsn}`, conflicted: conflict ? ["zzzz"] : [], conflictedFiles: conflict ? ["a.txt"] : [], resolved: [] };
   }
 
   async diffAgainstMain(): Promise<FileChange[]> {

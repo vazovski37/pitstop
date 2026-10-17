@@ -273,6 +273,9 @@ export class Daemon {
       }
       if (touched.length > 0 && parts.length === 0) parts.push(`touched ${touched.join(", ")}, which you are editing`);
       if (parts.length > 0) notes.push(`#${e.lsn} "${e.intent}" ${parts.join("; ")}`);
+      if (result.resolved.length > 0) {
+        notes.push(`#${e.lsn} conflicted with your edits in ${result.resolved.join(", ")}; Mergiraf merged them by structure, so check those files`);
+      }
       if (result.conflictedFiles.length > 0) {
         notes.push(`#${e.lsn} left conflict markers in ${result.conflictedFiles.join(", ")}: resolve them before you commit`);
       } else if (result.conflicted.length > 0) {
