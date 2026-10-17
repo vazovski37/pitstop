@@ -2,7 +2,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { DEFAULT_REPO, type Author, type Changeset, type ServerMessage } from "@pitstop/protocol";
+import { DEFAULT_REPO, type Changeset, type ServerMessage } from "@pitstop/protocol";
 import { cloneRepository, prepareWorktree } from "./clone.js";
 import { readFileConfig } from "./config.js";
 import { run } from "./exec.js";
@@ -11,7 +11,6 @@ import { binariesFromEnv, blobHash, JjWorktree } from "./jj.js";
 import { readState } from "./state.js";
 import { entryAt, FakeApplier, removeDir, tempDir } from "./test-support.js";
 
-const author: Author = { developer: "teammate", agent: "agent-b" };
 
 /** A two-entry log for `teamdb/demo`: an import of two files, then a change to one of them. */
 const log: Changeset[] = [
@@ -58,7 +57,7 @@ describe("pitstop clone", () => {
 
   it("fetches the log, replays every entry in order and leaves config and state behind", async () => {
     const lines: string[] = [];
-    const result = await cloneRepository({ serverUrl: server.url, token: "t1", repo: "teamdb/demo", dir, author, log: (l) => lines.push(l) }, hooks);
+    const result = await cloneRepository({ serverUrl: server.url, token: "t1", repo: "teamdb/demo", dir, log: (l) => lines.push(l) }, hooks);
     expect(result).toMatchObject({ dir, entries: 2, repo: { id: "teamdb/demo", headLsn: 2 } });
     expect(applier.lsns).toEqual([1, 2]);
     expect(await readFileConfig(dir)).toEqual({ serverUrl: server.url, token: "t1", repo: "teamdb/demo" });
@@ -67,15 +66,15 @@ describe("pitstop clone", () => {
   });
 
   it("refuses an unknown repository and a directory that is not empty", async () => {
-    await expect(cloneRepository({ serverUrl: server.url, repo: "nobody/nothing", dir, author }, hooks)).rejects.toThrow(/no repository nobody\/nothing/);
+    await expect(cloneRepository({ serverUrl: server.url, repo: "nobody/nothing", dir }, hooks)).rejects.toThrow(/no repository nobody\/nothing/);
     await mkdir(dir, { recursive: true });
     await writeFile(join(dir, "x"), "x");
-    await expect(cloneRepository({ serverUrl: server.url, repo: "teamdb/demo", dir, author }, hooks)).rejects.toThrow(/not empty/);
+    await expect(cloneRepository({ serverUrl: server.url, repo: "teamdb/demo", dir }, hooks)).rejects.toThrow(/not empty/);
     expect(applier.lsns).toEqual([]);
   });
 
   it("works for the default repository without a repo query", async () => {
-    await cloneRepository({ serverUrl: server.url, repo: DEFAULT_REPO, dir, author }, hooks);
+    await cloneRepository({ serverUrl: server.url, repo: DEFAULT_REPO, dir }, hooks);
     expect(applier.lsns).toEqual([1, 2]);
     expect(await readFileConfig(dir)).toEqual({ serverUrl: server.url, repo: DEFAULT_REPO });
   });
@@ -103,7 +102,7 @@ describe.skipIf(!available)("pitstop clone into a real colocated worktree", { ti
 
   it("replays the log into files, commits and a working copy the daemon can continue from", async () => {
     const dir = join(base, "one");
-    const result = await cloneRepository({ serverUrl: server.url, repo: "teamdb/demo", dir, author, bin });
+    const result = await cloneRepository({ serverUrl: server.url, repo: "teamdb/demo", dir, bin });
     expect(result.entries).toBe(2);
     expect(await readFile(join(dir, "a.txt"), "utf8")).toBe("a1\na3\n");
     expect(await readFile(join(dir, "src", "b.ts"), "utf8")).toBe("export const b = 1;\n");
@@ -117,7 +116,7 @@ describe.skipIf(!available)("pitstop clone into a real colocated worktree", { ti
 
     // a second clone of the same log agrees on every commit id
     const other = join(base, "two");
-    await cloneRepository({ serverUrl: server.url, repo: "teamdb/demo", dir: other, author, bin });
+    await cloneRepository({ serverUrl: server.url, repo: "teamdb/demo", dir: other, bin });
     expect((await run(bin.git, ["rev-parse", "main"], { cwd: other })).trim()).toBe((await git("rev-parse", "main")).trim());
   });
 

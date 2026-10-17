@@ -1,6 +1,6 @@
 # mcp/ — agent integration
 
-Owner: **teammate**.
+Owner: **Vazovski** (since 18 October 2026; built by the teammate through Phase 4).
 
 ## What this folder does
 Connects coding agents (Claude Code for the hackathon) to the daemon: MCP tools the agent calls, and the hook that marks safe points. Design reference: the technical design doc (written when the project was called Agent Git), sections 8.3, 10 and 13.

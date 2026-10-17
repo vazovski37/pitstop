@@ -1,6 +1,6 @@
 # daemon/ — the local replica
 
-Owner: **teammate**. Vazovski's Claude does not edit this folder.
+Owner: **Vazovski** (since 18 October 2026; built by the teammate through Phase 4). Keep `README.md` here, the guide for other teams, in step with the CLI (`src/index.ts`, `USAGE`).
 
 ## What this folder does
 One process per worktree. It keeps the local folder in sync with the server's log and turns the agent's edits into commits. Design reference: the technical design doc (written when the project was called Agent Git), sections 6.3, 8 and 13.1.
@@ -30,7 +30,7 @@ In a worktree that is `jj git init --colocate`d with a `main` bookmark:
 - `pitstop import` by hand: every tracked text file as an add at base LSN 0, so the server can rebuild the tree at any entry (the type-check gate needs that).
 - `pitstop daemon` (`npm run dev -w @pitstop/daemon -- daemon` from the repo) connects to `PITSTOP_SERVER` (default `http://localhost:8080`), subscribes from the LSN in `.pitstop/state.json`, applies entries in order and stops on the first failure. When it applies an entry over unfinished edits in `@`, it records the LSN those edits began at (`readBaseLsn` in the state file).
 - `pitstop commit -m "<intent>"` sends `@` against `main` as a `CommitRequest` with file contents, the read and write sets from `symbols.ts` (empty when the worktree has no `tsconfig.json`), and `readBaseLsn` when the daemon recorded one. If the accepted entry is the next one for this worktree it is applied at once; otherwise the running daemon applies it in order.
-- Environment: `PITSTOP_TOKEN`, `PITSTOP_DEVELOPER`, `PITSTOP_AGENT`, and `PITSTOP_JJ_BIN` / `PITSTOP_GIT_BIN` when the executables are not on PATH.
+- Environment: `PITSTOP_SERVER`, `PITSTOP_TOKEN`, `PITSTOP_REPO` (each wins over `.pitstop/config.json`), `PITSTOP_DEVELOPER`, `PITSTOP_AGENT`, `PITSTOP_DAEMON_PORT` (the local API's port; default a free one), and `PITSTOP_JJ_BIN` / `PITSTOP_GIT_BIN` / `PITSTOP_MERGIRAF_BIN` when the executables are not on PATH. `README.md` lists the same set for other teams.
 - No server at hand: `npm run fake-server -w @pitstop/daemon` replays `packages/protocol/fixtures/server-messages.json` on port 8081 and accepts commits; with `PITSTOP_FAKE_LOG=empty` it starts with no entries, so an import becomes #1 as on a new server. The tests use the same fake (`src/fake-server.ts`); the ones against a real jj repo (`src/jj.test.ts`) skip themselves where jj is not installed.
 
 Symbol sets (`symbols.ts`): two TypeScript programs from the worktree's own `tsconfig.json`, the tree at `main` and the tree at `@`, both in memory. A symbol is a top-level declaration or a class member, `path#qualified.name`. Write set: text changed, added or removed. Signature write set: the checker's signature or type string changed, or the symbol was removed. Read set: every project symbol a changed declaration refers to, types included, lib and `node_modules` excluded. A declaration's text excludes the comments above it, so a doc-comment-only edit is not a write; whitespace inside the declaration is. `src/symbols.test.ts` runs the two laptops' edits from `demo/scenario.md` against `demo/teamdb`.
