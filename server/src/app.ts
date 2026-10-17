@@ -64,7 +64,8 @@ const LOG_PAGE_MAX = 500;
  * so tests can call it with `app.inject()` and fake dependencies.
  */
 export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
-  const app = Fastify({ logger: deps.logger ?? false });
+  // A commit carries whole files, and an import carries a whole repository: well past Fastify's 1 MiB default.
+  const app = Fastify({ logger: deps.logger ?? false, bodyLimit: 32 * 1024 * 1024 });
   await app.register(websocket);
   const stream = new Stream(deps.store, deps.version, app.log);
 
