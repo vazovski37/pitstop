@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { Changeset, CommitRequest } from "@pitstop/protocol";
 import { GAP_LIMIT, RejectedCommit, SKIPPED_CHECKS } from "./store.js";
-import { decideCommit, validate } from "./validate.js";
+import { decideCommit, overlapWarnings, validate } from "./validate.js";
 
 // The demo scenario (demo/scenario.md): #121 fixes auth and changes getCurrentUser's signature;
 // the profile commit, begun at #120, read getCurrentUser.
@@ -87,6 +87,43 @@ describe("validate", () => {
     const later = entry(122, { files: [{ path: "src/utils/timeAgo.ts", op: "modify" }], writeSet: ["src/utils/timeAgo.ts#timeAgo"] });
     const verdict = validate(profile(), [authFix, later]);
     expect(verdict).toMatchObject({ kind: "skew", conflictsWith: [121, 122] });
+  });
+});
+
+describe("overlapWarnings", () => {
+  const intentOf = (id: string, agent: string, text: string, declaredSymbols: string[], status: "open" | "committed" = "open") => ({
+    id,
+    repo: "teamdb/demo",
+    author: { developer: agent === "agent-a" ? "vazovski" : "teammate", agent },
+    baseLsn: 120,
+    text,
+    declaredSymbols,
+    status,
+    heartbeatAt: "2026-10-17T14:18:00Z",
+  });
+  const auth = intentOf("int_01", "agent-a", "Fix session expiry in getCurrentUser", ["src/auth/session.ts#getCurrentUser"]);
+
+  it("warns both agents when a new intent declares a symbol an open one already declared", () => {
+    const profile = intentOf("int_02", "agent-b", "Show last-seen on the profile page", ["src/pages/ProfilePage.ts#renderProfile", "src/auth/session.ts#getCurrentUser"]);
+    const warnings = overlapWarnings(profile, [auth, profile]);
+    expect(warnings).toHaveLength(2);
+    expect(warnings[0]).toMatchObject({
+      type: "warning",
+      repo: "teamdb/demo",
+      agent: "agent-b",
+      kind: "overlapping_intent",
+      symbols: ["src/auth/session.ts#getCurrentUser"],
+    });
+    expect((warnings[0] as { message: string }).message).toContain("agent-a is already working on src/auth/session.ts#getCurrentUser (intent: Fix session expiry in getCurrentUser)");
+    expect(warnings[1]).toMatchObject({ agent: "agent-a", kind: "overlapping_intent", symbols: ["src/auth/session.ts#getCurrentUser"] });
+  });
+
+  it("stays quiet for disjoint, closed or the same intent", () => {
+    const disjoint = intentOf("int_03", "agent-b", "Show last-seen", ["src/pages/ProfilePage.ts#renderProfile"]);
+    expect(overlapWarnings(disjoint, [auth, disjoint])).toEqual([]);
+    const closed = intentOf("int_04", "agent-a", "done", ["src/pages/ProfilePage.ts#renderProfile"], "committed");
+    expect(overlapWarnings(disjoint, [closed])).toEqual([]);
+    expect(overlapWarnings(auth, [auth])).toEqual([]);
   });
 });
 
