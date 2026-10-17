@@ -68,6 +68,24 @@ GitHub → Settings → Collaborators → invite. They need no Azure access at a
 
 ---
 
+## Second laptop
+
+Any other computer (yours or your teammate's) needs only the tools from step 1 (Azure CLI not required) and access to the GitHub repo. No Azure login, no bootstrap: deploys still happen only through GitHub Actions.
+
+```bash
+git clone https://github.com/<you>/pitstop && cd pitstop
+cp .env.example .env
+npm install
+npm run db:up               # local Postgres with pgvector on port 5432
+npm test
+jj git init --colocate      # optional: jj and git share the same folder
+```
+
+- If `db:up` fails with `port is already allocated`, another Postgres on that computer is using port 5432; stop it first.
+- `npm test` skips the migration tests unless `DATABASE_URL` is set in the shell: `DATABASE_URL=postgresql://pitstop:pitstop@localhost:5432/pitstop npm test`.
+
+---
+
 ## Every day (both of you)
 
 ```bash
