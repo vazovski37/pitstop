@@ -42,6 +42,7 @@ import {
   SKIPPED_CHECKS,
   withBlobHashes,
   type Decision,
+  type Parked as ParkedCommit,
   type RejectReason,
   type Role,
   type Store,
@@ -49,6 +50,16 @@ import {
 } from "./store.js";
 import { Stream, type Worktree } from "./stream.js";
 import { decideCommit, describeSkew, overlapWarnings, type SkewVerdict, type ValidationMode } from "./validate.js";
+
+/** Thrown inside an append when write skew must wait for the repository's resolver. */
+class Parked extends Error {
+  constructor(
+    readonly skew: SkewVerdict,
+    readonly head: number,
+  ) {
+    super("parked for the resolver");
+  }
+}
 
 export interface AppDeps {
   /** Version string shown on /healthz. The deploy smoke test compares it with the git SHA. */
@@ -196,6 +207,67 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     void reply.code(code).send({ error: code === 401 ? "unauthorized" : "forbidden", message: "only the server's administrator may do this" });
     return false;
   };
+  /**
+   * Like `guard`, but a repository the caller may not even read answers 404, the same as one
+   * that does not exist: the answer must not tell strangers which private names are taken.
+   */
+  const access = async (req: FastifyRequest, reply: FastifyReply, repo: string, role: Role): Promise<boolean> => {
+    if ((await deps.store.getRepo(repo)) === undefined || !(await allowed(req.identity, repo, "reader", deps.store, auth))) {
+      await reply.code(404).send({ error: "unknown_repo" });
+      return false;
+    }
+    return guard(req, reply, repo, role);
+  };
+  /** Who decides on the repository's write skew: its resolvers, else its owners. */
+  const decidersOf = async (repo: string): Promise<{ userId: string; login: string }[]> => {
+    const members = await deps.store.listMembers(repo);
+    const resolvers = members.filter((m) => m.resolver);
+    return resolvers.length > 0 ? resolvers : members.filter((m) => m.role === "owner");
+  };
+  /**
+   * The open parked commit a decision is about, when the caller may decide on it (one of its
+   * deciders, or the administrator); otherwise answers and returns undefined.
+   */
+  const decision = async (req: FastifyRequest, reply: FastifyReply, repo: string, id: string): Promise<{ parked: ParkedCommit; login: string } | undefined> => {
+    if (!(await access(req, reply, repo, "reader"))) return undefined;
+    const parked = await deps.store.getParked(repo, id);
+    if (parked === undefined) {
+      await reply.code(404).send({ error: "not_found" });
+      return undefined;
+    }
+    if (parked.status !== "open") {
+      await reply.code(409).send({ error: "decided", message: `${id} was already decided (${parked.status})` });
+      return undefined;
+    }
+    const user = currentUser(req);
+    const deciders = await decidersOf(repo);
+    if (!isAdmin(req.identity, auth) && !(user !== undefined && deciders.some((d) => d.userId === user.id))) {
+      await reply.code(403).send({ error: "forbidden", message: `only this repository's resolver decides (${deciders.map((d) => d.login).join(", ") || "its owners"})` });
+      return undefined;
+    }
+    return { parked, login: user?.login ?? "the administrator" };
+  };
+  /** A parked commit as the website shows it: the request's files without their contents' bulk. */
+  const parkedView = (p: ParkedCommit) => ({
+    id: p.id,
+    status: p.status,
+    intent: p.request.intent,
+    author: p.author,
+    files: p.request.files.map((f) => ({ path: f.path, op: f.op, ...(f.fromPath === undefined ? {} : { fromPath: f.fromPath }), ...(f.content === undefined ? {} : { content: f.content }) })),
+    skew: p.skew,
+    conflictsWith: p.conflictsWith,
+    headLsn: p.headLsn,
+    createdAt: p.createdAt,
+    ...(p.note === undefined ? {} : { note: p.note }),
+    ...(p.decidedBy === undefined ? {} : { decidedBy: p.decidedBy }),
+    ...(p.landedLsn === undefined ? {} : { landedLsn: p.landedLsn }),
+    ...(p.decidedAt === undefined ? {} : { decidedAt: p.decidedAt }),
+  });
+  /** This server's address as a browser sees it, for links in messages. */
+  const siteUrl = (req: FastifyRequest): string => {
+    const proto = (req.headers["x-forwarded-proto"] as string | undefined) ?? req.protocol;
+    return auth.publicUrl ?? `${proto}://${req.headers.host ?? "localhost"}`;
+  };
   /** Whether `userId` is the repository's only owner, so taking their ownership away would orphan it. */
   const lastOwner = async (repo: string, userId: string): Promise<boolean> => {
     const owners = (await deps.store.listMembers(repo)).filter((m) => m.role === "owner");
@@ -292,17 +364,39 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     if (!parsed.success) return rejected(reply, "invalid_request", issues(parsed.error));
     const repo = repoOf(parsed.data);
     if (!(await guard(req, reply, repo, "writer"))) return reply;
+    // A personal token names the developer; the daemon's own word is kept only for the shared token.
+    const user = currentUser(req);
+    const author = user === undefined ? parsed.data.author : { ...parsed.data.author, developer: user.login };
+    let request: CommitRequest;
     try {
-      // A personal token names the developer; the daemon's own word is kept only for the shared token.
-      const user = currentUser(req);
-      const author = user === undefined ? parsed.data.author : { ...parsed.data.author, developer: user.login };
-      const request: CommitRequest = { ...withBlobHashes(parsed.data), repo, author };
+      request = { ...withBlobHashes(parsed.data), repo, author };
+    } catch (err) {
+      if (err instanceof InvalidCommit) return rejected(reply, "invalid_request", err.message);
+      throw err;
+    }
+    // A commit waiting for the repository's resolver holds its author's next one, or the author
+    // could land the same change past the resolver by committing it again.
+    const waiting = await deps.store.openParkedBy(repo, author);
+    if (waiting !== undefined) {
+      return rejected(
+        reply,
+        "constraint_failed",
+        `your commit "${waiting.request.intent}" (${waiting.id}) is waiting for this repository's resolver; you will be told at a safe point whether it landed or what to change`,
+      );
+    }
+    // In agent mode a repository with members has people who decide on write skew (its resolvers,
+    // else its owners); the commit waits for them instead of bouncing back to its own agent. When
+    // the committer is the only one who could decide, it bounces back as before.
+    const deciders = repair === "agent" ? await decidersOf(repo) : [];
+    const parks = deciders.length > 0 && !(user !== undefined && deciders.every((d) => d.userId === user.id));
+    try {
       let skew: SkewVerdict | undefined;
       const changeset = await deps.store.append(request, async (gap, head): Promise<Decision> => {
         // With a resolver, the validator only reports skew; what happens to it is decided here.
         const outcome = decideCommit(request, gap, head, repair === "off" ? mode : "warn");
         let decision = outcome.decision;
         if (outcome.skew !== undefined && repair !== "off") {
+          if (repair === "agent" && parks) throw new Parked(outcome.skew, head);
           // `agent`: the coding agent that committed is the resolver; it gets told what changed.
           // No trees needed for that, and reading them here would ask the pool for a second
           // connection while this one holds the repository's lock.
@@ -347,11 +441,104 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
       const body: CommitResponse = { status: "accepted", changeset };
       return reply.code(200).send(body);
     } catch (err) {
+      if (err instanceof Parked) {
+        // Recorded after the append rolled back: the lock is free while people decide.
+        const parked = await deps.store.park({
+          repo,
+          ...(user === undefined ? {} : { userId: user.id }),
+          request,
+          skew: describeSkew(err.skew),
+          conflictsWith: err.skew.conflictsWith,
+          headLsn: err.head,
+        });
+        const who = deciders.map((d) => d.login).join(", ");
+        stream.broadcast(repo, {
+          type: "warning",
+          repo,
+          agent: author.agent,
+          kind: "dependency_changed",
+          message: `"${request.intent}" by ${author.developer} waits for ${who}: write skew, ${parked.skew} (${parked.id})`,
+          symbols: err.skew.symbols.map((s) => s.symbolId),
+        });
+        return rejected(
+          reply,
+          "escalated",
+          `write skew: ${parked.skew}. This repository's resolver (${who}) decides on it: your commit waits as ${parked.id} at ${siteUrl(req)}/#/r/${repo}/conflicts. Do not commit this change again; at a later safe point you will be told whether it landed or what to change.`,
+          err.skew.conflictsWith,
+        );
+      }
       if (err instanceof InvalidCommit) return rejected(reply, "invalid_request", err.message);
       if (err instanceof RejectedCommit) return rejected(reply, err.reason, err.message, err.conflictsWith);
       throw err;
     }
   });
+
+  // The repository's waiting commits: newest first, open ones on top.
+  app.get<RepoParams>("/repos/:owner/:name/parked", async (req, reply) => {
+    const repo = repoParam(req);
+    if (!(await access(req, reply, repo, "reader"))) return reply;
+    const all = await deps.store.listParked(repo);
+    return [...all.filter((p) => p.status === "open"), ...all.filter((p) => p.status !== "open")].map(parkedView);
+  });
+
+  // A resolver lets a waiting commit land as it is, write skew and all, under their name.
+  app.post<{ Params: { owner: string; name: string; id: string } }>("/repos/:owner/:name/parked/:id/accept", async (req, reply) => {
+    const repo = `${req.params.owner}/${req.params.name}`;
+    const decided = await decision(req, reply, repo, req.params.id);
+    if (decided === undefined) return reply;
+    const { parked, login } = decided;
+    try {
+      const changeset = await deps.store.append(parked.request, (gap, head) => {
+        // Writes are still checked: a file someone changed since cannot be overwritten blind.
+        const outcome = decideCommit(parked.request, gap, head, "warn");
+        const found = outcome.skew === undefined ? parked.skew : describeSkew(outcome.skew);
+        return {
+          ...outcome.decision,
+          checks: { ...SKIPPED_CHECKS, details: `write skew accepted by ${login}: ${found}` },
+          repairs: [{ againstLsn: parked.conflictsWith.at(-1) ?? head, kind: "semantic", summary: `write skew accepted as is by ${login}` }],
+        };
+      });
+      await deps.store.decideParked(repo, parked.id, { status: "accepted", decidedBy: login, landedLsn: changeset.lsn });
+      stream.notify(repo);
+      mirrors?.kick(repo);
+      stream.broadcast(repo, {
+        type: "warning",
+        repo,
+        agent: parked.author.agent,
+        kind: "dependency_changed",
+        message: `${login} let "${parked.request.intent}" (${parked.id}) through: it landed as #${changeset.lsn}. Nothing to commit again for it.`,
+        symbols: [],
+      });
+      return { ...parkedView({ ...parked, status: "accepted", decidedBy: login, landedLsn: changeset.lsn }), changeset };
+    } catch (err) {
+      if (err instanceof RejectedCommit || err instanceof InvalidCommit) {
+        return reply.code(409).send({ error: "cannot_land", message: `${err.message}. Send it back instead.` });
+      }
+      throw err;
+    }
+  });
+
+  // A resolver sends a waiting commit back to its author with a note; the author's agent adapts.
+  app.post<{ Params: { owner: string; name: string; id: string }; Body: { note?: unknown } }>(
+    "/repos/:owner/:name/parked/:id/send-back",
+    async (req, reply) => {
+      const repo = `${req.params.owner}/${req.params.name}`;
+      const decided = await decision(req, reply, repo, req.params.id);
+      if (decided === undefined) return reply;
+      const { parked, login } = decided;
+      const note = typeof req.body?.note === "string" ? req.body.note.trim().slice(0, 2000) : "";
+      await deps.store.decideParked(repo, parked.id, { status: "sent_back", decidedBy: login, ...(note === "" ? {} : { note }) });
+      stream.broadcast(repo, {
+        type: "warning",
+        repo,
+        agent: parked.author.agent,
+        kind: "dependency_changed",
+        message: `${login} sent "${parked.request.intent}" (${parked.id}) back${note === "" ? "" : `: ${note}`}. Re-read what changed (${parked.skew}), adapt your change, and commit again.`,
+        symbols: [],
+      });
+      return parkedView({ ...parked, status: "sent_back", decidedBy: login, ...(note === "" ? {} : { note }) });
+    },
+  );
 
   // Opens a transaction (section 6.2, step 1) and tells every worktree about it.
   app.post("/intents", async (req, reply) => {
@@ -382,18 +569,15 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     if (!id.success) return reply.code(400).send({ error: "invalid_request", message: "id must be owner/name in lowercase" });
     if (req.identity.kind === "anonymous" && accounts) return reply.code(401).send({ error: "unauthorized", message: "sign in to create a repository" });
     const user = currentUser(req);
+    // Idempotent for whoever may read it (pitstop init runs it every time, a member's included).
+    const existing = await deps.store.getRepo(id.data);
+    if (existing !== undefined && (await allowed(req.identity, existing.id, "reader", deps.store, auth))) return reply.code(200).send(existing);
     // A user creates repositories under their own GitHub login, so nobody can squat another's
     // name; the administrator may use any owner.
     if (user !== undefined && id.data.split("/")[0] !== user.login.toLowerCase()) {
       return reply.code(403).send({ error: "forbidden", message: `repositories are created under your login: ${user.login.toLowerCase()}/<name>` });
     }
-    const existing = await deps.store.getRepo(id.data);
-    if (existing !== undefined) {
-      // Idempotent for whoever may read it (pitstop init runs it every time); a name taken by
-      // someone else says only that.
-      if (await allowed(req.identity, existing.id, "reader", deps.store, auth)) return reply.code(200).send(existing);
-      return reply.code(409).send({ error: "taken", message: `${id.data} already exists` });
-    }
+    if (existing !== undefined) return reply.code(409).send({ error: "taken", message: `${id.data} already exists` });
     const { repo, created } = await deps.store.createRepo(id.data);
     if (created && user !== undefined) await deps.store.setMember(repo.id, user.id, "owner");
     return reply.code(created ? 201 : 200).send(repo);
@@ -406,16 +590,13 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   });
 
   app.get<RepoParams>("/repos/:owner/:name", async (req, reply) => {
-    const repo = await deps.store.getRepo(repoParam(req));
-    if (repo === undefined) return reply.code(404).send({ error: "unknown_repo" });
-    if (!(await guard(req, reply, repo.id, "reader"))) return reply;
-    return repo;
+    if (!(await access(req, reply, repoParam(req), "reader"))) return reply;
+    return deps.store.getRepo(repoParam(req));
   });
 
   app.patch<RepoParams>("/repos/:owner/:name", async (req, reply) => {
-    const repo = await deps.store.getRepo(repoParam(req));
-    if (repo === undefined) return reply.code(404).send({ error: "unknown_repo" });
-    if (!(await guard(req, reply, repo.id, "owner"))) return reply;
+    if (!(await access(req, reply, repoParam(req), "owner"))) return reply;
+    const repo = (await deps.store.getRepo(repoParam(req))) as Repo;
     const parsed = RepoPatch.safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: "invalid_request", message: issues(parsed.error) });
     await deps.store.setVisibility(repo.id, parsed.data.visibility);
@@ -425,8 +606,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   // The replicas: what each connected daemon has applied, from its heartbeats (stream.ts), against the head.
   app.get<RepoParams>("/repos/:owner/:name/worktrees", async (req, reply) => {
     const repo = repoParam(req);
-    if ((await deps.store.getRepo(repo)) === undefined) return reply.code(404).send({ error: "unknown_repo" });
-    if (!(await guard(req, reply, repo, "reader"))) return reply;
+    if (!(await access(req, reply, repo, "reader"))) return reply;
     const intents = new Map((await deps.store.openIntents(repo)).map((i) => [i.id, i]));
     const body: WorktreesResponse = {
       headLsn: await deps.store.headLsn(repo),
@@ -440,8 +620,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
 
   app.get<RepoParams>("/repos/:owner/:name/members", async (req, reply) => {
     const repo = repoParam(req);
-    if ((await deps.store.getRepo(repo)) === undefined) return reply.code(404).send({ error: "unknown_repo" });
-    if (!(await guard(req, reply, repo, "reader"))) return reply;
+    if (!(await access(req, reply, repo, "reader"))) return reply;
     const members = (await deps.store.listMembers(repo)).map((m) => ({ login: m.login, role: m.role, ...(m.resolver ? { resolver: true } : {}) }));
     const invites = (await deps.store.listInvites(repo)).map((i) => ({ login: i.login, role: i.role, pending: true }));
     return [...members, ...invites];
@@ -449,8 +628,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
 
   app.put<{ Params: { owner: string; name: string; login: string } }>("/repos/:owner/:name/members/:login", async (req, reply) => {
     const repo = `${req.params.owner}/${req.params.name}`;
-    if ((await deps.store.getRepo(repo)) === undefined) return reply.code(404).send({ error: "unknown_repo" });
-    if (!(await guard(req, reply, repo, "owner"))) return reply;
+    if (!(await access(req, reply, repo, "owner"))) return reply;
     const parsed = MemberBody.safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: "invalid_request", message: issues(parsed.error) });
     const login = GitHubLogin.safeParse(req.params.login);
@@ -472,10 +650,9 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
 
   app.delete<{ Params: { owner: string; name: string; login: string } }>("/repos/:owner/:name/members/:login", async (req, reply) => {
     const repo = `${req.params.owner}/${req.params.name}`;
-    if ((await deps.store.getRepo(repo)) === undefined) return reply.code(404).send({ error: "unknown_repo" });
-    // Owners remove anyone; a member may remove themselves (leave).
-    const leaving = currentUser(req)?.login === req.params.login;
-    if (!(await guard(req, reply, repo, leaving ? "reader" : "owner"))) return reply;
+    // Owners remove anyone; a member may remove themselves (leave). GitHub logins are case-insensitive.
+    const leaving = currentUser(req)?.login.toLowerCase() === req.params.login.toLowerCase();
+    if (!(await access(req, reply, repo, leaving ? "reader" : "owner"))) return reply;
     const user = await deps.store.getUserByLogin(req.params.login);
     if (user !== undefined && (await lastOwner(repo, user.id))) {
       return reply.code(409).send({ error: "last_owner", message: "a repository needs an owner: make someone else owner first" });
@@ -491,10 +668,10 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
       return reply.code(501).send({ error: "no_mirror", message: "set MIRROR_GITHUB_TOKEN on the server to mirror repositories" });
     }
     const repo = repoParam(req);
-    if ((await deps.store.getRepo(repo)) === undefined) return reply.code(404).send({ error: "unknown_repo" });
     // One server-wide GitHub token pushes every mirror, so only the administrator may aim it:
     // a repository owner could otherwise point it at any branch that token can write.
     if (!adminOnly(req, reply)) return reply;
+    if ((await deps.store.getRepo(repo)) === undefined) return reply.code(404).send({ error: "unknown_repo" });
     const parsed = MirrorBody.safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: "invalid_request", message: issues(parsed.error) });
     const baseCommit = parsed.data.baseCommit ?? (await deps.github.getRef(parsed.data.github, parsed.data.branch));
@@ -505,9 +682,9 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
 
   app.get<RepoParams>("/repos/:owner/:name/mirror", async (req, reply) => {
     const repo = repoParam(req);
+    if (!(await access(req, reply, repo, "reader"))) return reply;
     const mirror = await deps.store.getMirror(repo);
     if (mirror === undefined) return reply.code(404).send({ error: "no_mirror" });
-    if (!(await guard(req, reply, repo, "reader"))) return reply;
     return mirror;
   });
 
@@ -524,8 +701,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     if (!repo.success) return reply.code(400).send({ error: "invalid_request", message: "repo must be owner/name in lowercase" });
     const fromLsn = Lsn.safeParse(Number(req.query.fromLsn ?? 0));
     if (!fromLsn.success) return reply.code(400).send({ error: "invalid_request", message: "fromLsn must be an LSN" });
-    if ((await deps.store.getRepo(repo.data)) === undefined) return reply.code(404).send({ error: "unknown_repo" });
-    if (!(await guard(req, reply, repo.data, "reader"))) return reply;
+    if (!(await access(req, reply, repo.data, "reader"))) return reply;
     const limit = Math.min(Math.max(Math.trunc(Number(req.query.limit)) || LOG_PAGE, 1), LOG_PAGE_MAX);
     const entries: Changeset[] = await deps.store.entriesAfter(repo.data, fromLsn.data, limit);
     return entries;
@@ -539,8 +715,15 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
       socket.close(1008, "cross-origin stream refused");
       return;
     }
-    stream.connect(socket, (repo) => allowed(identity, repo, "reader", deps.store, auth));
+    const presented = presentedToken(req);
+    stream.connect(socket, async (repo) => {
+      if (presented?.startsWith("pst_") && (await deps.store.userForToken(presented)) === undefined) return false;
+      return allowed(identity, repo, "reader", deps.store, auth);
+    });
   });
+
+  // Fastify's default 404 logs the URL with its query string; this one logs nothing.
+  app.setNotFoundHandler((_req, reply) => reply.code(404).send({ error: "not_found" }));
 
   // The live view (web/): static files at /, registered last so every API route above wins over
   // the wildcard. Open to anyone who can reach the server; the data it shows is still guarded.

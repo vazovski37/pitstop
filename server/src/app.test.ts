@@ -2,7 +2,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { CommitResponse, Health, Intent, type CommitRequest } from "@pitstop/protocol";
+import { CommitResponse, Health, Intent, type Changeset, type CommitRequest } from "@pitstop/protocol";
 import { buildApp, type AppDeps } from "./app.js";
 import type { OAuthProvider, OAuthUser } from "./auth.js";
 import type { GitHubClient } from "./github.js";
@@ -517,9 +517,10 @@ describe("accounts", () => {
     expect((await app.inject({ method: "GET", url: "/repos/alice/app/members", headers: bearer(alice) })).json()).toEqual([{ login: "alice", role: "owner" }]);
 
     expect((await app.inject({ method: "POST", url: "/commit", payload: request("bob-1", { repo: "alice/app" }), headers: bearer(bob) })).statusCode).toBe(403);
-    expect((await app.inject({ method: "GET", url: "/repos/alice/app", headers: bearer(bob) })).statusCode).toBe(403);
-    expect((await app.inject({ method: "GET", url: "/log?repo=alice/app" })).statusCode).toBe(401);
-    expect((await app.inject({ method: "PUT", url: "/repos/alice/app/members/bob", payload: { role: "writer" }, headers: bearer(bob) })).statusCode).toBe(403);
+    // Someone who may not read a repository is told nothing about it: 404, as if it did not exist.
+    expect((await app.inject({ method: "GET", url: "/repos/alice/app", headers: bearer(bob) })).statusCode).toBe(404);
+    expect((await app.inject({ method: "GET", url: "/log?repo=alice/app" })).statusCode).toBe(404);
+    expect((await app.inject({ method: "PUT", url: "/repos/alice/app/members/bob", payload: { role: "writer" }, headers: bearer(bob) })).statusCode).toBe(404);
 
     expect((await app.inject({ method: "PUT", url: "/repos/alice/app/members/bob", payload: { role: "writer" }, headers: bearer(alice) })).statusCode).toBe(200);
     expect((await app.inject({ method: "PUT", url: "/repos/alice/app/members/not a login", payload: { role: "writer" }, headers: bearer(alice) })).statusCode).toBe(400);
@@ -540,7 +541,7 @@ describe("accounts", () => {
 
     // A repository with no members is closed to users: the first stranger to sign in cannot take it.
     expect((await commit("default-by-bob", { repo: "local/default" }, bearer(bob))).statusCode).toBe(403);
-    expect((await app.inject({ method: "PUT", url: "/repos/local/default/members/bob", payload: { role: "owner" }, headers: bearer(bob) })).statusCode).toBe(403);
+    expect((await app.inject({ method: "PUT", url: "/repos/local/default/members/bob", payload: { role: "owner" }, headers: bearer(bob) })).statusCode).toBe(404);
     await app.close();
   });
 
@@ -599,6 +600,110 @@ describe("accounts", () => {
     await app.close();
   });
 
+  describe("a resolver decides on write skew", () => {
+    // The demo's write skew: alice's #1 changes getCurrentUser's signature, bob's commit read it at #0.
+    const authFix = {
+      intent: "Fix the expired-session bug in auth",
+      files: [{ path: "src/auth/session.ts", op: "modify" as const, content: "export function getCurrentUser() { return null; }\n" }],
+      writeSet: ["src/auth/session.ts#getCurrentUser"],
+      sigWriteSet: ["src/auth/session.ts#getCurrentUser"],
+      readSet: [],
+    };
+    const profile = {
+      intent: "Show last-seen on the profile page",
+      files: [{ path: "src/pages/ProfilePage.ts", op: "modify" as const, content }],
+      writeSet: ["src/pages/ProfilePage.ts#renderProfile"],
+      readSet: ["src/auth/session.ts#getCurrentUser"],
+    };
+    const team = async () => {
+      const ctx = await accounts({ repair: "agent" });
+      const alice = await tokenFor(ctx.store, "alice", 1001);
+      const bob = await tokenFor(ctx.store, "bob", 1002);
+      await ctx.app.inject({ method: "POST", url: "/repos", payload: { id: "alice/app" }, headers: bearer(alice) });
+      await ctx.app.inject({ method: "PUT", url: "/repos/alice/app/members/bob", payload: { role: "writer" }, headers: bearer(alice) });
+      const as = (token: string, key: string, extra: Partial<CommitRequest>) =>
+        ctx.app.inject({ method: "POST", url: "/commit", payload: request(key, { repo: "alice/app", baseLsn: 0, ...extra }), headers: bearer(token) });
+      expect((await as(alice, "auth-fix-1", authFix)).statusCode).toBe(200);
+      return { ...ctx, alice, bob, as };
+    };
+
+    it("parks the commit for the owner, holds its author's next one, and lands it when let through", async () => {
+      const { app, alice, bob, as } = await team();
+      const parked = await as(bob, "profile-1", profile);
+      expect(parked.statusCode).toBe(409);
+      const answer = parked.json() as { reason: string; message: string; conflictsWith: number[] };
+      expect(answer).toMatchObject({ reason: "escalated", conflictsWith: [1] });
+      expect(answer.message).toMatch(/resolver \(alice\) decides on it: your commit waits as pk_[0-9a-f]{8}/);
+      const id = /pk_[0-9a-f]{8}/.exec(answer.message)?.[0] as string;
+
+      const again = await as(bob, "profile-2", profile);
+      expect(again.statusCode).toBe(409);
+      expect(again.json()).toMatchObject({ reason: "constraint_failed" });
+
+      const list = (await app.inject({ method: "GET", url: "/repos/alice/app/parked", headers: bearer(bob) })).json() as { id: string; status: string; skew: string }[];
+      expect(list).toEqual([expect.objectContaining({ id, status: "open", skew: "#1 changed src/auth/session.ts#getCurrentUser (signature)" })]);
+
+      expect((await app.inject({ method: "POST", url: `/repos/alice/app/parked/${id}/accept`, headers: bearer(bob) })).statusCode).toBe(403);
+      const accepted = await app.inject({ method: "POST", url: `/repos/alice/app/parked/${id}/accept`, headers: bearer(alice) });
+      expect(accepted.statusCode).toBe(200);
+      expect(accepted.json()).toMatchObject({ status: "accepted", decidedBy: "alice", landedLsn: 2 });
+      const log = (await app.inject({ method: "GET", url: "/log?repo=alice/app", headers: bearer(alice) })).json() as Changeset[];
+      expect(log[1]).toMatchObject({ lsn: 2, author: { developer: "bob" }, repairs: [{ againstLsn: 1, kind: "semantic", summary: "write skew accepted as is by alice" }] });
+      expect((await app.inject({ method: "POST", url: `/repos/alice/app/parked/${id}/accept`, headers: bearer(alice) })).statusCode).toBe(409);
+      expect((await as(bob, "profile-3", { ...profile, baseLsn: 2, files: [{ path: "src/b.ts", op: "add", content }], readSet: [] })).statusCode).toBe(200);
+      await app.close();
+    });
+
+    it("sends it back with a note to its author, who may commit again", async () => {
+      const { app, alice, bob, as } = await team();
+      const id = /pk_[0-9a-f]{8}/.exec((await as(bob, "profile-1", profile)).json().message)?.[0] as string;
+      const back = await app.inject({ method: "POST", url: `/repos/alice/app/parked/${id}/send-back`, payload: { note: "guard the null user" }, headers: bearer(alice) });
+      expect(back.json()).toMatchObject({ status: "sent_back", decidedBy: "alice", note: "guard the null user" });
+      // Re-read at #1 (the daemon moved its read base there): it lands.
+      expect((await as(bob, "profile-2", { ...profile, baseLsn: 1, readBaseLsn: 1 })).statusCode).toBe(200);
+      await app.close();
+    });
+
+    it("goes to the members marked resolver, and back to its own agent when its author is the only one who decides", async () => {
+      const { app, alice, as } = await team();
+      // alice is the only owner and the committer: nobody else to ask.
+      const own = await as(alice, "alice-skew", { ...profile, baseLsn: 0 });
+      expect(own.statusCode).toBe(409);
+      expect(own.json().message).toContain("Re-read those files at head #1");
+      expect((await app.inject({ method: "GET", url: "/repos/alice/app/parked", headers: bearer(alice) })).json()).toEqual([]);
+      await app.close();
+    });
+  });
+
+  it("scopes intents and idempotency keys to their repository", async () => {
+    const { app, store } = await accounts();
+    const alice = await tokenFor(store, "alice", 1001);
+    const bob = await tokenFor(store, "bob", 1002);
+    await app.inject({ method: "POST", url: "/repos", payload: { id: "alice/app" }, headers: bearer(alice) });
+    await app.inject({ method: "POST", url: "/repos", payload: { id: "bob/own" }, headers: bearer(bob) });
+    const intent = Intent.parse(
+      (await app.inject({ method: "POST", url: "/intents", payload: { repo: "alice/app", author: { developer: "alice", agent: "a" }, baseLsn: 0, text: "work" }, headers: bearer(alice) })).json(),
+    );
+    // bob cannot close alice's intent from his own repository...
+    const steal = await app.inject({ method: "POST", url: "/commit", payload: request("steal-001", { repo: "bob/own", intentId: intent.id }), headers: bearer(bob) });
+    expect(steal.statusCode).toBe(400);
+    expect((await store.openIntents("alice/app")).map((i) => i.id)).toEqual([intent.id]);
+    // ...nor read her commit back through its idempotency key.
+    expect((await app.inject({ method: "POST", url: "/commit", payload: request("shared-key-1", { repo: "alice/app" }), headers: bearer(alice) })).statusCode).toBe(200);
+    expect((await app.inject({ method: "POST", url: "/commit", payload: request("shared-key-1", { repo: "bob/own" }), headers: bearer(bob) })).statusCode).toBe(400);
+    await app.close();
+  });
+
+  it("answers an existing repository to its members whatever its owner name (pitstop init)", async () => {
+    const { app, store } = await accounts();
+    const alice = await tokenFor(store, "alice", 1001);
+    const bob = await tokenFor(store, "bob", 1002);
+    await app.inject({ method: "POST", url: "/repos", payload: { id: "alice/app" }, headers: bearer(alice) });
+    await app.inject({ method: "PUT", url: "/repos/alice/app/members/bob", payload: { role: "writer" }, headers: bearer(alice) });
+    expect((await app.inject({ method: "POST", url: "/repos", payload: { id: "alice/app" }, headers: bearer(bob) })).statusCode).toBe(200);
+    await app.close();
+  });
+
   it("never leaves a repository without an owner; a member may leave", async () => {
     const { app, store } = await accounts();
     const alice = await tokenFor(store, "alice", 1001);
@@ -633,7 +738,7 @@ describe("accounts", () => {
     await app.inject({ method: "POST", url: "/repos", payload: { id: "alice/app" }, headers: bearer(alice) });
     expect((await commit("shared-1", { repo: "alice/app" }, bearer(shared))).statusCode).toBe(200);
     expect((await app.inject({ method: "GET", url: "/repos/alice/app/mirror", headers: bearer(shared) })).statusCode).toBe(404);
-    expect((await app.inject({ method: "GET", url: "/log" })).statusCode).toBe(401);
+    expect((await app.inject({ method: "GET", url: "/log" })).statusCode).toBe(404); // without accounts the shared token guards everything (401); with them, an unreadable repository is 404
     // The owner may not aim the server's GitHub token anywhere; the administrator may.
     const aim = (token: string) => app.inject({ method: "PUT", url: "/repos/alice/app/mirror", payload: { github: "vazovski37/pitstop" }, headers: bearer(token) });
     expect((await aim(alice)).statusCode).toBe(403);
@@ -641,7 +746,7 @@ describe("accounts", () => {
     expect((await app.inject({ method: "DELETE", url: "/repos/alice/app/mirror", headers: bearer(alice) })).statusCode).toBe(403);
     // The administrator makes the repositories it created reachable by adding their owner.
     await app.inject({ method: "POST", url: "/repos", payload: { id: "team/legacy" }, headers: bearer(shared) });
-    expect((await app.inject({ method: "GET", url: "/repos/team/legacy", headers: bearer(alice) })).statusCode).toBe(403);
+    expect((await app.inject({ method: "GET", url: "/repos/team/legacy", headers: bearer(alice) })).statusCode).toBe(404);
     expect((await app.inject({ method: "PUT", url: "/repos/team/legacy/members/alice", payload: { role: "owner" }, headers: bearer(shared) })).statusCode).toBe(200);
     expect((await app.inject({ method: "GET", url: "/repos/team/legacy", headers: bearer(alice) })).statusCode).toBe(200);
     await app.close();

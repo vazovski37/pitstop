@@ -18,6 +18,8 @@ interface Subscriber {
   intentId: string | null;
   /** One delivery at a time per socket, so entries never interleave. */
   sending: Promise<void>;
+  /** Asked again before every delivery: a member removed, a repository made private or a token revoked cuts the socket off. */
+  canRead: (repo: RepoId) => Promise<boolean>;
 }
 
 /**
@@ -54,15 +56,24 @@ export class Stream {
    * daemon asks for. `canRead` decides which repositories this socket may follow (auth.ts).
    */
   connect(socket: WebSocket, canRead: (repo: RepoId) => Promise<boolean> = async () => true): void {
-    const sub: Subscriber = { socket, repo: null, lastSentLsn: null, appliedLsn: null, intentId: null, sending: Promise.resolve() };
+    const sub: Subscriber = { socket, repo: null, lastSentLsn: null, appliedLsn: null, intentId: null, sending: Promise.resolve(), canRead };
     this.subs.add(sub);
     socket.on("close", () => this.subs.delete(sub));
     socket.on("error", (err) => this.log?.warn({ err }, "stream socket error"));
     socket.on("message", (raw) => void this.onMessage(sub, raw, canRead));
-    sub.sending = this.store
-      .headLsn(DEFAULT_REPO)
-      .then((headLsn) => this.send(sub, { type: "hello", serverVersion: this.version, headLsn }))
+    // hello carries the default repository's head only for a socket that may read it; the head
+    // that matters comes with `head` after subscribe.
+    sub.sending = canRead(DEFAULT_REPO)
+      .then(async (readable) => this.send(sub, { type: "hello", serverVersion: this.version, headLsn: readable ? await this.store.headLsn(DEFAULT_REPO) : 0 }))
       .catch((err) => this.fail(sub, err));
+  }
+
+  /** Whether the socket may still read its repository; closes it when not. */
+  private async stillReads(sub: Subscriber): Promise<boolean> {
+    if (sub.repo === null) return false;
+    if (await sub.canRead(sub.repo)) return true;
+    sub.socket.close(1008, `no read access to ${sub.repo}`);
+    return false;
   }
 
   /** Called after every append to `repo`: each of its subscribed sockets gets what it has not seen yet. */
@@ -72,7 +83,15 @@ export class Stream {
 
   /** Pushes a message that is not a log entry (`intent`, `warning`) to every socket following `repo`. */
   broadcast(repo: RepoId, message: ServerMessage): void {
-    for (const sub of this.subs) if (sub.repo === repo) this.send(sub, message);
+    for (const sub of this.subs) {
+      if (sub.repo !== repo) continue;
+      // In order with the entries, and only while the socket may still read the repository.
+      sub.sending = sub.sending
+        .then(async () => {
+          if (await this.stillReads(sub)) this.send(sub, message);
+        })
+        .catch((err) => this.fail(sub, err));
+    }
   }
 
   /**
@@ -121,7 +140,8 @@ export class Stream {
         // The daemon names its open intent on every heartbeat while it has one, so a heartbeat
         // without one means the task is over: the worktree loses its name until the next intent.
         sub.intentId = message.intentId ?? null;
-        if (message.intentId !== undefined) await this.store.heartbeat(message.intentId);
+        // Only for the repository this socket follows: an id from elsewhere refreshes nothing.
+        if (message.intentId !== undefined && sub.repo !== null) await this.store.heartbeat(sub.repo, message.intentId);
         break;
     }
   }
@@ -131,6 +151,7 @@ export class Stream {
       .then(async () => {
         for (;;) {
           if (sub.repo === null || sub.lastSentLsn === null || sub.socket.readyState !== sub.socket.OPEN) return;
+          if (!(await this.stillReads(sub))) return;
           const batch = await this.store.entriesAfter(sub.repo, sub.lastSentLsn, PAGE);
           for (const changeset of batch) {
             this.send(sub, { type: "entry", changeset });

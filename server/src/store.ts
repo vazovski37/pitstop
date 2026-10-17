@@ -1,6 +1,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import {
   DEFAULT_REPO,
+  type Author,
   type Changeset,
   type Checks,
   type CommitRequest,
@@ -46,7 +47,7 @@ export interface Store {
   /** The repository's open intents: the catalog's live view (design doc 9.3), for early warnings. */
   openIntents(repo: RepoId): Promise<Intent[]>;
   /** Refreshes an open intent's heartbeat. Unknown or closed intents are ignored. */
-  heartbeat(intentId: string): Promise<void>;
+  heartbeat(repo: RepoId, intentId: string): Promise<void>;
   getMirror(repo: RepoId): Promise<Mirror | undefined>;
   /** Creates or replaces the repository's mirror; its position starts over at `baseCommit`. */
   setMirror(repo: RepoId, config: MirrorConfig): Promise<Mirror>;
@@ -77,6 +78,15 @@ export interface Store {
   deleteInvite(repo: RepoId, login: string): Promise<boolean>;
   /** Turns the user's pending invites into memberships; the repositories they joined. */
   acceptInvites(user: User): Promise<RepoId[]>;
+  // Parked commits (migration 007): write skew waiting for the repository's resolver.
+  park(input: ParkInput): Promise<Parked>;
+  /** Newest first. */
+  listParked(repo: RepoId): Promise<Parked[]>;
+  getParked(repo: RepoId, id: string): Promise<Parked | undefined>;
+  /** The author's commit still waiting in the repository, if any. */
+  openParkedBy(repo: RepoId, author: Author): Promise<Parked | undefined>;
+  /** Records the decision on an open parked commit; false when it was not open. */
+  decideParked(repo: RepoId, id: string, decision: ParkDecision): Promise<boolean>;
   visibility(repo: RepoId): Promise<Visibility | undefined>;
   setVisibility(repo: RepoId, visibility: Visibility): Promise<void>;
 }
@@ -121,6 +131,35 @@ export interface Invite {
   role: Role;
   createdAt: string;
 }
+export interface ParkInput {
+  repo: RepoId;
+  /** The committer, when a signed-in user. */
+  userId?: string;
+  request: CommitRequest;
+  /** What the validator found, for people (`describeSkew`). */
+  skew: string;
+  conflictsWith: Lsn[];
+  headLsn: Lsn;
+}
+export type ParkStatus = "open" | "accepted" | "sent_back";
+export interface Parked extends ParkInput {
+  id: string;
+  author: Author;
+  status: ParkStatus;
+  note?: string;
+  /** The resolver's login. */
+  decidedBy?: string;
+  landedLsn?: Lsn;
+  createdAt: string;
+  decidedAt?: string;
+}
+export interface ParkDecision {
+  status: Exclude<ParkStatus, "open">;
+  decidedBy: string;
+  note?: string;
+  landedLsn?: Lsn;
+}
+export const newParkedId = (): string => `pk_${randomBytes(4).toString("hex")}`;
 export type Visibility = "private" | "public";
 
 export const newUserId = (): string => `u_${randomBytes(4).toString("hex")}`;
@@ -245,17 +284,21 @@ export class MemoryStore implements Store {
   private readonly members = new Map<string, Member>(); // `${repo}\n${userId}`
   private readonly invites = new Map<string, Invite>(); // `${repo}\n${login}`
   private readonly visibilities = new Map<RepoId, Visibility>();
+  private readonly parked = new Map<string, Parked>();
 
   async append(req: CommitRequest, decide?: Decide): Promise<Changeset> {
     const seen = this.byKey.get(req.idempotencyKey);
-    if (seen) return seen;
+    if (seen) {
+      if (seen.repo !== repoOf(req)) throw new InvalidCommit("idempotency key already used by another commit");
+      return seen;
+    }
     const repo = repoOf(req);
     const log = this.logs.get(repo);
     if (log === undefined) throw unknownRepo(repo);
     const lsn = log.length + 1;
     if (req.baseLsn >= lsn) throw new InvalidCommit(`baseLsn ${req.baseLsn} is not below the next LSN ${lsn}`);
     const intent = req.intentId === undefined ? undefined : this.intents.get(req.intentId);
-    if (req.intentId !== undefined && intent === undefined) throw new InvalidCommit(`unknown intent ${req.intentId}`);
+    if (req.intentId !== undefined && (intent === undefined || intent.repo !== repo)) throw new InvalidCommit(`unknown intent ${req.intentId}`);
     const gap = log.filter((e) => e.lsn > gapStart(req)).slice(0, GAP_LIMIT + 1);
     const decision = decide ? await decide(gap, lsn - 1) : {};
     const changeset: Changeset = {
@@ -333,9 +376,9 @@ export class MemoryStore implements Store {
     return [...this.intents.values()].filter((i) => i.repo === repo && i.status === "open");
   }
 
-  async heartbeat(intentId: string): Promise<void> {
+  async heartbeat(repo: RepoId, intentId: string): Promise<void> {
     const intent = this.intents.get(intentId);
-    if (intent?.status === "open") this.intents.set(intentId, { ...intent, heartbeatAt: new Date().toISOString() });
+    if (intent?.status === "open" && intent.repo === repo) this.intents.set(intentId, { ...intent, heartbeatAt: new Date().toISOString() });
   }
 
   async getMirror(repo: RepoId): Promise<Mirror | undefined> {
@@ -460,6 +503,35 @@ export class MemoryStore implements Store {
 
   async deleteInvite(repo: RepoId, login: string): Promise<boolean> {
     return this.invites.delete(`${repo}\n${login.toLowerCase()}`);
+  }
+
+  async park(input: ParkInput): Promise<Parked> {
+    if (!this.repos.has(input.repo)) throw unknownRepo(input.repo);
+    const parked: Parked = { ...input, id: newParkedId(), author: input.request.author, status: "open", createdAt: new Date().toISOString() };
+    this.parked.set(parked.id, parked);
+    return parked;
+  }
+
+  async listParked(repo: RepoId): Promise<Parked[]> {
+    return [...this.parked.values()].filter((p) => p.repo === repo).sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id));
+  }
+
+  async getParked(repo: RepoId, id: string): Promise<Parked | undefined> {
+    const parked = this.parked.get(id);
+    return parked?.repo === repo ? parked : undefined;
+  }
+
+  async openParkedBy(repo: RepoId, author: Author): Promise<Parked | undefined> {
+    return [...this.parked.values()].find(
+      (p) => p.repo === repo && p.status === "open" && p.author.developer === author.developer && p.author.agent === author.agent,
+    );
+  }
+
+  async decideParked(repo: RepoId, id: string, decision: ParkDecision): Promise<boolean> {
+    const parked = await this.getParked(repo, id);
+    if (parked === undefined || parked.status !== "open") return false;
+    this.parked.set(id, { ...parked, ...decision, decidedAt: new Date().toISOString() });
+    return true;
   }
 
   async acceptInvites(user: User): Promise<RepoId[]> {

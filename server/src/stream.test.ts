@@ -224,6 +224,30 @@ describe("GET /stream", () => {
     reader.close();
   });
 
+  it("cuts off a socket whose access was taken away, at the next delivery", async () => {
+    const oauth = { authorizeUrl: () => "https://github.test/authorize", exchange: async () => ({ githubId: 1, login: "alice" }) };
+    const store = new MemoryStore();
+    const app = await buildApp({ version: "test-sha", pingDb: async () => true, store, oauth, sessionSecret: "a-cookie-secret-for-tests" });
+    await app.listen({ host: "127.0.0.1", port: 0 });
+    cleanup = () => app.close();
+    const url = `ws://127.0.0.1:${(app.server.address() as AddressInfo).port}/stream`;
+    const alice = await store.upsertUser({ githubId: 1, login: "alice" });
+    const aliceToken = (await store.createToken(alice.id, "laptop")).secret;
+    const bob = await store.upsertUser({ githubId: 2, login: "bob" });
+    const bobToken = (await store.createToken(bob.id, "laptop")).secret;
+    await store.createRepo("alice/app");
+    await store.setMember("alice/app", alice.id, "owner");
+    await store.setMember("alice/app", bob.id, "reader");
+
+    const watcher = await connect(url, { authorization: `Bearer ${bobToken}` });
+    await watcher.next(); // hello
+    watcher.send({ type: "subscribe", repo: "alice/app", fromLsn: 0 });
+    expect(await watcher.next()).toMatchObject({ type: "head", repo: "alice/app" });
+    await store.removeMember("alice/app", bob.id);
+    await app.inject({ method: "POST", url: "/commit", payload: { ...request("after-removal"), repo: "alice/app" }, headers: { authorization: `Bearer ${aliceToken}` } });
+    expect(await watcher.closed).toBe(1008);
+  });
+
   it("refuses a signed-in browser's stream opened by another site (cross-site WebSocket hijacking)", async () => {
     const oauth = { authorizeUrl: () => "https://github.test/authorize", exchange: async () => ({ githubId: 1, login: "alice" }) };
     const store = new MemoryStore();

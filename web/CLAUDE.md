@@ -4,7 +4,7 @@ Owner: **Vazovski** (since 18 October 2026, every folder is).
 
 ## Pages (hash routes)
 - `#/` home: signed out, the pitch and "Sign in with GitHub"; signed in, your repositories (`GET /repos`) and "New repository" under your login (`POST /repos`).
-- `#/r/<owner>/<name>` a repository: tabs **Live** (below), **Members** (`/repos/:o/:n/members`: roles, the resolver flag, invites by GitHub login that turn into membership at first sign-in, remove, leave) and **Set up Claude** (makes a personal token with `POST /tokens` and writes the prompt a developer pastes into Claude Code: install Node, git and jj, `npm install -g <server>/pitstop-cli.tgz`, `pitstop setup <server> <repo> --token …`). The administrator's shared token never goes into a prompt.
+- `#/r/<owner>/<name>` a repository: tabs **Live** (below), **Conflicts** (`/repos/:o/:n/parked`: commits waiting for the resolver, their write skew and files; a resolver lets one through or sends it back with a note), **Members** (`/repos/:o/:n/members`: roles, the resolver flag, invites by GitHub login that turn into membership at first sign-in, remove, leave) and **Set up Claude** (makes a personal token with `POST /tokens` and writes the prompt a developer pastes into Claude Code: install Node, git and jj, `npm install -g <server>/pitstop-cli.tgz`, `pitstop setup <server> <repo> --token …`). The administrator's shared token never goes into a prompt.
 - `#/account` personal tokens (make, list, revoke) and sign out.
 - On a server without accounts the header takes the shared token instead (kept in `localStorage`).
 

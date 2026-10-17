@@ -163,9 +163,16 @@ function connect(): void {
   };
   ws.onmessage = (ev) => handle(JSON.parse(String(ev.data)) as ServerMessage);
   ws.onerror = () => ws.close();
-  ws.onclose = () => {
+  ws.onclose = (ev) => {
     if (socket !== ws) return; // replaced on purpose
     setConnected(false);
+    if (ev.code === 1008) {
+      // Refused (no access, or access taken away): say why instead of retrying forever.
+      $("conn").textContent = "no access";
+      $("conn").title = ev.reason;
+      socket = undefined;
+      return;
+    }
     // What the worktrees had applied is as stale as the rest of the page now: shown again on reconnect.
     state.worktrees = [];
     renderWorktrees();
@@ -212,7 +219,10 @@ function handle(message: ServerMessage): void {
       onIntent(message.intent);
       break;
     case "warning":
-      if (message.repo === state.repo) addEvent("warning", `for ${message.agent}: ${message.message}`);
+      if (message.repo === state.repo) {
+        addEvent("warning", `for ${message.agent}: ${message.message}`);
+        if (message.kind === "dependency_changed") void countConflicts(state.repo);
+      }
       break;
   }
 }
@@ -442,7 +452,7 @@ function follow(repo: string): void {
 
 // --- routes --------------------------------------------------------------------------------------
 
-type Tab = "live" | "members" | "setup";
+type Tab = "live" | "conflicts" | "members" | "setup";
 type Route = { view: "home" } | { view: "account" } | { view: "repo"; repo: string; tab: Tab };
 
 function parseRoute(hash: string): Route {
@@ -452,7 +462,7 @@ function parseRoute(hash: string): Route {
   // Before routes, the hash held only the repository: #owner/name.
   const parts = (raw.startsWith("/r/") ? raw.slice(3) : raw.replace(/^\//, "")).split("/");
   const [owner, name, tab] = parts;
-  if (owner && name) return { view: "repo", repo: `${owner}/${name}`, tab: tab === "members" || tab === "setup" ? tab : "live" };
+  if (owner && name) return { view: "repo", repo: `${owner}/${name}`, tab: tab === "members" || tab === "setup" || tab === "conflicts" ? tab : "live" };
   return { view: "home" };
 }
 
@@ -472,15 +482,18 @@ function show(route: Route): void {
   } else {
     $("view-repo").hidden = false;
     $("repo-title").textContent = route.repo;
-    for (const tab of ["live", "members", "setup"] as const) {
+    for (const tab of ["live", "conflicts", "members", "setup"] as const) {
       const link = $<HTMLAnchorElement>(`tab-${tab}`);
       link.href = repoHref(route.repo, tab);
       link.className = tab === route.tab ? "active" : "";
     }
     $("pane-live").hidden = route.tab !== "live";
+    $("pane-conflicts").hidden = route.tab !== "conflicts";
     $("pane-members").hidden = route.tab !== "members";
     $("pane-setup").hidden = route.tab !== "setup";
     follow(route.repo);
+    if (route.tab === "conflicts") void renderConflicts(route.repo);
+    else void countConflicts(route.repo);
     if (route.tab === "members") void renderMembers(route.repo);
     if (route.tab === "setup") void renderSetup(route.repo);
   }
@@ -705,6 +718,104 @@ async function makePrompt(repo: string, empty: boolean): Promise<void> {
 function showPrompt(text: string): void {
   $("prompt").textContent = text;
   $("prompt-box").hidden = false;
+}
+
+// --- conflicts: commits waiting for the repository's resolver ------------------------------------
+
+interface ParkedRow {
+  id: string;
+  status: "open" | "accepted" | "sent_back";
+  intent: string;
+  author: { developer: string; agent: string };
+  files: { path: string; op: string; fromPath?: string; content?: string }[];
+  skew: string;
+  conflictsWith: number[];
+  headLsn: number;
+  createdAt: string;
+  note?: string;
+  decidedBy?: string;
+  landedLsn?: number;
+  decidedAt?: string;
+}
+
+/** Whether the person looking decides on this repository's conflicts: a resolver, else an owner, or the administrator. */
+async function decides(repo: string): Promise<boolean> {
+  if (session.me === undefined) return token !== "";
+  const members = await api<MemberRow[]>(`/repos/${repo}/members`);
+  if (members === undefined) return false;
+  const active = members.filter((m) => m.pending !== true);
+  const resolvers = active.filter((m) => m.resolver === true);
+  const deciders = resolvers.length > 0 ? resolvers : active.filter((m) => m.role === "owner");
+  const me = session.me.login.toLowerCase();
+  return deciders.some((m) => m.login.toLowerCase() === me);
+}
+
+async function countConflicts(repo: string): Promise<void> {
+  const list = (await api<ParkedRow[]>(`/repos/${repo}/parked`)) ?? [];
+  const open = list.filter((p) => p.status === "open").length;
+  const badge = $("conflict-count");
+  badge.textContent = String(open);
+  badge.hidden = open === 0;
+}
+
+async function renderConflicts(repo: string): Promise<void> {
+  const res = await call<ParkedRow[]>("GET", `/repos/${repo}/parked`);
+  if (res.status !== 200 || res.body === undefined) {
+    $("conflicts").replaceChildren();
+    say("conflicts-msg", messageOf(res.body, `the server answered ${res.status}`), false);
+    return;
+  }
+  const list = res.body;
+  const canDecide = await decides(repo);
+  $("no-conflicts").hidden = list.length > 0;
+  const open = list.filter((p) => p.status === "open").length;
+  $("conflict-count").textContent = String(open);
+  $("conflict-count").hidden = open === 0;
+  $("conflicts").replaceChildren(...list.map((p) => conflictCard(repo, p, canDecide)));
+}
+
+function conflictCard(repo: string, p: ParkedRow, canDecide: boolean): HTMLElement {
+  const status =
+    p.status === "open"
+      ? el("span", { class: "badge warn" }, "waiting")
+      : p.status === "accepted"
+        ? el("span", { class: "badge repair" }, `let through by ${p.decidedBy ?? "?"}${p.landedLsn === undefined ? "" : ` as #${p.landedLsn}`}`)
+        : el("span", { class: "badge" }, `sent back by ${p.decidedBy ?? "?"}`);
+  const files = p.files.map((f) =>
+    el(
+      "details",
+      {},
+      el("summary", {}, `${f.op} ${f.fromPath === undefined ? f.path : `${f.fromPath} → ${f.path}`}`),
+      f.content === undefined ? el("p", { class: "dim" }, "no content") : el("pre", {}, f.content),
+    ),
+  );
+  const card = el(
+    "li",
+    { class: p.status === "open" ? "open" : "" },
+    el("div", { class: "head" }, el("strong", { class: "grow" }, p.intent), status),
+    el("div", { class: "dim" }, `${p.author.agent} (${p.author.developer}) · ${timeAgo(p.createdAt)} · ${p.id} · head was #${p.headLsn}`),
+    el("div", { class: "skew" }, `Write skew: ${p.skew}`),
+    ...files,
+    p.note === undefined ? null : el("p", {}, el("span", { class: "dim" }, "note: "), p.note),
+  );
+  if (p.status === "open" && canDecide) {
+    const note = el("textarea", { placeholder: "A note for the author when you send it back: what to change" });
+    const accept = el("button", { type: "button" }, "Let it through");
+    const back = el("button", { type: "button" }, "Send back");
+    accept.addEventListener("click", () => void decide(repo, p.id, "accept"));
+    back.addEventListener("click", () => void decide(repo, p.id, "send-back", note.value));
+    card.append(note, el("div", { class: "stack" }, accept, back));
+  } else if (p.status === "open") {
+    card.append(el("p", { class: "dim" }, "Waiting for this repository's resolver."));
+  }
+  return card;
+}
+
+async function decide(repo: string, id: string, action: "accept" | "send-back", note?: string): Promise<void> {
+  const res = await call<ParkedRow>("POST", `/repos/${repo}/parked/${id}/${action}`, action === "send-back" ? { note: note ?? "" } : undefined);
+  if (res.status >= 300) say("conflicts-msg", messageOf(res.body, `the server answered ${res.status}`), false);
+  else say("conflicts-msg", action === "accept" ? `${id} landed${res.body?.landedLsn === undefined ? "" : ` as #${res.body.landedLsn}`}` : `${id} sent back to its author`, true);
+  await renderConflicts(repo);
 }
 
 // --- account: personal tokens --------------------------------------------------------------------

@@ -103,3 +103,13 @@ header nav a:hover { color: var(--text); }
 .msg.ok { color: var(--ok); }
 #prompt, #new-token-secret { white-space: pre-wrap; word-break: break-word; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 12px; line-height: 1.5; }
 code { color: var(--accent); }
+
+/* conflicts waiting for the resolver */
+.cards > li { border: 1px solid var(--line); border-radius: 8px; padding: 12px; margin-bottom: 10px; }
+.cards > li.open { border-color: var(--warn); }
+.cards .head { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }
+.cards .skew { color: var(--repair); margin: 8px 0; }
+.cards details { margin: 6px 0; }
+.cards pre { white-space: pre-wrap; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 8px; max-height: 320px; overflow: auto; font-size: 12px; }
+.cards textarea { width: 100%; min-height: 60px; font: inherit; background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 4px; padding: 6px; }
+.tabs .badge { margin-left: 4px; }
