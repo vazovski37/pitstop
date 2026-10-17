@@ -6,9 +6,11 @@ import {
   DEFAULT_REPO,
   IntentRequest,
   Lsn,
+  RepoId,
   type Changeset,
   type CommitResponse,
   type Health,
+  type Repo,
   type ServerMessage,
 } from "@pitstop/protocol";
 import { typecheckGate } from "./checks.js";
@@ -17,6 +19,7 @@ import {
   gapStart,
   InvalidCommit,
   RejectedCommit,
+  repoOf,
   SKIPPED_CHECKS,
   withBlobHashes,
   type Decision,
@@ -109,11 +112,9 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   app.post("/commit", async (req, reply) => {
     const parsed = CommitRequest.safeParse(req.body);
     if (!parsed.success) return rejected(reply, "invalid_request", issues(parsed.error));
-    if (parsed.data.repo !== undefined && parsed.data.repo !== DEFAULT_REPO) {
-      return rejected(reply, "invalid_request", `only ${DEFAULT_REPO} exists on this server yet`);
-    }
     try {
-      const request = withBlobHashes(parsed.data);
+      const repo = repoOf(parsed.data);
+      const request: CommitRequest = { ...withBlobHashes(parsed.data), repo };
       let skew: SkewVerdict | undefined;
       const changeset = await deps.store.append(request, async (gap, head): Promise<Decision> => {
         // With a resolver, the validator only reports skew; what happens to it is decided here.
@@ -125,8 +126,8 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
             skew: outcome.skew,
             gap,
             headLsn: head,
-            head: await deps.store.treeAt(head),
-            base: await deps.store.treeAt(gapStart(request)),
+            head: await deps.store.treeAt(repo, head),
+            base: await deps.store.treeAt(repo, gapStart(request)),
           };
           // `agent`: the coding agent that committed is the resolver; it gets told what changed.
           if (repair === "agent" || deps.repairer === undefined) throw escalation(input);
@@ -136,7 +137,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
         }
         if (check !== "always") return decision;
         // The constraint of section 7.4: the merged tree must type-check, or the commit does not land.
-        const gate = await typecheckGate(await deps.store.treeAt(head), decision.files ?? request.files);
+        const gate = await typecheckGate(await deps.store.treeAt(repo, head), decision.files ?? request.files);
         if (gate.typecheck === "fail") {
           throw new RejectedCommit("constraint_failed", `type check failed on the merged tree:\n${gate.details ?? ""}`);
         }
@@ -144,10 +145,10 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
         const details = [checks.details, gate.details].filter((d) => d !== undefined).join("; ");
         return { ...decision, checks: { ...checks, typecheck: gate.typecheck, ...(details === "" ? {} : { details }) } };
       });
-      stream.notify();
+      stream.notify(repo);
       if (skew) {
-        // Until repair exists the skew lands as is; the daemon and the live view hear about it.
-        stream.broadcast({
+        // Without a resolver the skew lands as is; the daemon and the live view hear about it.
+        stream.broadcast(repo, {
           type: "warning",
           repo: changeset.repo,
           agent: request.author.agent,
@@ -169,21 +170,42 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   app.post("/intents", async (req, reply) => {
     const parsed = IntentRequest.safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: "invalid_request", message: issues(parsed.error) });
-    if (parsed.data.repo !== undefined && parsed.data.repo !== DEFAULT_REPO) {
-      return reply.code(400).send({ error: "invalid_request", message: `only ${DEFAULT_REPO} exists on this server yet` });
+    try {
+      const intent = await deps.store.openIntent(parsed.data);
+      const message: ServerMessage = { type: "intent", intent };
+      stream.broadcast(intent.repo, message);
+      return reply.code(201).send(intent);
+    } catch (err) {
+      if (err instanceof InvalidCommit) return reply.code(400).send({ error: "invalid_request", message: err.message });
+      throw err;
     }
-    const intent = await deps.store.openIntent(parsed.data);
-    const message: ServerMessage = { type: "intent", intent };
-    stream.broadcast(message);
-    return reply.code(201).send(intent);
+  });
+
+  // Repositories: one server, many logs (build plan, "Beyond the demo").
+  app.post<{ Body: { id?: unknown } }>("/repos", async (req, reply) => {
+    const id = RepoId.safeParse(req.body?.id);
+    if (!id.success) return reply.code(400).send({ error: "invalid_request", message: "id must be owner/name in lowercase" });
+    const { repo, created } = await deps.store.createRepo(id.data);
+    return reply.code(created ? 201 : 200).send(repo);
+  });
+
+  app.get("/repos", async (): Promise<Repo[]> => deps.store.listRepos());
+
+  app.get<{ Params: { owner: string; name: string } }>("/repos/:owner/:name", async (req, reply) => {
+    const repo = await deps.store.getRepo(`${req.params.owner}/${req.params.name}`);
+    if (repo === undefined) return reply.code(404).send({ error: "unknown_repo" });
+    return repo;
   });
 
   // The log over HTTP: for the live view, catch-up by hand, and debugging.
-  app.get<{ Querystring: { fromLsn?: string; limit?: string } }>("/log", async (req, reply) => {
+  app.get<{ Querystring: { repo?: string; fromLsn?: string; limit?: string } }>("/log", async (req, reply) => {
+    const repo = RepoId.safeParse(req.query.repo ?? DEFAULT_REPO);
+    if (!repo.success) return reply.code(400).send({ error: "invalid_request", message: "repo must be owner/name in lowercase" });
     const fromLsn = Lsn.safeParse(Number(req.query.fromLsn ?? 0));
     if (!fromLsn.success) return reply.code(400).send({ error: "invalid_request", message: "fromLsn must be an LSN" });
+    if ((await deps.store.getRepo(repo.data)) === undefined) return reply.code(404).send({ error: "unknown_repo" });
     const limit = Math.min(Math.max(Math.trunc(Number(req.query.limit)) || LOG_PAGE, 1), LOG_PAGE_MAX);
-    const entries: Changeset[] = await deps.store.entriesAfter(fromLsn.data, limit);
+    const entries: Changeset[] = await deps.store.entriesAfter(repo.data, fromLsn.data, limit);
     return entries;
   });
 

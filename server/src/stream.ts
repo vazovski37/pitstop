@@ -1,6 +1,6 @@
 import type { FastifyBaseLogger } from "fastify";
 import type { RawData, WebSocket } from "ws";
-import { ClientMessage, DEFAULT_REPO, type Lsn, type ServerMessage } from "@pitstop/protocol";
+import { ClientMessage, DEFAULT_REPO, type Lsn, type RepoId, type ServerMessage } from "@pitstop/protocol";
 import type { Store } from "./store.js";
 
 /** Entries read from the store per delivery round. */
@@ -8,6 +8,8 @@ const PAGE = 200;
 
 interface Subscriber {
   socket: WebSocket;
+  /** Set by `subscribe`; a socket follows one repository. */
+  repo: RepoId | null;
   /** Set by `subscribe`; null until then, so nothing is delivered. */
   lastSentLsn: Lsn | null;
   /** From heartbeats; the live view shows it against the head. */
@@ -20,8 +22,8 @@ interface Subscriber {
  * The WebSocket side of the log (design doc section 8.2).
  *
  * Replay and live push are one path: a delivery sends everything after the socket's
- * `lastSentLsn` from the store, in LSN order. `subscribe` starts it; every append
- * triggers it again. So a socket never sees a gap or a duplicate, and a late
+ * `lastSentLsn` from its repository's log, in LSN order. `subscribe` starts it; every append to
+ * that repository triggers it again. So a socket never sees a gap or a duplicate, and a late
  * subscriber catches up from exactly where it left off.
  *
  * Subscribers live in this process, which is why the Container App runs one replica.
@@ -35,32 +37,32 @@ export class Stream {
     private readonly log?: FastifyBaseLogger,
   ) {}
 
-  /** Wires a new connection: `hello` first, then whatever the daemon asks for. */
+  /** Wires a new connection: `hello` first (with the default repository's head), then whatever the daemon asks for. */
   connect(socket: WebSocket): void {
-    const sub: Subscriber = { socket, lastSentLsn: null, appliedLsn: null, sending: Promise.resolve() };
+    const sub: Subscriber = { socket, repo: null, lastSentLsn: null, appliedLsn: null, sending: Promise.resolve() };
     this.subs.add(sub);
     socket.on("close", () => this.subs.delete(sub));
     socket.on("error", (err) => this.log?.warn({ err }, "stream socket error"));
     socket.on("message", (raw) => void this.onMessage(sub, raw));
     sub.sending = this.store
-      .headLsn()
+      .headLsn(DEFAULT_REPO)
       .then((headLsn) => this.send(sub, { type: "hello", serverVersion: this.version, headLsn }))
       .catch((err) => this.fail(sub, err));
   }
 
-  /** Called after every append: each subscribed socket gets what it has not seen yet. */
-  notify(): void {
-    for (const sub of this.subs) this.deliver(sub);
+  /** Called after every append to `repo`: each of its subscribed sockets gets what it has not seen yet. */
+  notify(repo: RepoId): void {
+    for (const sub of this.subs) if (sub.repo === repo) this.deliver(sub);
   }
 
-  /** Pushes a message that is not a log entry (`intent`, `warning`) to every socket. */
-  broadcast(message: ServerMessage): void {
-    for (const sub of this.subs) this.send(sub, message);
+  /** Pushes a message that is not a log entry (`intent`, `warning`) to every socket following `repo`. */
+  broadcast(repo: RepoId, message: ServerMessage): void {
+    for (const sub of this.subs) if (sub.repo === repo) this.send(sub, message);
   }
 
-  /** Applied LSN of every connected worktree that reported one. */
-  worktrees(): Lsn[] {
-    return [...this.subs].flatMap((s) => (s.appliedLsn === null ? [] : [s.appliedLsn]));
+  /** Applied LSN of every connected worktree of `repo` that reported one. */
+  worktrees(repo: RepoId): Lsn[] {
+    return [...this.subs].flatMap((s) => (s.repo === repo && s.appliedLsn !== null ? [s.appliedLsn] : []));
   }
 
   private async onMessage(sub: Subscriber, raw: RawData): Promise<void> {
@@ -71,18 +73,21 @@ export class Stream {
     }
     const message = parsed.data;
     switch (message.type) {
-      case "subscribe":
-        if (message.repo !== undefined && message.repo !== DEFAULT_REPO) {
-          sub.socket.close(1008, `only ${DEFAULT_REPO} exists on this server yet`);
+      case "subscribe": {
+        const repo = message.repo ?? DEFAULT_REPO;
+        if ((await this.store.getRepo(repo)) === undefined) {
+          sub.socket.close(1008, `unknown repo ${repo}: POST /repos first`);
           return;
         }
+        sub.repo = repo;
         // `head` first, so the daemon knows where the log stands before the entries arrive.
         sub.sending = sub.sending
-          .then(async () => this.send(sub, { type: "head", repo: DEFAULT_REPO, headLsn: await this.store.headLsn() }))
+          .then(async () => this.send(sub, { type: "head", repo, headLsn: await this.store.headLsn(repo) }))
           .catch((err) => this.fail(sub, err));
         sub.lastSentLsn = message.fromLsn;
         this.deliver(sub);
         break;
+      }
       case "heartbeat":
         if (message.appliedLsn !== undefined) sub.appliedLsn = message.appliedLsn;
         if (message.intentId !== undefined) await this.store.heartbeat(message.intentId);
@@ -94,8 +99,8 @@ export class Stream {
     sub.sending = sub.sending
       .then(async () => {
         for (;;) {
-          if (sub.lastSentLsn === null || sub.socket.readyState !== sub.socket.OPEN) return;
-          const batch = await this.store.entriesAfter(sub.lastSentLsn, PAGE);
+          if (sub.repo === null || sub.lastSentLsn === null || sub.socket.readyState !== sub.socket.OPEN) return;
+          const batch = await this.store.entriesAfter(sub.repo, sub.lastSentLsn, PAGE);
           for (const changeset of batch) {
             this.send(sub, { type: "entry", changeset });
             sub.lastSentLsn = changeset.lsn;

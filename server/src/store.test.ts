@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { CommitRequest } from "@pitstop/protocol";
+import { DEFAULT_REPO, type CommitRequest } from "@pitstop/protocol";
 import { applyFiles, MemoryStore } from "./store.js";
 
 const request = (key: string, baseLsn: number, files: CommitRequest["files"]): CommitRequest => ({
@@ -38,8 +38,24 @@ describe("MemoryStore.treeAt", () => {
     await store.append(request("import", 0, [{ path: "src/a.ts", op: "add", content: "1" }, { path: "src/b.ts", op: "add", content: "1" }]));
     await store.append(request("edit", 1, [{ path: "src/a.ts", op: "modify", content: "2" }]));
     await store.append(request("move", 2, [{ path: "src/c.ts", op: "rename", fromPath: "src/b.ts", content: "1" }]));
-    expect(await store.treeAt(1)).toEqual(new Map([["src/a.ts", "1"], ["src/b.ts", "1"]]));
-    expect(await store.treeAt(3)).toEqual(new Map([["src/a.ts", "2"], ["src/c.ts", "1"]]));
-    expect(await store.treeAt(0)).toEqual(new Map());
+    expect(await store.treeAt(DEFAULT_REPO, 1)).toEqual(new Map([["src/a.ts", "1"], ["src/b.ts", "1"]]));
+    expect(await store.treeAt(DEFAULT_REPO, 3)).toEqual(new Map([["src/a.ts", "2"], ["src/c.ts", "1"]]));
+    expect(await store.treeAt(DEFAULT_REPO, 0)).toEqual(new Map());
+  });
+});
+
+describe("MemoryStore repositories", () => {
+  it("keeps a log per repository and refuses unknown ones", async () => {
+    const store = new MemoryStore();
+    expect(await store.createRepo("acme/app")).toMatchObject({ created: true, repo: { id: "acme/app", headLsn: 0 } });
+    expect(await store.createRepo("acme/app")).toMatchObject({ created: false });
+    await store.append(request("default-1", 0, [{ path: "a.ts", op: "add", content: "a" }]));
+    const other = await store.append({ ...request("acme-1", 0, [{ path: "b.ts", op: "add", content: "b" }]), repo: "acme/app" });
+    expect(other).toMatchObject({ repo: "acme/app", lsn: 1 });
+    expect(await store.headLsn(DEFAULT_REPO)).toBe(1);
+    expect(await store.headLsn("acme/app")).toBe(1);
+    expect((await store.treeAt("acme/app", 1)).has("a.ts")).toBe(false);
+    expect((await store.listRepos()).map((r) => r.id)).toEqual(["acme/app", DEFAULT_REPO]);
+    await expect(store.append({ ...request("nowhere", 0, []), repo: "no/such" })).rejects.toThrow(/unknown repo/);
   });
 });

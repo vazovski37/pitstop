@@ -10,29 +10,38 @@ import {
   type IntentRequest,
   type Lsn,
   type Repair,
+  type Repo,
+  type RepoId,
 } from "@pitstop/protocol";
 
 /**
- * What the server needs from its storage: the log, the blobs and the open intents.
- * `PgStore` (pg-store.ts) is the real one; `MemoryStore` serves tests and laptops without Postgres.
+ * What the server needs from its storage: the repositories, each with its own log, the blobs,
+ * and the open intents. `PgStore` (pg-store.ts) is the real one; `MemoryStore` serves tests and
+ * laptops without Postgres. LSNs count per repository.
  */
 export interface Store {
   /**
-   * Appends a changeset at the next LSN. The same idempotency key returns the same changeset.
-   * `decide`, when given, runs inside the append's critical section with every entry after
-   * `gapStart(req)` (at most GAP_LIMIT + 1 of them) and the head LSN. It returns what to record
-   * with the changeset, or throws `RejectedCommit` to refuse it. The validator lives there (validate.ts).
+   * Appends a changeset to `repoOf(req)` at its next LSN. The same idempotency key returns the
+   * same changeset. `decide`, when given, runs inside the append's critical section with every
+   * entry after `gapStart(req)` (at most GAP_LIMIT + 1 of them) and the head LSN. It returns what
+   * to record with the changeset, or throws `RejectedCommit` to refuse it (validate.ts).
+   * An unknown repository is an `InvalidCommit`.
    */
   append(req: CommitRequest, decide?: Decide): Promise<Changeset>;
-  /** Entries with `lsn > fromLsn`, in LSN order, at most `limit` of them. */
-  entriesAfter(fromLsn: Lsn, limit: number): Promise<Changeset[]>;
-  headLsn(): Promise<Lsn>;
+  /** Entries of `repo` with `lsn > fromLsn`, in LSN order, at most `limit` of them. */
+  entriesAfter(repo: RepoId, fromLsn: Lsn, limit: number): Promise<Changeset[]>;
+  headLsn(repo: RepoId): Promise<Lsn>;
   /**
-   * Every file at `lsn`, path to text: the log folded up to that entry (the latest change per
-   * path, deletes and renames applied). Needs the repository to have entered the log as a full
-   * import at its first entry.
+   * Every file of `repo` at `lsn`, path to text: the log folded up to that entry (the latest
+   * change per path, deletes and renames applied). Needs the repository to have entered the log
+   * as a full import at its first entry.
    */
-  treeAt(lsn: Lsn): Promise<Tree>;
+  treeAt(repo: RepoId, lsn: Lsn): Promise<Tree>;
+  /** Creates the repository, or returns it when it exists. */
+  createRepo(id: RepoId): Promise<{ repo: Repo; created: boolean }>;
+  getRepo(id: RepoId): Promise<Repo | undefined>;
+  listRepos(): Promise<Repo[]>;
+  /** An unknown repository is an `InvalidCommit`. */
   openIntent(req: IntentRequest): Promise<Intent>;
   /** Refreshes an open intent's heartbeat. Unknown or closed intents are ignored. */
   heartbeat(intentId: string): Promise<void>;
@@ -52,6 +61,9 @@ export type Decide = (gap: Changeset[], head: Lsn) => Decision | Promise<Decisio
 
 /** How far behind head a commit may be before the daemon must rebase first. */
 export const GAP_LIMIT = 500;
+
+/** The repository a request is for. */
+export const repoOf = (req: { repo?: RepoId | undefined }): RepoId => req.repo ?? DEFAULT_REPO;
 
 /** The start of the window a commit is checked against: reads may be older than the files' base. */
 export const gapStart = (req: CommitRequest): Lsn => Math.min(req.baseLsn, req.readBaseLsn ?? req.baseLsn);
@@ -79,6 +91,8 @@ export class RejectedCommit extends Error {
     super(message);
   }
 }
+
+export const unknownRepo = (id: RepoId): InvalidCommit => new InvalidCommit(`unknown repo ${id}: POST /repos first`);
 
 /** Fills in a missing `blob` from `content`, and refuses a `blob` that is not its sha256. */
 export function withBlobHashes(req: CommitRequest): CommitRequest {
@@ -112,22 +126,25 @@ export function applyFiles(tree: Tree, files: FileChange[]): Tree {
 }
 
 export class MemoryStore implements Store {
-  private readonly entries: Changeset[] = [];
+  private readonly logs = new Map<RepoId, Changeset[]>([[DEFAULT_REPO, []]]);
+  private readonly repos = new Map<RepoId, Repo>([[DEFAULT_REPO, { id: DEFAULT_REPO, headLsn: 0, createdAt: new Date().toISOString() }]]);
   private readonly byKey = new Map<string, Changeset>();
   private readonly intents = new Map<string, Intent>();
 
   async append(req: CommitRequest, decide?: Decide): Promise<Changeset> {
     const seen = this.byKey.get(req.idempotencyKey);
     if (seen) return seen;
-    const lsn = this.entries.length + 1;
+    const repo = repoOf(req);
+    const log = this.logs.get(repo);
+    if (log === undefined) throw unknownRepo(repo);
+    const lsn = log.length + 1;
     if (req.baseLsn >= lsn) throw new InvalidCommit(`baseLsn ${req.baseLsn} is not below the next LSN ${lsn}`);
-    if (req.intentId !== undefined && !this.intents.has(req.intentId)) {
-      throw new InvalidCommit(`unknown intent ${req.intentId}`);
-    }
-    const gap = this.entries.filter((e) => e.lsn > gapStart(req)).slice(0, GAP_LIMIT + 1);
+    const intent = req.intentId === undefined ? undefined : this.intents.get(req.intentId);
+    if (req.intentId !== undefined && intent === undefined) throw new InvalidCommit(`unknown intent ${req.intentId}`);
+    const gap = log.filter((e) => e.lsn > gapStart(req)).slice(0, GAP_LIMIT + 1);
     const decision = decide ? await decide(gap, lsn - 1) : {};
     const changeset: Changeset = {
-      repo: req.repo ?? DEFAULT_REPO,
+      repo,
       lsn,
       baseLsn: req.baseLsn,
       author: req.author,
@@ -141,31 +158,51 @@ export class MemoryStore implements Store {
       brainVersion: 0,
       createdAt: new Date().toISOString(),
     };
-    this.entries.push(changeset);
+    log.push(changeset);
     this.byKey.set(req.idempotencyKey, changeset);
-    const intent = req.intentId === undefined ? undefined : this.intents.get(req.intentId);
     if (intent?.status === "open") this.intents.set(intent.id, { ...intent, status: "committed" });
     return changeset;
   }
 
-  async entriesAfter(fromLsn: Lsn, limit: number): Promise<Changeset[]> {
-    return this.entries.filter((e) => e.lsn > fromLsn).slice(0, limit);
+  async entriesAfter(repo: RepoId, fromLsn: Lsn, limit: number): Promise<Changeset[]> {
+    return (this.logs.get(repo) ?? []).filter((e) => e.lsn > fromLsn).slice(0, limit);
   }
 
-  async headLsn(): Promise<Lsn> {
-    return this.entries.length;
+  async headLsn(repo: RepoId): Promise<Lsn> {
+    return this.logs.get(repo)?.length ?? 0;
   }
 
-  async treeAt(lsn: Lsn): Promise<Tree> {
+  async treeAt(repo: RepoId, lsn: Lsn): Promise<Tree> {
     const tree: Tree = new Map();
-    for (const entry of this.entries) if (entry.lsn <= lsn) applyFiles(tree, entry.files);
+    for (const entry of this.logs.get(repo) ?? []) if (entry.lsn <= lsn) applyFiles(tree, entry.files);
     return tree;
   }
 
+  async createRepo(id: RepoId): Promise<{ repo: Repo; created: boolean }> {
+    const existing = await this.getRepo(id);
+    if (existing) return { repo: existing, created: false };
+    const repo: Repo = { id, headLsn: 0, createdAt: new Date().toISOString() };
+    this.repos.set(id, repo);
+    this.logs.set(id, []);
+    return { repo, created: true };
+  }
+
+  async getRepo(id: RepoId): Promise<Repo | undefined> {
+    const repo = this.repos.get(id);
+    return repo === undefined ? undefined : { ...repo, headLsn: await this.headLsn(id) };
+  }
+
+  async listRepos(): Promise<Repo[]> {
+    const all = await Promise.all([...this.repos.keys()].sort().map((id) => this.getRepo(id)));
+    return all.flatMap((r) => (r === undefined ? [] : [r]));
+  }
+
   async openIntent(req: IntentRequest): Promise<Intent> {
+    const repo = repoOf(req);
+    if (!this.repos.has(repo)) throw unknownRepo(repo);
     const intent: Intent = {
       id: newIntentId(),
-      repo: req.repo ?? DEFAULT_REPO,
+      repo,
       author: req.author,
       baseLsn: req.baseLsn,
       text: req.text,

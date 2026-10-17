@@ -13,6 +13,9 @@ The single source of truth: the write-ahead log, the commit API, the WebSocket s
 - `buildApp()` in `src/app.ts` takes its dependencies as arguments so tests use `app.inject()` with fakes. Keep it that way.
 - Never deploy from a laptop. Pushing to `main` deploys through GitHub Actions.
 
+## Repositories
+One server, many repositories (`repos` table, migration 003). LSNs count per repository and every log table is keyed by `(repo, lsn)`; `PgStore.append` locks per repository. A request without `repo` means `local/default`; an unknown repository is `invalid_request` (`POST /repos` first). A stream socket follows one repository from its `subscribe` on and is answered with `head` before any entry. `GET /repos`, `GET /repos/:owner/:name`, `GET /log?repo=`.
+
 ## Access
 `PITSTOP_TOKEN`, when set, guards every route except `/healthz` and `/version`: `Authorization: Bearer <token>`, or `?token=` where a browser cannot set headers. Unset means open; keep it set on Azure (`infra/main.bicep` wires the GitHub secret).
 

@@ -1,28 +1,28 @@
 import type pg from "pg";
-import {
-  DEFAULT_REPO,
-  type Changeset,
-  type Checks,
-  type CommitRequest,
-  type FileChange,
-  type Intent,
-  type IntentRequest,
-  type Lsn,
-  type Repair,
+import type {
+  Changeset,
+  Checks,
+  CommitRequest,
+  FileChange,
+  Intent,
+  IntentRequest,
+  Lsn,
+  Repair,
+  Repo,
+  RepoId,
 } from "@pitstop/protocol";
 import {
   GAP_LIMIT,
   gapStart,
   InvalidCommit,
   newIntentId,
+  repoOf,
   SKIPPED_CHECKS,
+  unknownRepo,
   type Decide,
   type Store,
   type Tree,
 } from "./store.js";
-
-/** Every append takes this transaction-scoped advisory lock, so two commits never share or skip an LSN. */
-const APPEND_LOCK_ID = 7_301_421;
 
 /** A pool or a client inside a transaction; both answer `query`. */
 interface Queryable {
@@ -30,6 +30,7 @@ interface Queryable {
 }
 
 interface ChangesetRow {
+  repo: string;
   lsn: number;
   base_lsn: number;
   developer: string;
@@ -56,45 +57,59 @@ interface SymbolRow {
   kind: "read" | "write" | "sig_write";
 }
 
-/** The log in Postgres. Tables: server/migrations. LSNs are bigint in SQL and cast to int on the way out. */
+interface RepoRow {
+  id: string;
+  head: number;
+  created_at: Date;
+}
+
+/**
+ * The log in Postgres. Tables: server/migrations. LSNs are bigint in SQL and cast to int on the
+ * way out; they count per repository, and each repository's appends are serialised by their own
+ * transaction-scoped advisory lock, so two commits never share or skip an LSN.
+ */
 export class PgStore implements Store {
   constructor(private readonly pool: pg.Pool) {}
 
   async append(req: CommitRequest, decide?: Decide): Promise<Changeset> {
+    const repo = repoOf(req);
     const client = await this.pool.connect();
     try {
       await client.query("begin");
-      await client.query("select pg_advisory_xact_lock($1)", [APPEND_LOCK_ID]);
+      await client.query("select pg_advisory_xact_lock(hashtext($1)::bigint)", [repo]);
 
-      const seen = await client.query<{ lsn: number }>(
-        "select lsn::int as lsn from changesets where idempotency_key = $1",
+      const seen = await client.query<{ repo: string; lsn: number }>(
+        "select repo, lsn::int as lsn from changesets where idempotency_key = $1",
         [req.idempotencyKey],
       );
-      const seenLsn = seen.rows[0]?.lsn;
-      if (seenLsn !== undefined) {
-        const [existing] = await this.read(client, seenLsn - 1, 1);
+      const seenRow = seen.rows[0];
+      if (seenRow !== undefined) {
+        const [existing] = await this.read(client, seenRow.repo, seenRow.lsn - 1, 1);
         await client.query("commit");
-        if (!existing) throw new Error(`changeset ${seenLsn} vanished`);
+        if (!existing) throw new Error(`changeset ${seenRow.repo}#${seenRow.lsn} vanished`);
         return existing;
       }
 
-      const lsn = (await this.head(client)) + 1;
+      const known = await client.query("select 1 from repos where id = $1", [repo]);
+      if ((known.rowCount ?? 0) === 0) throw unknownRepo(repo);
+      const lsn = (await this.head(client, repo)) + 1;
       if (req.baseLsn >= lsn) throw new InvalidCommit(`baseLsn ${req.baseLsn} is not below the next LSN ${lsn}`);
       if (req.intentId !== undefined) {
-        const known = await client.query("select 1 from intents where id = $1", [req.intentId]);
-        if ((known.rowCount ?? 0) === 0) throw new InvalidCommit(`unknown intent ${req.intentId}`);
+        const intent = await client.query("select 1 from intents where id = $1", [req.intentId]);
+        if ((intent.rowCount ?? 0) === 0) throw new InvalidCommit(`unknown intent ${req.intentId}`);
       }
       const brain = await client.query<{ version: number | null }>("select max(version) as version from brain_versions");
 
       // The validator runs here, under the lock, so nothing lands between its look at the gap and this append.
-      const gap = decide ? await this.read(client, gapStart(req), GAP_LIMIT + 1) : [];
+      const gap = decide ? await this.read(client, repo, gapStart(req), GAP_LIMIT + 1) : [];
       const decision = decide ? await decide(gap, lsn - 1) : {};
 
       await client.query(
         `insert into changesets
-           (lsn, base_lsn, idempotency_key, developer, agent, intent, intent_id, repairs, checks, brain_version)
-         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+           (repo, lsn, base_lsn, idempotency_key, developer, agent, intent, intent_id, repairs, checks, brain_version)
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
         [
+          repo,
           lsn,
           req.baseLsn,
           req.idempotencyKey,
@@ -116,8 +131,8 @@ export class PgStore implements Store {
           ]);
         }
         await client.query(
-          "insert into changeset_files (lsn, path, op, blob_hash, from_path) values ($1, $2, $3, $4, $5)",
-          [lsn, f.path, f.op, f.blob ?? null, f.fromPath ?? null],
+          "insert into changeset_files (repo, lsn, path, op, blob_hash, from_path) values ($1, $2, $3, $4, $5, $6)",
+          [repo, lsn, f.path, f.op, f.blob ?? null, f.fromPath ?? null],
         );
       }
       const symbols: [string, SymbolRow["kind"]][] = [
@@ -127,17 +142,17 @@ export class PgStore implements Store {
       ];
       for (const [symbolId, kind] of symbols) {
         await client.query(
-          "insert into changeset_symbols (lsn, symbol_id, kind) values ($1, $2, $3) on conflict do nothing",
-          [lsn, symbolId, kind],
+          "insert into changeset_symbols (repo, lsn, symbol_id, kind) values ($1, $2, $3, $4) on conflict do nothing",
+          [repo, lsn, symbolId, kind],
         );
       }
       if (req.intentId !== undefined) {
         await client.query("update intents set status = 'committed' where id = $1 and status = 'open'", [req.intentId]);
       }
 
-      const [changeset] = await this.read(client, lsn - 1, 1);
+      const [changeset] = await this.read(client, repo, lsn - 1, 1);
       await client.query("commit");
-      if (!changeset) throw new Error(`changeset ${lsn} not readable after insert`);
+      if (!changeset) throw new Error(`changeset ${repo}#${lsn} not readable after insert`);
       return changeset;
     } catch (err) {
       await client.query("rollback").catch(() => undefined);
@@ -147,42 +162,75 @@ export class PgStore implements Store {
     }
   }
 
-  entriesAfter(fromLsn: Lsn, limit: number): Promise<Changeset[]> {
-    return this.read(this.pool, fromLsn, limit);
+  entriesAfter(repo: RepoId, fromLsn: Lsn, limit: number): Promise<Changeset[]> {
+    return this.read(this.pool, repo, fromLsn, limit);
   }
 
-  headLsn(): Promise<Lsn> {
-    return this.head(this.pool);
+  headLsn(repo: RepoId): Promise<Lsn> {
+    return this.head(this.pool, repo);
   }
 
-  async treeAt(lsn: Lsn): Promise<Tree> {
+  async treeAt(repo: RepoId, lsn: Lsn): Promise<Tree> {
     // The latest change per path up to `lsn`; a rename also ends its old path there.
     const rows = await this.pool.query<{ path: string; content: string }>(
       `with changes as (
-         select path, lsn, op, blob_hash from changeset_files where lsn <= $1
+         select path, lsn, op, blob_hash from changeset_files where repo = $1 and lsn <= $2
          union all
          select from_path as path, lsn, 'delete' as op, null as blob_hash
-         from changeset_files where lsn <= $1 and from_path is not null
+         from changeset_files where repo = $1 and lsn <= $2 and from_path is not null
        ),
        latest as (select distinct on (path) path, op, blob_hash from changes order by path, lsn desc)
        select l.path, convert_from(b.bytes, 'UTF8') as content
        from latest l join blobs b on b.hash = l.blob_hash
        where l.op <> 'delete' order by l.path`,
-      [lsn],
+      [repo, lsn],
     );
     return new Map(rows.rows.map((r) => [r.path, r.content]));
   }
 
+  async createRepo(id: RepoId): Promise<{ repo: Repo; created: boolean }> {
+    const inserted = await this.pool.query<{ created_at: Date }>(
+      "insert into repos (id) values ($1) on conflict (id) do nothing returning created_at",
+      [id],
+    );
+    const row = inserted.rows[0];
+    if (row !== undefined) return { repo: { id, headLsn: 0, createdAt: row.created_at.toISOString() }, created: true };
+    const existing = await this.getRepo(id);
+    if (existing === undefined) throw new Error(`repo ${id} vanished`);
+    return { repo: existing, created: false };
+  }
+
+  async getRepo(id: RepoId): Promise<Repo | undefined> {
+    const res = await this.pool.query<RepoRow>(
+      `select r.id, r.created_at, coalesce(max(c.lsn), 0)::int as head
+       from repos r left join changesets c on c.repo = r.id where r.id = $1 group by r.id`,
+      [id],
+    );
+    const row = res.rows[0];
+    return row === undefined ? undefined : { id: row.id, headLsn: row.head, createdAt: row.created_at.toISOString() };
+  }
+
+  async listRepos(): Promise<Repo[]> {
+    const res = await this.pool.query<RepoRow>(
+      `select r.id, r.created_at, coalesce(max(c.lsn), 0)::int as head
+       from repos r left join changesets c on c.repo = r.id group by r.id order by r.id`,
+    );
+    return res.rows.map((row) => ({ id: row.id, headLsn: row.head, createdAt: row.created_at.toISOString() }));
+  }
+
   async openIntent(req: IntentRequest): Promise<Intent> {
+    const repo = repoOf(req);
+    const known = await this.pool.query("select 1 from repos where id = $1", [repo]);
+    if ((known.rowCount ?? 0) === 0) throw unknownRepo(repo);
     const id = newIntentId();
     const res = await this.pool.query<{ heartbeat_at: Date }>(
-      `insert into intents (id, developer, agent, base_lsn, text, declared_symbols, status)
-       values ($1, $2, $3, $4, $5, $6, 'open') returning heartbeat_at`,
-      [id, req.author.developer, req.author.agent, req.baseLsn, req.text, req.declaredSymbols],
+      `insert into intents (id, repo, developer, agent, base_lsn, text, declared_symbols, status)
+       values ($1, $2, $3, $4, $5, $6, $7, 'open') returning heartbeat_at`,
+      [id, repo, req.author.developer, req.author.agent, req.baseLsn, req.text, req.declaredSymbols],
     );
     return {
       id,
-      repo: DEFAULT_REPO, // until migration 003 stores repositories
+      repo,
       author: req.author,
       baseLsn: req.baseLsn,
       text: req.text,
@@ -196,35 +244,36 @@ export class PgStore implements Store {
     await this.pool.query("update intents set heartbeat_at = now() where id = $1 and status = 'open'", [intentId]);
   }
 
-  private async head(db: Queryable): Promise<Lsn> {
-    const res = await db.query<{ head: number }>("select coalesce(max(lsn), 0)::int as head from changesets");
+  private async head(db: Queryable, repo: RepoId): Promise<Lsn> {
+    const res = await db.query<{ head: number }>("select coalesce(max(lsn), 0)::int as head from changesets where repo = $1", [repo]);
     return res.rows[0]?.head ?? 0;
   }
 
-  private async read(db: Queryable, fromLsn: Lsn, limit: number): Promise<Changeset[]> {
+  private async read(db: Queryable, repo: RepoId, fromLsn: Lsn, limit: number): Promise<Changeset[]> {
     const heads = await db.query<ChangesetRow>(
-      `select lsn::int as lsn, base_lsn::int as base_lsn, developer, agent, intent, repairs, checks,
+      `select repo, lsn::int as lsn, base_lsn::int as base_lsn, developer, agent, intent, repairs, checks,
               brain_version, created_at
-       from changesets where lsn > $1 order by lsn limit $2`,
-      [fromLsn, limit],
+       from changesets where repo = $1 and lsn > $2 order by lsn limit $3`,
+      [repo, fromLsn, limit],
     );
     if (heads.rows.length === 0) return [];
     const lsns = heads.rows.map((r) => r.lsn);
     const files = await db.query<FileRow>(
       `select f.lsn::int as lsn, f.path, f.op, f.blob_hash, f.from_path, convert_from(b.bytes, 'UTF8') as content
        from changeset_files f left join blobs b on b.hash = f.blob_hash
-       where f.lsn = any($1::bigint[]) order by f.lsn, f.path`,
-      [lsns],
+       where f.repo = $1 and f.lsn = any($2::bigint[]) order by f.lsn, f.path`,
+      [repo, lsns],
     );
     const symbols = await db.query<SymbolRow>(
-      "select lsn::int as lsn, symbol_id, kind from changeset_symbols where lsn = any($1::bigint[]) order by lsn, symbol_id",
-      [lsns],
+      `select lsn::int as lsn, symbol_id, kind from changeset_symbols
+       where repo = $1 and lsn = any($2::bigint[]) order by lsn, symbol_id`,
+      [repo, lsns],
     );
     return heads.rows.map((row) => {
       const own = <T extends { lsn: number }>(rows: T[]): T[] => rows.filter((r) => r.lsn === row.lsn);
       const syms = own(symbols.rows);
       return {
-        repo: DEFAULT_REPO, // until migration 003 stores repositories
+        repo: row.repo,
         lsn: row.lsn,
         baseLsn: row.base_lsn,
         author: { developer: row.developer, agent: row.agent },
