@@ -716,10 +716,17 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
       return;
     }
     const presented = presentedToken(req);
-    stream.connect(socket, async (repo) => {
-      if (presented?.startsWith("pst_") && (await deps.store.userForToken(presented)) === undefined) return false;
-      return allowed(identity, repo, "reader", deps.store, auth);
-    });
+    const revoked = async (): Promise<boolean> => presented?.startsWith("pst_") === true && (await deps.store.userForToken(presented)) === undefined;
+    stream.connect(
+      socket,
+      async (repo) => !(await revoked()) && allowed(identity, repo, "reader", deps.store, auth),
+      {
+        // Presence (stream.ts): written as the signed-in user, and only by writers, since what it
+        // says reaches the members' coding agents.
+        developer: identity.kind === "user" ? identity.user.login : undefined,
+        canWrite: async (repo) => !(await revoked()) && allowed(identity, repo, "writer", deps.store, auth),
+      },
+    );
   });
 
   // Fastify's default 404 logs the URL with its query string; this one logs nothing.

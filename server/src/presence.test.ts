@@ -378,6 +378,43 @@ describe("who may write presence", () => {
     stranger.close();
   });
 
+  it("is taken from a writer on the /stream route, as that user, and refused from a reader", async () => {
+    const store = new MemoryStore();
+    const oauth: OAuthProvider = { authorizeUrl: () => "https://github.test/authorize", exchange: async () => ({ githubId: 1, login: "alice" }) };
+    const app = await buildApp({ version: "test-sha", pingDb: async () => true, store, oauth, sessionSecret: "a-cookie-secret-for-tests" });
+    await app.listen({ host: "127.0.0.1", port: 0 });
+    cleanups.push(() => app.close());
+    const alice = await store.upsertUser({ githubId: 1, login: "alice" });
+    const bob = await store.upsertUser({ githubId: 2, login: "bob" });
+    await store.createRepo("alice/app");
+    await store.setMember("alice/app", alice.id, "owner");
+    await store.setMember("alice/app", bob.id, "reader");
+    const port = (app.server.address() as AddressInfo).port;
+    const as = async (secret: string): Promise<Inbox> =>
+      new Promise((resolve, reject) => {
+        const socket = new WebSocket(`ws://127.0.0.1:${port}/stream`, { headers: { authorization: `Bearer ${secret}` } });
+        const inbox = new Inbox(socket);
+        socket.once("open", () => resolve(inbox));
+        socket.once("error", reject);
+      });
+    const join = async (inbox: Inbox): Promise<Inbox> => {
+      expect(await inbox.next()).toMatchObject({ type: "hello" });
+      inbox.send({ type: "subscribe", repo: "alice/app", fromLsn: 0 });
+      expect(await inbox.next()).toMatchObject({ type: "head", repo: "alice/app" });
+      return inbox;
+    };
+    const writer = await join(await as((await store.createToken(alice.id, "laptop")).secret));
+    const reader = await join(await as((await store.createToken(bob.id, "laptop")).secret));
+
+    reader.send({ type: "presence", entry: entry("w_bob", 0, { repo: "alice/app" }) });
+    writer.send({ type: "presence", entry: entry("w_alice", 0, { repo: "alice/app", author: { developer: "someone-else", agent: "agent-a" } }) });
+    const seen = await reader.presence();
+    // The reader's own entry never landed; the writer's did, under the writer's login.
+    expect(seen.entries).toEqual([expect.objectContaining({ replica: "w_alice", author: { developer: "alice", agent: "agent-a" } })]);
+    writer.close();
+    reader.close();
+  });
+
   it("is taken for at most a few replicas from one socket", async () => {
     const { url } = await listenStream();
     const watcher = await subscribed(url);
