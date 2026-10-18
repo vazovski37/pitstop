@@ -30,10 +30,13 @@ import {
   type AuthConfig,
   type OAuthProvider,
 } from "./auth.js";
+import { checkedFiles, checkFiles } from "./adr-rules.js";
+import { afterCommit, brainSweep, enforceBrain, loadCommitBrain, registerBrainRoutes, STALE_AFTER_MS, SWEEP_MS, withBrain, type BrainContext } from "./brain.js";
 import { typecheckGate } from "./checks.js";
 import type { GitHubClient } from "./github.js";
 import { MirrorWorker } from "./mirror.js";
 import { escalation, repairCommit, type Repairer, type RepairMode } from "./repair.js";
+import { runReviews, type Reviewer } from "./review.js";
 import {
   gapStart,
   InvalidCommit,
@@ -91,6 +94,14 @@ export interface AppDeps {
   repair?: RepairMode;
   /** The model-backed repairer for `groq` mode; tests inject a fake. */
   repairer?: Repairer;
+  /** Answers the brain's advisory `ai_review` rules (review.ts); absent, they are noted as not run. Tests inject a fake. */
+  reviewer?: Reviewer;
+  /** How often the brain sweep runs (stale intents, expired leases); default 30 s, 0 never. */
+  sweepMs?: number;
+  /** An open intent with no heartbeat for this long is stale; default five minutes. */
+  staleAfterMs?: number;
+  /** The clock leases and the sweep read; tests move it. */
+  now?: () => Date;
   /** GitHub, for the git mirror (mirror.ts). Absent: the mirror routes answer 501. Tests inject a fake. */
   github?: GitHubClient;
   /** How often failed mirrors are retried; tests shorten it. */
@@ -120,6 +131,13 @@ const GitHubLogin = z.string().regex(/^[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9]
 const RepoPatch = z.object({ visibility: z.enum(["private", "public"]) });
 
 type RepoParams = { Params: { owner: string; name: string } };
+
+declare module "fastify" {
+  interface FastifyInstance {
+    /** Runs the brain sweep once (brain.ts): the timer's job, callable from tests. */
+    brainSweep: () => Promise<{ stale: unknown[]; ended: unknown[] }>;
+  }
+}
 
 /**
  * Answer of `GET /repos/:owner/:name/worktrees`: each connected worktree's applied LSN against the
@@ -280,6 +298,38 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   };
   const cookieBase = { httpOnly: true, sameSite: "lax" as const, secure: auth.secureCookies ?? false };
 
+  // The brain (brain.ts): ADRs, leases, the query API, and the sweep that marks quiet intents
+  // stale and expires leases, so a crashed agent never blocks anyone.
+  const now = deps.now ?? (() => new Date());
+  const brain: BrainContext = {
+    store: deps.store,
+    stream,
+    access,
+    may: (req, repo, role) => allowed(req.identity, repo, role, deps.store, auth),
+    isAdmin: (req) => isAdmin(req.identity, auth),
+    currentUser,
+    now,
+  };
+  const sweep = () => brainSweep(brain, deps.staleAfterMs ?? STALE_AFTER_MS);
+  app.decorate("brainSweep", sweep);
+  const sweepMs = deps.sweepMs ?? SWEEP_MS;
+  let sweepTimer: NodeJS.Timeout | undefined;
+  let sweeping = false;
+  app.addHook("onReady", async () => {
+    if (sweepMs <= 0) return;
+    sweepTimer = setInterval(() => {
+      if (sweeping) return;
+      sweeping = true;
+      sweep()
+        .catch((err: unknown) => app.log.error({ err }, "brain sweep failed"))
+        .finally(() => {
+          sweeping = false;
+        });
+    }, sweepMs);
+    sweepTimer.unref();
+  });
+  app.addHook("onClose", async () => clearInterval(sweepTimer));
+
   // The deploy smoke test (infra/smoke.sh) polls this until it reports the new version with db: true.
   app.get("/healthz", async (_req, reply) => {
     let db = false;
@@ -389,44 +439,61 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     // the committer is the only one who could decide, it bounces back as before.
     const deciders = repair === "agent" ? await decidersOf(repo) : [];
     const parks = deciders.length > 0 && !(user !== undefined && deciders.every((d) => d.userId === user.id));
+    // The brain (9.1, 9.4): the accepted ADRs, the version and the live leases, read before the
+    // append; the advisory ai_review rules asked of a model here too, outside the lock.
+    const brainNow = await loadCommitBrain(deps.store, repo, now());
+    const advisory = await runReviews(deps.reviewer, checkFiles(brainNow.adrs, checkedFiles(request.files)).reviews, request.intent);
+    let escalated: SkewVerdict | undefined;
     try {
       let skew: SkewVerdict | undefined;
       const changeset = await deps.store.append(request, async (gap, head): Promise<Decision> => {
-        // With a resolver, the validator only reports skew; what happens to it is decided here.
-        const outcome = decideCommit(request, gap, head, repair === "off" ? mode : "warn");
-        let decision = outcome.decision;
-        if (outcome.skew !== undefined && repair !== "off") {
-          if (repair === "agent" && parks) throw new Parked(outcome.skew, head);
-          // `agent`: the coding agent that committed is the resolver; it gets told what changed.
-          // No trees needed for that, and reading them here would ask the pool for a second
-          // connection while this one holds the repository's lock.
-          if (repair === "agent" || deps.repairer === undefined) {
-            throw escalation({ request, skew: outcome.skew, gap, headLsn: head });
+        // A lease another agent holds, or a broken ADR rule, refuses the commit before anything else.
+        const brainCheck = enforceBrain(brainNow, request, request.files);
+        const decided = async (): Promise<Decision> => {
+          // With a resolver, the validator only reports skew; what happens to it is decided here.
+          const outcome = decideCommit(request, gap, head, repair === "off" ? mode : "warn");
+          let decision = outcome.decision;
+          if (outcome.skew !== undefined && repair !== "off") {
+            if (repair === "agent" && parks) throw new Parked(outcome.skew, head);
+            // What the live view is told if this ends in an escalation (here, or after repair gave up).
+            escalated = outcome.skew;
+            // `agent`: the coding agent that committed is the resolver; it gets told what changed.
+            // No trees needed for that, and reading them here would ask the pool for a second
+            // connection while this one holds the repository's lock.
+            if (repair === "agent" || deps.repairer === undefined) {
+              throw escalation({ request, skew: outcome.skew, gap, headLsn: head });
+            }
+            const input = {
+              request,
+              skew: outcome.skew,
+              gap,
+              headLsn: head,
+              head: await deps.store.treeAt(repo, head),
+              base: await deps.store.treeAt(repo, gapStart(request)),
+            };
+            decision = await repairCommit(input, deps.repairer);
+            escalated = undefined;
+            // A repair rewrote the files: they answer to the same rules.
+            if (decision.files !== undefined) enforceBrain(brainNow, request, decision.files);
+          } else {
+            skew = outcome.skew;
           }
-          const input = {
-            request,
-            skew: outcome.skew,
-            gap,
-            headLsn: head,
-            head: await deps.store.treeAt(repo, head),
-            base: await deps.store.treeAt(repo, gapStart(request)),
-          };
-          decision = await repairCommit(input, deps.repairer);
-        } else {
-          skew = outcome.skew;
-        }
-        if (check !== "always") return decision;
-        // The constraint of section 7.4: the merged tree must type-check, or the commit does not land.
-        const gate = await typecheckGate(await deps.store.treeAt(repo, head), decision.files ?? request.files);
-        if (gate.typecheck === "fail") {
-          throw new RejectedCommit("constraint_failed", `type check failed on the merged tree:\n${gate.details ?? ""}`);
-        }
-        const checks = decision.checks ?? SKIPPED_CHECKS;
-        const details = [checks.details, gate.details].filter((d) => d !== undefined).join("; ");
-        return { ...decision, checks: { ...checks, typecheck: gate.typecheck, ...(details === "" ? {} : { details }) } };
+          if (check !== "always") return decision;
+          // The constraint of section 7.4: the merged tree must type-check, or the commit does not land.
+          const gate = await typecheckGate(await deps.store.treeAt(repo, head), decision.files ?? request.files);
+          if (gate.typecheck === "fail") {
+            throw new RejectedCommit("constraint_failed", `type check failed on the merged tree:\n${gate.details ?? ""}`);
+          }
+          const checks = decision.checks ?? SKIPPED_CHECKS;
+          const details = [checks.details, gate.details].filter((d) => d !== undefined).join("; ");
+          return { ...decision, checks: { ...checks, typecheck: gate.typecheck, ...(details === "" ? {} : { details }) } };
+        };
+        return withBrain(await decided(), brainNow, brainCheck, advisory);
       });
       stream.notify(repo);
       mirrors?.kick(repo);
+      // The intent it closed: every worktree hears it, and its leases go.
+      await afterCommit(brain, repo, request.intentId);
       if (skew) {
         // Without a resolver the skew lands as is; the daemon and the live view hear about it.
         stream.broadcast(repo, {
@@ -468,7 +535,21 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
         );
       }
       if (err instanceof InvalidCommit) return rejected(reply, "invalid_request", err.message);
-      if (err instanceof RejectedCommit) return rejected(reply, err.reason, err.message, err.conflictsWith);
+      if (err instanceof RejectedCommit) {
+        if (err.reason === "escalated" && escalated !== undefined) {
+          // The plain escalation: the committing agent adapts its own change. The live view hears
+          // about it as it does about a parked one.
+          stream.broadcast(repo, {
+            type: "warning",
+            repo,
+            agent: author.agent,
+            kind: "dependency_changed",
+            message: `"${request.intent}" by ${author.developer} went back to ${author.agent} to adapt: write skew, ${describeSkew(escalated)}`,
+            symbols: escalated.symbols.map((s) => s.symbolId),
+          });
+        }
+        return rejected(reply, err.reason, err.message, err.conflictsWith);
+      }
       throw err;
     }
   });
@@ -488,19 +569,24 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     if (decided === undefined) return reply;
     const { parked, login } = decided;
     try {
+      const brainNow = await loadCommitBrain(deps.store, repo, now());
       const changeset = await deps.store.append(parked.request, (gap, head) => {
+        // The brain still holds: an ADR accepted, or a lease taken, while it waited.
+        const brainCheck = enforceBrain(brainNow, parked.request, parked.request.files);
         // Writes are still checked: a file someone changed since cannot be overwritten blind.
         const outcome = decideCommit(parked.request, gap, head, "warn");
         const found = outcome.skew === undefined ? parked.skew : describeSkew(outcome.skew);
-        return {
+        const decision: Decision = {
           ...outcome.decision,
           checks: { ...SKIPPED_CHECKS, details: `write skew accepted by ${login}: ${found}` },
           repairs: [{ againstLsn: parked.conflictsWith.at(-1) ?? head, kind: "semantic", summary: `write skew accepted as is by ${login}` }],
         };
+        return withBrain(decision, brainNow, brainCheck, []);
       });
       await deps.store.decideParked(repo, parked.id, { status: "accepted", decidedBy: login, landedLsn: changeset.lsn });
       stream.notify(repo);
       mirrors?.kick(repo);
+      await afterCommit(brain, repo, parked.request.intentId);
       stream.broadcast(repo, {
         type: "warning",
         repo,
@@ -695,17 +781,24 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     return reply.code(204).send();
   });
 
-  // The log over HTTP: for the live view, catch-up by hand, and debugging.
-  app.get<{ Querystring: { repo?: string; fromLsn?: string; limit?: string } }>("/log", async (req, reply) => {
+  // The log over HTTP: for the live view, catch-up by hand, and debugging. `touches` (a path glob)
+  // keeps only entries that changed a matching file, `since` is `fromLsn` by its query-API name.
+  app.get<{ Querystring: { repo?: string; fromLsn?: string; since?: string; touches?: string; limit?: string } }>("/log", async (req, reply) => {
     const repo = RepoId.safeParse(req.query.repo ?? DEFAULT_REPO);
     if (!repo.success) return reply.code(400).send({ error: "invalid_request", message: "repo must be owner/name in lowercase" });
-    const fromLsn = Lsn.safeParse(Number(req.query.fromLsn ?? 0));
-    if (!fromLsn.success) return reply.code(400).send({ error: "invalid_request", message: "fromLsn must be an LSN" });
+    const fromLsn = Lsn.safeParse(Number(req.query.since ?? req.query.fromLsn ?? 0));
+    if (!fromLsn.success) return reply.code(400).send({ error: "invalid_request", message: "fromLsn (since) must be an LSN" });
     if (!(await access(req, reply, repo.data, "reader"))) return reply;
     const limit = Math.min(Math.max(Math.trunc(Number(req.query.limit)) || LOG_PAGE, 1), LOG_PAGE_MAX);
-    const entries: Changeset[] = await deps.store.entriesAfter(repo.data, fromLsn.data, limit);
+    const touches = req.query.touches;
+    const entries: Changeset[] =
+      touches === undefined || touches === ""
+        ? await deps.store.entriesAfter(repo.data, fromLsn.data, limit)
+        : await deps.store.findEntries(repo.data, { touches, since: fromLsn.data, limit });
     return entries;
   });
+
+  registerBrainRoutes(app, brain);
 
   // hello, then replay after the daemon's fromLsn, then live (section 8.2). See stream.ts.
   app.get("/stream", { websocket: true }, (socket, req) => {
