@@ -1,0 +1,69 @@
+{
+  "adr": {
+    "repo": "teamdb/demo",
+    "number": 1,
+    "title": "Pages never touch the database",
+    "status": "accepted",
+    "decision": "Code under src/pages reads data through src/services, never from src/db directly.",
+    "reason": "One place owns queries, caching and access checks.",
+    "consequences": "A page that needs data adds or uses a service function.",
+    "rules": [
+      { "kind": "forbid_import", "files": "src/pages/**", "target": "src/db/**" },
+      { "kind": "forbid_call", "files": "src/pages/**", "call": "db.query" },
+      { "kind": "forbid_pattern", "files": "src/**", "pattern": "console\\.log\\(", "message": "use the logger" },
+      { "kind": "ai_review", "files": "src/auth/**", "question": "Does this change keep expired sessions out?" }
+    ],
+    "version": 1,
+    "createdBy": "vazovski37",
+    "createdAt": "2026-10-18T03:00:00Z",
+    "decidedBy": "vazovski37",
+    "decidedAt": "2026-10-18T03:05:00Z"
+  },
+  "lease": {
+    "repo": "teamdb/demo",
+    "symbol": "src/auth/session.ts#getCurrentUser",
+    "holder": { "developer": "vazovski37", "agent": "agent-a" },
+    "intentId": "int_01",
+    "reason": "changing its return type",
+    "status": "held",
+    "expiresAt": "2026-10-18T03:15:00Z",
+    "createdAt": "2026-10-18T03:05:00Z"
+  },
+  "serverMessages": [
+    { "type": "brain", "repo": "teamdb/demo", "version": 1, "adr": { "repo": "teamdb/demo", "number": 1, "title": "Pages never touch the database", "status": "accepted", "decision": "Pages read data through services.", "reason": "", "consequences": "", "rules": [], "version": 1, "createdBy": "vazovski37", "createdAt": "2026-10-18T03:00:00Z" } },
+    { "type": "lease", "lease": { "repo": "teamdb/demo", "symbol": "src/auth/session.ts#getCurrentUser", "holder": { "developer": "vazovski37", "agent": "agent-a" }, "status": "released", "reason": "", "expiresAt": "2026-10-18T03:15:00Z", "createdAt": "2026-10-18T03:05:00Z" } },
+    {
+      "type": "presence",
+      "repo": "teamdb/demo",
+      "entries": [
+        {
+          "replica": "w_7f3a9c21",
+          "repo": "teamdb/demo",
+          "author": { "developer": "vazovski37", "agent": "agent-a" },
+          "state": "working",
+          "intent": "Fix the expired-session bug in auth",
+          "intentId": "int_01",
+          "files": ["src/auth/session.ts"],
+          "symbols": ["src/auth/session.ts#getCurrentUser"],
+          "appliedLsn": 1,
+          "stamp": "001792270000000.000000.w_7f3a9c21"
+        }
+      ]
+    }
+  ],
+  "clientMessages": [
+    {
+      "type": "presence",
+      "entry": {
+        "replica": "w_0b51de44",
+        "repo": "teamdb/demo",
+        "author": { "developer": "lbala23", "agent": "agent-b" },
+        "state": "idle",
+        "files": [],
+        "symbols": [],
+        "appliedLsn": 1,
+        "stamp": "001792270000500.000003.w_0b51de44"
+      }
+    }
+  ]
+}
