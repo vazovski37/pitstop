@@ -6,6 +6,10 @@
  * Behaviour copied from server/src/stream.ts: `hello` on connect, then after `subscribe` a
  * `head` for the repository, every entry above `fromLsn` in order, then entries appended by
  * commits as they happen. One repository only (`DEFAULT_REPO` unless the request names one).
+ *
+ * The brain and the query API (server/src/brain.ts) in miniature: `GET /repos/:o/:n/brain` from
+ * `setBrain`, leases with one holder per symbol, a symbol's history and callers, and why a path
+ * is so, all from the entries it holds. `broadcast` pushes a `brain` or `lease` message.
  */
 import { readFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
@@ -19,9 +23,11 @@ import {
   IntentRequest,
   ServerMessage,
   RepoId,
+  type Adr,
   type Changeset,
   type CommitResponse,
   type Intent,
+  type Lease,
   type Repo,
 } from "@pitstop/protocol";
 
@@ -61,6 +67,12 @@ export interface FakeServer {
   append(changeset: Changeset): void;
   /** Makes the next `POST /commit` answer `rejected` with this, like the validator or repair would. */
   rejectNextCommit(rejection: Rejection): void;
+  /** What `GET /repos/:o/:n/brain` answers: the brain version and the ADRs. */
+  setBrain(brain: { version: number; adrs: Adr[] }): void;
+  /** Live leases, by symbol: taken through `POST /repos/:o/:n/leases`, or put here by a test. */
+  leases: Map<string, Lease>;
+  /** Pushes a message to every subscriber, as the server does with `brain` and `lease`. */
+  broadcast(message: ServerMessage): void;
   close(): Promise<void>;
 }
 
@@ -85,6 +97,8 @@ export async function startFakeServer(opts: FakeServerOptions = {}): Promise<Fak
   const subscribers = new Map<WebSocket, { lastSentLsn: number | null }>();
   let dropped = false;
   let rejectNext: Rejection | undefined;
+  let brain: { version: number; adrs: Adr[] } = { version: 0, adrs: [] };
+  const leases = new Map<string, Lease>();
 
   const authorized = (req: IncomingMessage): boolean => {
     if (opts.token === undefined) return true;
@@ -115,9 +129,106 @@ export async function startFakeServer(opts: FakeServerOptions = {}): Promise<Fak
     entries.push(changeset);
     for (const socket of subscribers.keys()) deliver(socket);
   };
+  const broadcast = (message: ServerMessage) => {
+    for (const socket of subscribers.keys()) sendTo(socket, message);
+  };
+  /** An entry as the query API answers it. */
+  const entryView = (e: Changeset) => ({
+    lsn: e.lsn,
+    intent: e.intent,
+    author: e.author,
+    createdAt: e.createdAt,
+    brainVersion: e.brainVersion,
+    files: e.files.map((f) => ({ path: f.path, op: f.op })),
+    repairs: e.repairs.map((r) => r.summary),
+  });
+  const newestFirst = (list: Changeset[]) => [...list].sort((a, b) => b.lsn - a.lsn);
+
+  /** The brain and the query API; undefined when the request is not one of theirs. */
+  const brainRoute = async (req: IncomingMessage, res: ServerResponse): Promise<boolean> => {
+    const url = new URL(req.url ?? "/", "http://fake");
+    const m = /^\/repos\/([^/]+)\/([^/]+)\/(brain|leases|why|symbols\/([^/]+)\/(history|callers))$/.exec(url.pathname);
+    if (m === null) return false;
+    const repo = `${m[1]}/${m[2]}`;
+    const what = m[3] as string;
+    if (what === "brain" && req.method === "GET") {
+      json(res, 200, { repo, version: brain.version, adrs: brain.adrs, leases: [...leases.values()], intents: intents.filter((i) => i.status === "open") });
+      return true;
+    }
+    if (what === "leases" && req.method === "POST") {
+      const body = (await readJson(req)) as { symbol: string; agent: string; developer?: string; reason?: string; ttlSeconds?: number; intentId?: string };
+      const held = leases.get(body.symbol);
+      const holder = { developer: body.developer ?? "fake", agent: body.agent };
+      if (held !== undefined && (held.holder.agent !== holder.agent || held.holder.developer !== holder.developer)) {
+        json(res, 409, { error: "leased", message: `${body.symbol} is leased to ${held.holder.agent} (${held.holder.developer}) until ${held.expiresAt}${held.reason ? `: ${held.reason}` : ""}`, lease: held });
+        return true;
+      }
+      const lease: Lease = {
+        repo,
+        symbol: body.symbol,
+        holder,
+        ...(body.intentId === undefined ? {} : { intentId: body.intentId }),
+        reason: body.reason ?? "",
+        status: "held",
+        expiresAt: new Date(Date.now() + (body.ttlSeconds ?? 300) * 1000).toISOString(),
+        createdAt: held?.createdAt ?? new Date().toISOString(),
+      };
+      leases.set(body.symbol, lease);
+      broadcast({ type: "lease", lease });
+      json(res, held === undefined ? 201 : 200, { lease, renewed: held !== undefined });
+      return true;
+    }
+    if (what === "leases" && req.method === "DELETE") {
+      const symbol = url.searchParams.get("symbol") ?? "";
+      const held = leases.get(symbol);
+      if (held === undefined) {
+        json(res, 404, { error: "not_found", message: `nobody holds a lease on ${symbol}` });
+        return true;
+      }
+      const agent = url.searchParams.get("agent");
+      if (agent !== null && agent !== held.holder.agent) {
+        json(res, 403, { error: "forbidden", message: `${symbol} is held by ${held.holder.agent} (${held.holder.developer}); only its holder or an owner releases it` });
+        return true;
+      }
+      leases.delete(symbol);
+      const released: Lease = { ...held, status: "released" };
+      broadcast({ type: "lease", lease: released });
+      json(res, 200, released);
+      return true;
+    }
+    if (what === "why" && req.method === "GET") {
+      const path = url.searchParams.get("path") ?? "";
+      const touched = newestFirst(entries.filter((e) => e.files.some((f) => f.path === path || f.fromPath === path)));
+      json(res, 200, { path, entries: touched.map((e) => ({ ...entryView(e), op: e.files.find((f) => f.path === path || f.fromPath === path)?.op ?? "modify" })) });
+      return true;
+    }
+    if (req.method === "GET" && m[4] !== undefined) {
+      const symbol = decodeURIComponent(m[4]);
+      if (m[5] === "history") {
+        const wrote = newestFirst(entries.filter((e) => e.writeSet.includes(symbol) || e.sigWriteSet.includes(symbol)));
+        const lease = leases.get(symbol);
+        json(res, 200, {
+          symbol,
+          history: wrote.map((e) => ({ ...entryView(e), signature: e.sigWriteSet.includes(symbol) })),
+          declaredBy: intents.filter((i) => i.status === "open" && i.declaredSymbols.includes(symbol)).map((i) => ({ id: i.id, text: i.text, author: i.author })),
+          ...(lease === undefined ? {} : { lease }),
+        });
+      } else {
+        const read = newestFirst(entries.filter((e) => e.readSet.includes(symbol)));
+        json(res, 200, {
+          symbol,
+          derivedFrom: "the read sets of landed entries (what each change referred to), not a parsed call graph",
+          callers: read.map((e) => ({ ...entryView(e), wrote: [...new Set([...e.writeSet, ...e.sigWriteSet])] })),
+        });
+      }
+      return true;
+    }
+    return false;
+  };
 
   const handle = async (req: IncomingMessage, res: ServerResponse) => {
     if (!authorized(req)) return json(res, 401, { error: "unauthorized" });
+    if (await brainRoute(req, res)) return;
     if (req.method === "POST" && req.url === "/commit") {
       const parsed = CommitRequest.safeParse(await readJson(req));
       if (!parsed.success) {
@@ -148,7 +259,7 @@ export async function startFakeServer(opts: FakeServerOptions = {}): Promise<Fak
         readSet: r.readSet,
         repairs: [],
         checks: { typecheck: "skipped", tests: "skipped", adr: "skipped" },
-        brainVersion: 0,
+        brainVersion: brain.version,
         createdAt: new Date().toISOString(),
       };
       append(changeset);
@@ -236,6 +347,11 @@ export async function startFakeServer(opts: FakeServerOptions = {}): Promise<Fak
     rejectNextCommit: (rejection) => {
       rejectNext = rejection;
     },
+    setBrain: (next) => {
+      brain = next;
+    },
+    leases,
+    broadcast,
     close: () =>
       new Promise<void>((resolve, reject) => {
         for (const socket of subscribers.keys()) socket.terminate();

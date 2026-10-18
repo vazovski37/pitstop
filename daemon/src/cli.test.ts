@@ -68,6 +68,29 @@ describe("the CLI acts on the checkout around the current directory", { timeout:
     expect(await liveDaemon(checkout)).toBeUndefined();
   });
 
+  it("brain lists the ADRs and leases, and lease takes, refuses and releases one symbol", async () => {
+    await writeFileConfig(checkout, { serverUrl: server.url, token: "y-token-for-this-server", repo: "team/app", agent: "carol-claude" });
+    const env = shell({ PITSTOP_DEVELOPER: "carol" });
+    server.setBrain({
+      version: 1,
+      adrs: [{ repo: "team/app", number: 1, title: "No console.log", status: "accepted", decision: "Use the logger.", reason: "", consequences: "", rules: [{ kind: "forbid_pattern", files: "src/**", pattern: "console\\.log\\(" }], version: 1, createdBy: "a", createdAt: "2026-10-18T03:00:00Z" }],
+    });
+    const taken = await pitstop(["lease", "src/a.ts#a", "-r", "renaming it"], checkout, env);
+    expect(taken.code).toBe(0);
+    expect(taken.out).toMatch(/src\/a\.ts#a is yours until \d\d:\d\dZ/);
+    expect(server.leases.get("src/a.ts#a")).toMatchObject({ holder: { developer: "carol", agent: "carol-claude" }, reason: "renaming it" });
+    const brain = await pitstop(["brain"], checkout, env);
+    expect(brain.out).toContain("Brain v1 of team/app: 1 accepted ADR, 1 live lease, 0 open intents.");
+    expect(brain.out).toContain("ADR-1 No console.log: Use the logger. Rules: forbid_pattern src/**: /console\\.log\\(/.");
+    expect(brain.out).toContain("Lease: src/a.ts#a leased to carol-claude (carol) until");
+    expect(brain.out).toContain("(yours)");
+    const other = await pitstop(["lease", "src/a.ts#a"], checkout, shell({ PITSTOP_DEVELOPER: "dan", PITSTOP_AGENT: "dan-claude" }));
+    expect(other.code).toBe(1);
+    expect(other.out).toContain("src/a.ts#a is leased to carol-claude (carol)");
+    expect((await pitstop(["lease", "src/a.ts#a", "--release"], checkout, env)).out).toContain("released src/a.ts#a");
+    expect(server.leases.size).toBe(0);
+  });
+
   it("start and daemon outside any checkout refuse, instead of following some server's default repository", async () => {
     for (const command of ["start", "daemon"]) {
       const r = await pitstop([command], outside, shell({}));

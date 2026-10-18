@@ -32,6 +32,8 @@ export interface Intent {
   text: string;
   baseLsn: number;
   declaredSymbols: string[];
+  /** The brain in brief (daemon/src/brain.ts): the ADRs, and leases others hold on the declared symbols. */
+  brief?: string[];
 }
 
 export type CommitAnswer =
@@ -41,9 +43,11 @@ export type CommitAnswer =
 export interface WhyEntry {
   lsn: number;
   intent: string;
+  intentId?: string;
   agent: string;
   op: string;
   createdAt: string;
+  brainVersion?: number;
   repairs: string[];
 }
 
@@ -52,6 +56,28 @@ export interface Ref {
   intent: string;
   agent: string;
   files: string[];
+  /** For a reader: what its change wrote. */
+  wrote?: string[];
+}
+
+export interface CallersAnswer {
+  readers: Ref[];
+  writers: Ref[];
+  /** How callers are known (read sets, not a call graph). */
+  note?: string;
+}
+
+export interface LeaseAnswer {
+  status: "held" | "refused" | "released";
+  message: string;
+  lease?: { symbol: string; expiresAt: string; holder: { developer: string; agent: string } };
+}
+
+export interface HistoryAnswer {
+  symbol: string;
+  history: { lsn: number; intent: string; intentId?: string; author: { developer: string; agent: string }; createdAt: string; signature: boolean; brainVersion: number; repairs: string[] }[];
+  declaredBy: { id: string; text: string; author: { developer: string; agent: string } }[];
+  lease?: { expiresAt: string; reason: string; holder: { developer: string; agent: string } };
 }
 
 export class DaemonClient {
@@ -80,8 +106,20 @@ export class DaemonClient {
     return this.call("GET", `/why?path=${encodeURIComponent(path)}`) as Promise<WhyEntry[]>;
   }
 
-  callers(symbol: string): Promise<{ readers: Ref[]; writers: Ref[] }> {
-    return this.call("GET", `/callers?symbol=${encodeURIComponent(symbol)}`) as Promise<{ readers: Ref[]; writers: Ref[] }>;
+  callers(symbol: string): Promise<CallersAnswer> {
+    return this.call("GET", `/callers?symbol=${encodeURIComponent(symbol)}`) as Promise<CallersAnswer>;
+  }
+
+  history(symbol: string): Promise<HistoryAnswer> {
+    return this.call("GET", `/history?symbol=${encodeURIComponent(symbol)}`) as Promise<HistoryAnswer>;
+  }
+
+  brain(): Promise<{ version: number; lines: string[] }> {
+    return this.call("GET", "/brain") as Promise<{ version: number; lines: string[] }>;
+  }
+
+  lease(symbol: string, opts: { reason?: string; ttlSeconds?: number; release?: boolean } = {}): Promise<LeaseAnswer> {
+    return this.call("POST", "/lease", { symbol, ...opts }) as Promise<LeaseAnswer>;
   }
 
   private async call(method: string, path: string, body?: unknown): Promise<unknown> {

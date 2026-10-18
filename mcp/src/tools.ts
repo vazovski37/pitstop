@@ -42,8 +42,13 @@ export const DESCRIPTIONS = {
   commit:
     "Commit your unfinished work in this worktree to the Pitstop log with a one-line intent. The server validates it against entries that landed meanwhile; a rejection tells you exactly what changed and what to do.",
   why: "Which log entries touched a file, latest first: the intent behind it, who did it, and any repair.",
-  callers: "Which log entries read a symbol (its callers, as far as the log knows) and which changed it. Symbols are path#qualified.name, e.g. src/auth/session.ts#getCurrentUser.",
+  callers: "Which log entries read a symbol (its callers, as far as the log knows: from read sets, not a call graph) and what they changed, and which entries changed the symbol. Symbols are path#qualified.name, e.g. src/auth/session.ts#getCurrentUser.",
   status: "Where this worktree stands: applied and head LSN, pending entries, your open intent, other agents' open intents.",
+  brain:
+    "The repository's brain: its version, the accepted architecture decisions (ADRs) with the rules every commit is checked against, the live leases on symbols, and the open intents.",
+  lease:
+    "Take a short lease on one hot symbol (path#name) before a risky change to it, with a reason: while you hold it, another agent's commit that writes it is refused. It lasts while your intent is open (your heartbeats renew it) and is released when you commit; release it early with release: true. Refused when another agent holds it.",
+  history: "Every change to a symbol (path#name), newest first: who, which intent, whether its signature changed, and who has it declared or leased now.",
 } as const;
 
 export function makeTools(client: DaemonClient, opts: ToolOptions = {}) {
@@ -53,7 +58,8 @@ export function makeTools(client: DaemonClient, opts: ToolOptions = {}) {
       guarded(async () => {
         const intent = await client.declareIntent(text, symbols);
         const declared = intent.declaredSymbols.length > 0 ? ` Declared: ${intent.declaredSymbols.join(", ")}.` : "";
-        return ok(`Intent ${intent.id} is open at #${intent.baseLsn}: "${intent.text}".${declared} Use the commit tool when the work is done.`);
+        const brief = intent.brief === undefined || intent.brief.length === 0 ? "" : `\n${intent.brief.join("\n")}`;
+        return ok(`Intent ${intent.id} is open at #${intent.baseLsn}: "${intent.text}".${declared} Use the commit tool when the work is done.${brief}`);
       }),
 
     commit: (intent: string) =>
@@ -80,20 +86,49 @@ export function makeTools(client: DaemonClient, opts: ToolOptions = {}) {
         if (entries.length === 0) return ok(`No entry in the log touched ${path}.`);
         const lines = entries.map((e) => {
           const repaired = e.repairs.length > 0 ? ` Repaired: ${e.repairs.join("; ")}.` : "";
-          return `#${e.lsn} ${e.agent} "${e.intent}" (${e.op}, ${e.createdAt}).${repaired}`;
+          const brain = e.brainVersion === undefined || e.brainVersion === 0 ? "" : `, brain v${e.brainVersion}`;
+          return `#${e.lsn} ${e.agent} "${e.intent}" (${e.op}, ${e.createdAt}${brain}).${repaired}`;
         });
         return ok(lines.join("\n"));
       }),
 
     callers: (symbol: string) =>
       guarded(async () => {
-        const { readers, writers } = await client.callers(symbol);
+        const { readers, writers, note } = await client.callers(symbol);
         if (readers.length === 0 && writers.length === 0) return ok(`No entry in the log read or changed ${symbol}.`);
-        const line = (r: { lsn: number; agent: string; intent: string; files: string[] }) => `  #${r.lsn} ${r.agent} "${r.intent}" (${r.files.join(", ")})`;
+        const line = (r: { lsn: number; agent: string; intent: string; files: string[]; wrote?: string[] }) =>
+          `  #${r.lsn} ${r.agent} "${r.intent}" (${r.wrote !== undefined && r.wrote.length > 0 ? `wrote ${r.wrote.join(", ")}` : r.files.join(", ")})`;
         const parts: string[] = [];
-        if (readers.length > 0) parts.push(`Read by:\n${readers.map(line).join("\n")}`);
+        if (readers.length > 0) parts.push(`Read by${note === undefined ? "" : ` (${note})`}:\n${readers.map(line).join("\n")}`);
         if (writers.length > 0) parts.push(`Changed by:\n${writers.map(line).join("\n")}`);
         return ok(parts.join("\n"));
+      }),
+
+    brain: () =>
+      guarded(async () => {
+        const { lines } = await client.brain();
+        return ok(lines.join("\n"));
+      }),
+
+    lease: (symbol: string, opts: { reason?: string; minutes?: number; release?: boolean } = {}) =>
+      guarded(async () => {
+        const answer = await client.lease(symbol, {
+          ...(opts.reason === undefined ? {} : { reason: opts.reason }),
+          ...(opts.minutes === undefined ? {} : { ttlSeconds: Math.round(opts.minutes * 60) }),
+          ...(opts.release === true ? { release: true } : {}),
+        });
+        if (answer.status === "refused") return fail(`Lease refused: ${answer.message}. Leave that symbol alone (a commit writing it is refused) or wait until the lease ends.`);
+        if (answer.status === "released") return ok(`Released the lease on ${symbol}.`);
+        return ok(`Lease taken: ${answer.message}. Other agents' commits that write it are refused until you commit (which releases it) or it expires; your heartbeats renew it while your intent is open.`);
+      }),
+
+    history: (symbol: string) =>
+      guarded(async () => {
+        const h = await client.history(symbol);
+        const lines = h.history.map((e) => `#${e.lsn} ${e.author.agent} "${e.intent}"${e.intentId === undefined ? "" : ` (${e.intentId})`}${e.signature ? ", signature changed" : ""} at ${e.createdAt}`);
+        if (h.declaredBy.length > 0) lines.push(`Declared now by: ${h.declaredBy.map((i) => `${i.author.agent} "${i.text}" (${i.id})`).join("; ")}`);
+        if (h.lease !== undefined) lines.push(`Leased to ${h.lease.holder.agent} (${h.lease.holder.developer}) until ${h.lease.expiresAt}${h.lease.reason ? `: ${h.lease.reason}` : ""}`);
+        return ok(lines.length === 0 ? `No entry in the log changed ${symbol}.` : lines.join("\n"));
       }),
 
     status: () =>

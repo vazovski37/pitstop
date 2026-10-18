@@ -15,11 +15,15 @@
  *   pitstop intent -m "<text>" [-s a,b]  declare an intent (symbols as path#name); the next commit closes it
  *   pitstop safe-point                   tell the running daemon the agent is between tools (the hook's command)
  *   pitstop status                       what the running daemon knows
+ *   pitstop brain                        the repository's ADRs, leases and open intents (design doc section 9)
+ *   pitstop lease <path#name> [-r why] [--release]
+ *                                        take (or release) a short lease on one symbol for the open intent
  *
  * Configuration: .pitstop/config.json (written by init) under the environment; see config.ts.
  */
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
+import { brainBrief, brainLines, fetchBrain, releaseLease, takeLease } from "./brain.js";
 import { BUNDLED, VERSION } from "./build-info.js";
 import { cloneRepository } from "./clone.js";
 import { commit, CommitRejected, importWorktree } from "./commit.js";
@@ -31,6 +35,7 @@ import { binariesFromEnv, JjWorktree } from "./jj.js";
 import { LocalClient } from "./local-client.js";
 import { liveDaemon, startDaemon, stopDaemon } from "./processes.js";
 import { setup, SetupStopped } from "./setup.js";
+import { readState } from "./state.js";
 
 export { describe } from "./messages.js";
 export { cloneRepository } from "./clone.js";
@@ -39,6 +44,7 @@ export { configFrom, configFromEnv, daemonEnv, findWorktree, loadConfig, readFil
 export { Daemon, readDaemonInfo, type SafePointResult, type Status } from "./daemon.js";
 export { init } from "./init.js";
 export { declareIntent } from "./intents.js";
+export { brainBrief, brainLines, fetchBrain, releaseLease, symbolCallers, symbolHistory, takeLease, whyPath, type Brain } from "./brain.js";
 export { JjWorktree, type Applier, type ApplyResult } from "./jj.js";
 export { LocalClient, NoDaemon } from "./local-client.js";
 export { StreamClient } from "./stream.js";
@@ -62,6 +68,9 @@ const USAGE = `usage:
   pitstop intent -m "<text>" [-s a,b]  declare an intent; the next commit closes it
   pitstop safe-point                   tell the running daemon the agent is between tools
   pitstop status                       what the running daemon knows
+  pitstop brain                        the repository's ADRs, leases and open intents
+  pitstop lease <path#name> [-r "<why>"] [--release]
+                                       take (or release) a short lease on one symbol
   pitstop version`;
 
 const flag = (args: string[], name: string): string | undefined => {
@@ -261,7 +270,30 @@ export async function main(argv: string[], config?: Config): Promise<number> {
     const symbols = (flag(rest, "-s") ?? "").split(",").map((s) => s.trim()).filter((s) => s.length > 0);
     const intent = await declareIntent({ ...shared, text, declaredSymbols: symbols });
     log(`${intent.id} ${intent.status}`);
+    // The brain in brief, as the agent gets it through the declare_intent tool.
+    const brain = await fetchBrain(shared).catch(() => undefined);
+    if (brain !== undefined) for (const line of brainBrief(brain, intent.declaredSymbols, cfg.author)) console.log(line);
     return 0;
+  }
+
+  if (command === "brain") {
+    for (const line of brainLines(await fetchBrain(shared), cfg.author)) console.log(line);
+    return 0;
+  }
+
+  if (command === "lease") {
+    const symbol = rest[0];
+    if (symbol === undefined || !/^[^#]+#.+$/.test(symbol)) {
+      console.error(USAGE);
+      return 2;
+    }
+    const reason = flag(rest, "-r");
+    const { intentId } = await readState(cfg.worktree);
+    const answer = rest.includes("--release")
+      ? await releaseLease(shared, symbol, cfg.author)
+      : await takeLease(shared, { symbol, holder: cfg.author, ...(reason === undefined ? {} : { reason }), ...(intentId === undefined ? {} : { intentId }) });
+    log(answer.message);
+    return answer.status === "refused" ? 1 : 0;
   }
 
   if (command === "safe-point" || command === "status") {
