@@ -268,7 +268,12 @@ export class Presence {
     const entry = parsed.data;
     this.doc = applyPresence(this.doc, entry);
     this.lastStamp = entry.stamp;
-    this.opts.send({ type: "presence", entry });
+    try {
+      // Callers fire and forget (heartbeats, `head`): a socket that fails mid-send must not take the daemon down.
+      this.opts.send({ type: "presence", entry });
+    } catch (err) {
+      this.opts.log?.(`presence: not sent: ${err instanceof Error ? err.message : String(err)}`);
+    }
     return entry;
   }
 
