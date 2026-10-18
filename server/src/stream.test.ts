@@ -22,6 +22,7 @@ class Inbox {
   private readonly messages: ServerMessage[] = [];
   private readonly waiting: (() => void)[] = [];
   readonly closed: Promise<number>;
+  readonly closeReason: Promise<string>;
 
   constructor(private readonly socket: WebSocket) {
     socket.addEventListener("message", (ev) => {
@@ -29,6 +30,7 @@ class Inbox {
       for (const wake of this.waiting.splice(0)) wake();
     });
     this.closed = new Promise((resolve) => socket.addEventListener("close", (ev) => resolve(ev.code)));
+    this.closeReason = new Promise((resolve) => socket.addEventListener("close", (ev) => resolve(ev.reason)));
   }
 
   async next(): Promise<ServerMessage> {
@@ -216,6 +218,13 @@ describe("GET /stream", () => {
     await outsider.next();
     outsider.send({ type: "subscribe", repo: "acme/app", fromLsn: 0 });
     expect(await outsider.closed).toBe(1008);
+
+    // A private repository and one that does not exist get the same answer, so a socket cannot
+    // find out which private names are taken.
+    const prober = await connect(url, { authorization: `Bearer ${stranger}` });
+    await prober.next();
+    prober.send({ type: "subscribe", repo: "acme/nothing", fromLsn: 0 });
+    expect((await outsider.closeReason).replace("acme/app", "<repo>")).toBe((await prober.closeReason).replace("acme/nothing", "<repo>"));
 
     const reader = await connect(url, { authorization: `Bearer ${secret}` });
     await reader.next();
