@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { DEFAULT_REPO, type CommitRequest } from "@pitstop/protocol";
 import { applyFiles, MemoryStore } from "./store.js";
+import { brainStoreSuite } from "./test-support.js";
 
 const request = (key: string, baseLsn: number, files: CommitRequest["files"]): CommitRequest => ({
   idempotencyKey: `idem-${key}-01`,
@@ -58,4 +59,8 @@ describe("MemoryStore repositories", () => {
     expect((await store.listRepos()).map((r) => r.id)).toEqual(["acme/app", DEFAULT_REPO]);
     await expect(store.append({ ...request("nowhere", 0, []), repo: "no/such" })).rejects.toThrow(/unknown repo/);
   });
+});
+
+describe("MemoryStore: the brain, stale intents and the query API", () => {
+  brainStoreSuite(() => new MemoryStore());
 });

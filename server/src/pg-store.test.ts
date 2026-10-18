@@ -4,6 +4,7 @@ import { createPool } from "./db.js";
 import { migrate } from "./migrate.js";
 import { PgStore } from "./pg-store.js";
 import { blobHash, InvalidCommit, RejectedCommit, withBlobHashes } from "./store.js";
+import { brainStoreSuite } from "./test-support.js";
 
 // Runs only when a database is available: in CI (Postgres service container)
 // or locally after `npm run db:up` with DATABASE_URL set.
@@ -29,7 +30,7 @@ describe.skipIf(!url)("PgStore against a real Postgres", () => {
 
   beforeAll(async () => {
     await migrate(pool);
-    await pool.query("truncate changesets, changeset_files, changeset_symbols, blobs, intents, leases, parked_commits, repo_invites, repo_members, repo_mirrors cascade");
+    await pool.query("truncate changesets, changeset_files, changeset_symbols, blobs, intents, leases, parked_commits, repo_invites, repo_members, repo_mirrors, repo_leases, repo_brain_versions, repo_adrs cascade");
     await pool.query("delete from repos where id <> $1", [DEFAULT_REPO]);
     await pool.query("insert into repos (id) values ($1) on conflict (id) do nothing", [DEFAULT_REPO]);
   });
@@ -244,4 +245,7 @@ describe.skipIf(!url)("PgStore against a real Postgres", () => {
     expect(await store.getRepo("no/such")).toBeUndefined();
     expect(await store.headLsn("no/such")).toBe(0);
   });
+
+  // The brain, stale intents and the query API, the same tests as MemoryStore's (test-support.ts).
+  brainStoreSuite(() => store);
 });
