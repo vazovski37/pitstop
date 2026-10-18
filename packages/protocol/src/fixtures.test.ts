@@ -1,11 +1,14 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
+  Adr,
+  AdrRule,
   Changeset,
   ClientMessage,
   CommitRequest,
   DEFAULT_REPO,
   IntentRequest,
+  Lease,
   Repo,
   RepoId,
   ServerMessage,
@@ -16,6 +19,28 @@ const load = (name: string): unknown =>
 
 // The fixtures are the shared examples both halves test against.
 // If a schema change breaks one of these, the contract changed: agree on it first.
+describe("brain fixtures (ADRs, leases, presence)", () => {
+  const brain = load("brain.json") as { adr: unknown; lease: unknown; serverMessages: unknown[]; clientMessages: unknown[] };
+
+  it("an ADR carries text and checkable rules", () => {
+    const adr = Adr.parse(brain.adr);
+    expect(adr.rules.map((r) => r.kind)).toEqual(["forbid_import", "forbid_call", "forbid_pattern", "ai_review"]);
+  });
+
+  it("a lease names one symbol and one holder", () => {
+    expect(Lease.parse(brain.lease)).toMatchObject({ status: "held", holder: { agent: "agent-a" } });
+  });
+
+  it("brain, lease and presence server messages, and the presence client message, are valid", () => {
+    expect(brain.serverMessages.map((m) => ServerMessage.parse(m).type)).toEqual(["brain", "lease", "presence"]);
+    expect(brain.clientMessages.map((m) => ClientMessage.parse(m).type)).toEqual(["presence"]);
+  });
+
+  it("an ADR rule of an unknown kind is refused", () => {
+    expect(() => AdrRule.parse({ kind: "forbid_everything", files: "**" })).toThrow();
+  });
+});
+
 describe("protocol fixtures", () => {
   it("commit request fixture is valid", () => {
     expect(() => CommitRequest.parse(load("commit-request.json"))).not.toThrow();
