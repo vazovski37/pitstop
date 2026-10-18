@@ -13,5 +13,11 @@ export function describe(message: ServerMessage): string {
       return `${message.intent.author.agent} started: ${message.intent.text}`;
     case "warning":
       return `warning for ${message.agent}: ${message.message}`;
+    case "brain":
+      return `brain v${message.version}: ADR-${message.adr.number} ${message.adr.status}: ${message.adr.title}`;
+    case "lease":
+      return `lease on ${message.lease.symbol} ${message.lease.status} (${message.lease.holder.agent})`;
+    case "presence":
+      return `presence: ${message.entries.map((e) => `${e.author.agent} ${e.state}`).join(", ")}`;
   }
 }
