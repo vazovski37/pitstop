@@ -119,7 +119,31 @@ export class HybridClock {
 }
 
 /** The later of two entries for one key: the greater stamp wins (stamps never tie across replicas). */
-const later = (a: PresenceEntry, b: PresenceEntry): PresenceEntry => (b.stamp > a.stamp ? b : a);
+/**
+ * The entry as a canonical string: keys sorted at every level, so two copies of the same entry
+ * built in a different key order compare equal.
+ */
+export function canonicalPresence(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalPresence).join(",")}]`;
+  if (value !== null && typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .filter(([, v]) => v !== undefined)
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+    return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${canonicalPresence(v)}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+/**
+ * The later of two entries for one key: the greater stamp wins. Stamps tie only when two writers
+ * share a replica id (a copied checkout) within one millisecond; then the greater canonical form
+ * wins, so every replica still picks the same entry whatever order they arrive in and the merge
+ * stays a join.
+ */
+const later = (a: PresenceEntry, b: PresenceEntry): PresenceEntry => {
+  if (b.stamp !== a.stamp) return b.stamp > a.stamp ? b : a;
+  return canonicalPresence(b) > canonicalPresence(a) ? b : a;
+};
 
 /** Merges one entry into a document; returns the same document when the entry changes nothing. */
 export function applyPresence(doc: PresenceDoc, entry: PresenceEntry): PresenceDoc {
