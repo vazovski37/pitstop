@@ -245,12 +245,27 @@ function handle(message: ServerMessage): void {
  * page cannot import runtime code from the protocol package (no bundler, and a value import would
  * pull zod into the browser), so these few lines live here too and must stay the same. Per
  * replica, the entry with the greater stamp wins; stamps are `<wall>.<counter>.<replica>` with
- * fixed-width numbers, so string order is clock order. Any order of updates, duplicates
- * included, ends in the same document.
+ * fixed-width numbers, so string order is clock order; equal stamps (two writers sharing a
+ * replica id) fall back to the canonical form, as in the protocol. Any order of updates,
+ * duplicates included, ends in the same document.
  */
+function canonicalPresence(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalPresence).join(",")}]`;
+  if (value !== null && typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .filter(([, v]) => v !== undefined)
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+    return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${canonicalPresence(v)}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
 function applyPresence(doc: PresenceDoc, entry: PresenceEntry): PresenceDoc {
   const current = doc[entry.replica];
-  if (current !== undefined && !(entry.stamp > current.stamp)) return doc;
+  if (current !== undefined) {
+    const wins = entry.stamp !== current.stamp ? entry.stamp > current.stamp : canonicalPresence(entry) > canonicalPresence(current);
+    if (!wins) return doc;
+  }
   return { ...doc, [entry.replica]: entry };
 }
 

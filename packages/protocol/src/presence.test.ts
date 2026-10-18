@@ -96,6 +96,16 @@ describe("presence CRDT (a last-writer-wins map)", () => {
     expect(livePresence(docOf([gone, working]), 250, 1_000)).toEqual([]);
   });
 
+  it("breaks a tie between equal stamps (two writers sharing a replica id) the same way everywhere", () => {
+    const one = entry("a", 100, 0, { author: { developer: "dev", agent: "agent-a" } });
+    const two = entry("a", 100, 0, { author: { developer: "dev", agent: "agent-b" } });
+    // The same entry with its keys in another order is the same entry.
+    const reordered = Object.fromEntries(Object.entries(two).reverse()) as PresenceEntry;
+    expect(docOf([one, two])).toEqual(docOf([two, one]));
+    expect(docOf([one, reordered]).a?.author.agent).toBe(docOf([reordered, one]).a?.author.agent);
+    expect(mergePresence(docOf([one]), docOf([two]))).toEqual(mergePresence(docOf([two]), docOf([one])));
+  });
+
   it("applying an entry that changes nothing returns the same document", () => {
     const doc = docOf([entry("a", 200, 0)]);
     expect(applyPresence(doc, entry("a", 100, 0))).toBe(doc);

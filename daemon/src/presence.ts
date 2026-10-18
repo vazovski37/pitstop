@@ -25,6 +25,7 @@ import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import {
   applyPresence,
+  canonicalPresence,
   HybridClock,
   livePresence,
   parseStamp,
@@ -125,6 +126,8 @@ export class Presence {
   /** This worktree's entry as last computed; keepalives resend it with a new stamp. */
   private mine: Values | undefined;
   private lastStamp: string | undefined;
+  /** This worktree's last write, canonical: a write by a twin with the same stamp shows as a different text. */
+  private lastWritten: string | undefined;
   private lastWriteAt = Number.NEGATIVE_INFINITY;
   private lastRewriteAt = Number.NEGATIVE_INFINITY;
   /** Another process writes this worktree's key (a copied checkout): said once in the log. */
@@ -172,7 +175,10 @@ export class Presence {
     // process shares this replica id (a copied checkout, two daemons): answering it would start
     // an endless exchange of rewrites, so it is said once and left to the keepalives.
     const own = this.doc[this.clock.replica];
-    if (own === undefined || this.lastStamp === undefined || !(own.stamp > this.lastStamp)) return;
+    if (own === undefined || this.lastStamp === undefined) return;
+    // Newer than its own last write, or as new but not what it wrote (a twin in the same millisecond).
+    const clobbered = own.stamp > this.lastStamp || (own.stamp === this.lastStamp && canonicalPresence(own) !== this.lastWritten);
+    if (!clobbered) return;
     if (own.state !== "gone") {
       if (!this.twinWarned) {
         this.twinWarned = true;
@@ -322,6 +328,7 @@ export class Presence {
     const entry = parsed.data;
     this.doc = applyPresence(this.doc, entry);
     this.lastStamp = entry.stamp;
+    this.lastWritten = canonicalPresence(entry);
     this.lastWriteAt = this.now();
     try {
       // Callers fire and forget (heartbeats, `head`): a socket that fails mid-send must not take the daemon down.
