@@ -245,7 +245,7 @@ function handle(message: ServerMessage): void {
     case "lease":
       if (message.lease.repo === state.repo) {
         const l = message.lease;
-        addEvent("lease", `${l.holder.agent} ${l.status === "held" ? "leased" : l.status === "released" ? "released" : "lost (expired)"} ${l.symbol}${l.reason ? `: ${l.reason}` : ""}`);
+        addEvent("lease", `${l.holder.agent} ${l.status === "held" ? "leased" : l.status === "released" ? "released" : "lost (expired)"} ${l.symbol}${l.status === "held" && l.reason ? `: ${l.reason}` : ""}`);
         if (showing(state.repo, "brain")) void renderBrain(state.repo);
       }
       break;
@@ -537,6 +537,8 @@ function renderDetail(): void {
       el("dd", {}, symbols(cs.readSet)),
       cs.repairs.length > 0 ? el("dt", {}, "repairs") : null,
       cs.repairs.length > 0 ? el("dd", {}, ...repairs) : null,
+      el("dt", {}, "brain"),
+      el("dd", {}, cs.brainVersion === 0 ? "v0 (no decision in force yet)" : `checked against brain v${cs.brainVersion}`),
       el("dt", {}, "checks"),
       el("dd", {}, checks, cs.checks.details === undefined ? null : el("pre", {}, cs.checks.details)),
     ),
@@ -1501,10 +1503,10 @@ function ruleText(rule: AdrRule): string {
 }
 
 const RULE_KINDS: { kind: AdrRule["kind"]; label: string; value: string }[] = [
-  { kind: "forbid_import", label: "may not import", value: "src/db/**" },
-  { kind: "forbid_call", label: "may not call", value: "db.query" },
-  { kind: "forbid_pattern", label: "may not contain", value: "console\\.log\\(" },
-  { kind: "ai_review", label: "a model reviews", value: "Does this keep expired sessions out?" },
+  { kind: "forbid_import", label: "Files may not import", value: "the module (glob), e.g. src/db/**" },
+  { kind: "forbid_call", label: "Files may not call", value: "the call, e.g. db.query" },
+  { kind: "forbid_pattern", label: "Files may not contain", value: "a regular expression, e.g. console\\.log\\(" },
+  { kind: "ai_review", label: "A model reviews files (advice)", value: "the question, e.g. Does this keep expired sessions out?" },
 ];
 
 /** The brain version on the tab and in the pane's title. */
@@ -1627,7 +1629,7 @@ async function releaseLease(repo: string, symbol: string): Promise<void> {
 /** One row of the rules builder: kind, the files it covers, and its target/call/pattern/question. */
 function ruleRow(kind: AdrRule["kind"] = "forbid_import"): HTMLElement {
   const select = el("select", { class: "select input-sm", "aria-label": "Rule kind" }, ...RULE_KINDS.map((k) => el("option", k.kind === kind ? { value: k.kind, selected: "" } : { value: k.kind }, k.label)));
-  const files = el("input", { class: "input input-sm", "aria-label": "Files (glob)", placeholder: "src/pages/**", value: "src/pages/**" });
+  const files = el("input", { class: "input input-sm", "aria-label": "Files (glob)", placeholder: "the files it covers (glob), e.g. src/pages/**" });
   const value = el("input", { class: "input input-sm", "aria-label": "Target", placeholder: RULE_KINDS[0]?.value ?? "" });
   const remove = el("button", { type: "button", class: "btn btn-ghost btn-sm", "aria-label": "Remove this rule" }, "×");
   const hint = (): void => {

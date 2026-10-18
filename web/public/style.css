@@ -515,6 +515,10 @@ textarea { height: auto; min-height: 76px; padding: 10px 12px; resize: vertical;
 #events li.repair::before, #events li.skew::before { background: var(--repair); }
 #events li.intent { color: var(--text-2); }
 #events li.intent::before { background: var(--ok); }
+#events li.brain { color: var(--text); }
+#events li.brain::before { background: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 25%, transparent); }
+#events li.lease { color: var(--text-2); }
+#events li.lease::before { background: var(--warn); }
 #events li.info { color: var(--text-3); }
 #events li[style*="pointer"]:hover { background: var(--surface-2); border-radius: var(--r-sm); }
 /* #events scrolls, so a focused row's ring is drawn inside it. */
@@ -735,8 +739,16 @@ textarea { height: auto; min-height: 76px; padding: 10px 12px; resize: vertical;
 .adr-form { display: grid; gap: var(--s-3); }
 .adr-form textarea { min-height: 64px; }
 .rule-rows { display: grid; gap: var(--s-2); }
-.rule-row { display: grid; grid-template-columns: minmax(120px, 0.9fr) minmax(0, 1fr) minmax(0, 1fr) auto; gap: var(--s-2); align-items: center; }
-@media (max-width: 600px) { .rule-row { grid-template-columns: 1fr; } }
+/* One rule per box: its kind and remove on top, then the files it covers, then its target, call, pattern or question. */
+.rule-row {
+  display: grid; grid-template-columns: minmax(0, 1fr) auto; grid-template-areas: "kind remove" "files files" "value value";
+  gap: var(--s-2); align-items: center; padding: var(--s-2); border: 1px solid var(--border); border-radius: var(--r-md);
+}
+.rule-row > select { grid-area: kind; }
+.rule-row > input:nth-of-type(1) { grid-area: files; }
+.rule-row > input:nth-of-type(2) { grid-area: value; }
+.rule-row > button { grid-area: remove; }
+#adr-add-rule, .lease-list li > .btn { justify-self: start; }
 .recheck { margin-top: var(--s-3); display: grid; gap: var(--s-2); font-size: var(--fs-sm); }
 .recheck .violation { border-left: 3px solid var(--bad); padding: 4px 0 4px var(--s-3); }
 .recheck .violation .mono { color: var(--text); }
