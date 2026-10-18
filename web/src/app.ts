@@ -612,6 +612,13 @@ function follow(repo: string): void {
 
 // --- design-system helpers: colour by name, avatars, icons, toasts, dialogs, loading --------------
 
+/**
+ * The hues a name can get: clear of the semantic ones (ok ≈150, warn ≈40, bad ≈0, repair ≈265,
+ * accent ≈233), so an agent never reads as a status. The landing diagram in index.html uses the
+ * same hues for agent-a, agent-b and agent-c (185, 310, 95).
+ */
+const NAME_HUES = [205, 310, 70, 330, 220, 290, 185, 95];
+
 /** A stable hue for a name, so an agent or a person keeps one colour everywhere on the page. */
 function hueOf(name: string): number {
   let h = 0x811c9dc5;
@@ -622,7 +629,7 @@ function hueOf(name: string): number {
   h ^= h >>> 15;
   h = Math.imul(h, 0x2c1b3c6d);
   h ^= h >>> 12;
-  return (h >>> 0) % 360;
+  return NAME_HUES[(h >>> 0) % NAME_HUES.length] ?? 205;
 }
 
 /** Two letters for a login: the initials of its parts (`giorgi-papidze` → GP), else its first two letters. */
@@ -967,13 +974,14 @@ async function loadRepoMembers(repo: string): Promise<void> {
 
 /**
  * The three first steps on a new repository: set up Claude (the log has entries, or a worktree is
- * connected), invite a teammate, mark the resolver. Shown on the Live tab until the repository has
- * entries and more than one member.
+ * connected), invite a teammate, mark the resolver. Shown on the Live tab to a signed-in account
+ * until the repository has entries and more than one member. The administrator's shared token
+ * never sees it: on a server without sign-in nobody could ever accept an invite.
  */
 function renderOnboarding(): void {
   const box = $("onboarding");
   const members = repoMeta.repo === state.repo ? repoMeta.members : undefined;
-  if (!showing(state.repo, "live") || members === undefined || state.head === null) {
+  if (session.me === undefined || !showing(state.repo, "live") || members === undefined || state.head === null) {
     box.hidden = true;
     return;
   }
@@ -1030,6 +1038,9 @@ async function renderMembers(repo: string): Promise<void> {
     else toast(done, "ok");
     await renderMembers(repo);
   };
+  // The list is rebuilt after every change: keep keyboard focus on the same control (found by its label).
+  const active = document.activeElement;
+  const focused = active instanceof HTMLElement && $("members").contains(active) ? active.getAttribute("aria-label") : null;
   $("members").replaceChildren(
     ...rows.map((m) => {
       const self = m.pending !== true && m.login.toLowerCase() === myLogin;
@@ -1047,7 +1058,8 @@ async function renderMembers(repo: string): Promise<void> {
       resolver.addEventListener("change", () =>
         void put(m.login, { role: m.role, resolver: resolver.checked }, resolver.checked ? `${m.login} now decides on conflicts.` : `${m.login} no longer decides on conflicts.`),
       );
-      const remove = el("button", { type: "button", class: "btn btn-ghost btn-sm member-remove" }, self ? "Leave" : pending ? "Withdraw" : "Remove");
+      const removeLabel = self ? `Leave ${repo}` : pending ? `Withdraw the invite for ${m.login}` : `Remove ${m.login}`;
+      const remove = el("button", { type: "button", class: "btn btn-ghost btn-sm member-remove", "aria-label": removeLabel }, self ? "Leave" : pending ? "Withdraw" : "Remove");
       remove.addEventListener("click", () => void removeMember(repo, m.login, self, pending));
       return el(
         "li",
@@ -1068,6 +1080,11 @@ async function renderMembers(repo: string): Promise<void> {
       );
     }),
   );
+  if (focused !== null) {
+    // A removed member's row is gone: the first control of the list takes the focus instead.
+    const same = $("members").querySelector<HTMLElement>(`[aria-label="${CSS.escape(focused)}"]`);
+    (same ?? $("members").querySelector<HTMLElement>("select:not(:disabled), input:not(:disabled), button"))?.focus();
+  }
   renderOnboarding();
 }
 
@@ -1137,15 +1154,40 @@ function promptText(repo: string, secret: string, empty: boolean): string {
   ].join("\n");
 }
 
+/**
+ * The Set up Claude texts in full (what the Copy buttons copy) and the personal token in them. On
+ * screen the token is masked unless the person asks to see it, so a screen recording or a shared
+ * screen does not publish a working token.
+ */
+const setupText = { prompt: "", manual: "", secret: "", revealed: false };
+
+const masked = (text: string): string =>
+  setupText.secret === "" || setupText.revealed ? text : text.split(setupText.secret).join(`${setupText.secret.slice(0, 8)}…`);
+
+function renderSetupText(): void {
+  $("prompt").textContent = masked(setupText.prompt);
+  $("manual-cmds").textContent = masked(setupText.manual);
+  for (const id of ["reveal-prompt", "reveal-manual"]) {
+    const button = $(id);
+    button.hidden = setupText.secret === "";
+    button.textContent = setupText.revealed ? "Hide token" : "Show token";
+  }
+}
+
 /** The same setup for someone who prefers a terminal: install the client, then `pitstop setup`. */
 function renderManual(repo: string, secret?: string): void {
   const server = location.origin;
-  $("manual-cmds").textContent = [`npm install -g ${server}/pitstop-cli.tgz`, `pitstop setup ${server} ${repo} --token ${secret ?? "<your personal token>"}`].join("\n");
+  setupText.manual = [`npm install -g ${server}/pitstop-cli.tgz`, `pitstop setup ${server} ${repo} --token ${secret ?? "<your personal token>"}`].join("\n");
+  renderSetupText();
 }
 
 async function renderSetup(repo: string): Promise<void> {
   $("setup-repo").textContent = repo;
   $("prompt-box").hidden = true;
+  $("prompt-warning").hidden = true;
+  setupText.prompt = "";
+  setupText.secret = "";
+  setupText.revealed = false;
   say("setup-msg", "", true);
   renderManual(repo);
   const button = $<HTMLButtonElement>("make-prompt");
@@ -1169,6 +1211,8 @@ async function renderSetup(repo: string): Promise<void> {
 async function makePrompt(repo: string, empty: boolean): Promise<void> {
   if (session.me === undefined) {
     // The administrator's shared token must never travel in a prompt.
+    setupText.secret = "";
+    $("prompt-warning").hidden = true;
     showPrompt(promptText(repo, "<your personal token: sign in, then Account>", empty));
     say("setup-msg", "Sign in with GitHub to get a personal token for this prompt.", false);
     return;
@@ -1178,15 +1222,19 @@ async function makePrompt(repo: string, empty: boolean): Promise<void> {
     toast(messageOf(made.body, `the server answered ${made.status}`), "error");
     return;
   }
+  setupText.secret = made.body.secret;
+  setupText.revealed = false;
   showPrompt(promptText(repo, made.body.secret, empty));
   renderManual(repo, made.body.secret);
+  $("prompt-warning").hidden = false;
   say("setup-msg", "", true);
   $("make-prompt").textContent = "Create another token";
   toast("A personal token was made and the prompt is ready. Copy it into Claude Code.", "ok");
 }
 
 function showPrompt(text: string): void {
-  $("prompt").textContent = text;
+  setupText.prompt = text;
+  renderSetupText();
   $("prompt-box").hidden = false;
 }
 
@@ -1259,11 +1307,19 @@ async function renderConflicts(repo: string, quiet = false): Promise<void> {
   setConflictCount(list.filter((p) => p.status === "open").length);
   if (quiet && key === conflictsKey) return;
   conflictsKey = key;
-  // Notes being typed survive a refresh.
+  // Notes being typed survive a refresh, and so do the focus and the cursor in the one being typed.
   const notes = new Map<string, string>();
   for (const area of $("conflicts").querySelectorAll<HTMLTextAreaElement>("textarea[data-id]")) notes.set(area.dataset.id ?? "", area.value);
-  $("no-conflicts").hidden = list.length > 0;
+  const active = document.activeElement;
+  const typing = active instanceof HTMLTextAreaElement && active.dataset.id !== undefined ? { id: active.dataset.id, start: active.selectionStart, end: active.selectionEnd } : undefined;
+  // "Nothing is waiting" whenever nothing is open; decided ones stay listed under it.
+  $("no-conflicts").hidden = list.some((p) => p.status === "open");
   $("conflicts").replaceChildren(...list.map((p) => conflictCard(repo, p, decide, notes.get(p.id) ?? "")));
+  if (typing !== undefined) {
+    const area = $("conflicts").querySelector<HTMLTextAreaElement>(`textarea[data-id="${CSS.escape(typing.id)}"]`);
+    area?.focus();
+    area?.setSelectionRange(typing.start, typing.end);
+  }
 }
 
 /** `#1 changed src/auth/session.ts#getCurrentUser (signature)` in plain words, one sentence per changed symbol. */
@@ -1309,7 +1365,7 @@ function conflictCard(repo: string, p: ParkedRow, decide: { me: boolean; who: st
         : el("span", { class: "badge" }, `Sent back by ${p.decidedBy ?? "?"}`);
   const card = el(
     "li",
-    { class: `conflict ${p.status === "open" ? "open" : ""}`.trim() },
+    { class: `conflict ${p.status === "open" ? "open" : ""}`.trim(), "data-id": p.id },
     el("div", { class: "conflict-head" }, el("h3", { class: "conflict-intent" }, p.intent), status),
     el(
       "div",
@@ -1372,6 +1428,14 @@ async function decideOn(repo: string, p: ParkedRow, action: "accept" | "send-bac
   else if (action === "accept") toast(`"${p.intent}" landed${res.body?.landedLsn === undefined ? "" : ` as #${res.body.landedLsn}`}. Every checkout receives it now.`, "ok");
   else toast(`"${p.intent}" went back to ${p.author.developer}; their agent adapts and commits again.`, "ok");
   await renderConflicts(repo);
+  // The buttons are gone with the decision: keep keyboard focus on the card, which now shows the outcome.
+  if (document.activeElement === null || document.activeElement === document.body) {
+    const card = $("conflicts").querySelector<HTMLElement>(`li[data-id="${CSS.escape(p.id)}"]`);
+    if (card !== null) {
+      card.tabIndex = -1;
+      card.focus();
+    }
+  }
 }
 
 // --- account: personal tokens --------------------------------------------------------------------
@@ -1496,8 +1560,20 @@ function setup(): void {
     if (route.view === "repo") void invite(ev, route.repo);
   });
   $<HTMLFormElement>("new-token").addEventListener("submit", (ev) => void createToken(ev));
-  $("copy-prompt").addEventListener("click", () => void copy($("prompt").textContent ?? "", "Prompt", "Paste it into Claude Code."));
-  $("copy-manual").addEventListener("click", () => void copy($("manual-cmds").textContent ?? "", "Commands"));
+  // The skip link moves focus to the page's content; following its #content would count as a route.
+  $("skip-link").addEventListener("click", (ev) => {
+    ev.preventDefault();
+    $("content").focus();
+  });
+  // Copy takes the full text; the screen shows the token masked (setupText).
+  $("copy-prompt").addEventListener("click", () => void copy(setupText.prompt, "Prompt", "Paste it into Claude Code."));
+  $("copy-manual").addEventListener("click", () => void copy(setupText.manual, "Commands"));
+  for (const id of ["reveal-prompt", "reveal-manual"]) {
+    $(id).addEventListener("click", () => {
+      setupText.revealed = !setupText.revealed;
+      renderSetupText();
+    });
+  }
   $("copy-token").addEventListener("click", () => void copy($("new-token-secret").textContent ?? "", "Token"));
   $("sign-out").addEventListener("click", () => void signOut());
   $("close").addEventListener("click", () => select(null));
@@ -1513,7 +1589,39 @@ function setup(): void {
     card?.classList.add("flash");
   });
   const live = $("pane-live");
-  new MutationObserver(() => paintAgents(live)).observe(live, { childList: true, subtree: true });
+  // The live view's render functions stay as they are: colour and keyboard access are added here.
+  const focusable = (row: HTMLElement): HTMLElement => {
+    row.tabIndex = 0;
+    row.setAttribute("role", "button");
+    return row;
+  };
+  new MutationObserver(() => {
+    paintAgents(live);
+    for (const row of live.querySelectorAll<HTMLElement>('#log > li:not([tabindex]), #events > li[style*="pointer"]:not([tabindex])')) focusable(row);
+  }).observe(live, { childList: true, subtree: true });
+  // Enter or Space on a focused log or event row acts like a click. Selecting rebuilds the log, so
+  // the focus goes back to the same entry's new row.
+  for (const id of ["log", "events"]) {
+    $(id).addEventListener("keydown", (ev) => {
+      const row = ev.target;
+      if (!(row instanceof HTMLElement) || row.parentElement?.id !== id || row.tabIndex !== 0) return;
+      if (ev.key !== "Enter" && ev.key !== " ") return;
+      ev.preventDefault();
+      const lsn = row.querySelector(".lsn")?.textContent;
+      row.click();
+      if (!row.isConnected && lsn !== undefined) {
+        // The observer marks new rows a moment later; this one is needed now.
+        for (const next of $("log").querySelectorAll<HTMLElement>(":scope > li")) if (next.querySelector(".lsn")?.textContent === lsn) focusable(next).focus();
+      }
+    });
+  }
+  // A landed entry flashes once: once its animation has played it is no longer "live", so a later
+  // re-render of the log (a click on another entry) does not replay it on the newest row.
+  $("log").addEventListener("animationend", (ev) => {
+    if (ev.animationName !== "land" || !(ev.target instanceof Element)) return;
+    const lsn = Number(ev.target.closest("li")?.querySelector(".lsn")?.textContent?.slice(1));
+    if (Number.isInteger(lsn)) state.live.delete(lsn);
+  });
   window.addEventListener("hashchange", () => show(parseRoute(location.hash)));
   window.setInterval(renderIntents, 5_000);
   window.setInterval(renderPresence, PRESENCE_REDRAW_MS);
