@@ -1,123 +1,133 @@
 # The rehearsal
 
-The run sheet for the demo: two laptops, two coding agents, one Pitstop server on Azure, and the
-write skew from `scenario.md` caught live. `scripts/gate4.sh` is the same story automated on one
-laptop; this file is the story with people at the keyboards. Everything quoted below (terminal
-lines, the agent's tool results, the page) is what the daemons, the hook and the live view printed
-when the sheet was run on 2026-10-18 against a local in-memory server, so it is what to expect.
+The run sheet for the demo on the hosted server: two people, two Claude Code sessions, one Pitstop
+repository made on the website, and the write skew from `scenario.md` held back and decided by a
+person on the Conflicts tab. Then the brain: an architecture decision and a lease.
+
+Everything quoted below (tool results, notes, page labels, toasts, event lines) is taken from the
+code and its tests on 18 October 2026. The sheet has not yet been run end to end with two real
+Claude Code sessions, so agent wording will vary; the server's and the page's texts will not. The
+old shared-token story, which needs no accounts, is at the end ("Offline: the gates").
+
+The server: `https://pitstop-server.bravebay-485f06a6.swedencentral.azurecontainerapps.io`, `$S`
+below. It runs `PITSTOP_REPAIR=agent` with GitHub sign-in on.
 
 Who is who:
 
 | | Laptop A | Laptop B |
 | --- | --- | --- |
-| Person | Vazovski | the teammate |
-| Agent name in the log | `agent-a` | `agent-b` |
+| Person | the owner (Vazovski), signed in as their GitHub login | the teammate, signed in as their own GitHub login |
+| Role in the repository | owner, and the **resolver** | writer |
+| Agent name | `agent-a` | `agent-b` |
 | Task | fix the expired-session bug (issue #58) | show last-seen on the profile page (issue #61) |
-| Work dir | `~/pitstop-A` | `~/pitstop-B` |
+| Checkout | `C:\code\teamdb` (made by `reset.sh`) | `C:\code\<repository name>` (cloned by setup) |
 
-The server: `https://pitstop-server.bravebay-485f06a6.swedencentral.azurecontainerapps.io`. Its live view is the
-root URL; its log is `GET /log?repo=teamdb/demo` with the shared token. Below, `$S` stands for the
-server URL and `$T` for the token.
+**The owner is the resolver, not the teammate.** A held-back commit waits on the website only when
+someone other than its committer can decide. B commits as the teammate, so the owner decides. If the
+teammate were the only resolver, B's skew would go straight back to agent B and the Conflicts tab
+would stay empty.
 
-## Before the day, once per laptop
+## Before the day, once
 
-1. The pitstop repo at `main`, built: `git pull && npm install && npm run build`.
-2. `jj` installed (`winget install jj-vcs.jj`; the script finds it even when it is not on PATH),
-   `git`, `node` 22+, `curl`, and Claude Code (`claude`) on PATH. Git Bash on Windows.
-3. The repo-root `.env` holds `PITSTOP_TOKEN=<the shared token>` (SETUP.md, "Server token").
-   Never commit it, never paste it in a prompt. `rehearse.sh` reads it from there.
-4. The browser: open `$S/`, paste the token in the "server token" field at the top right, press
-   "use". The page keeps it in localStorage, so this is once. Pick `teamdb/demo` in the
-   "repository" dropdown; the URL becomes `$S/#teamdb%2Fdemo`. Laptop A's browser is the one on the
-   projector; laptop B's is a safety copy.
-5. Three windows per laptop: a terminal for the reset script and the daemon log, a terminal for
-   Claude Code, the browser with the live view.
-6. Run the whole sheet once end to end with the two laptops a day before. A used repository name
-   cannot be reset (the log is append-only), so each take gets its own: `teamdb/demo` for the real
-   thing, `teamdb/take-1`, `teamdb/take-2` for the rehearsals, the same name on both laptops.
+1. **Two GitHub accounts, both signed in once.** The teammate opens `$S`, clicks `Sign in with
+   GitHub`, and that is all. Until then an invite stays `invited` and cannot be made resolver.
+2. **Tools on each laptop:** Node.js 22+, git, jj (`winget install jj-vcs.jj`, then a new
+   terminal so it is on PATH), Claude Code. jj needs a name and email; setup copies them from git,
+   or stops with the two `jj config set --user …` commands to run.
+3. **The developer name, for the lease step.** The server knows each laptop by its GitHub login,
+   the daemon by the OS user name, and today the lease code compares the two. Set it once per laptop
+   so they agree, capitals included (the login exactly as the Members tab shows it): `setx PITSTOP_DEVELOPER <your GitHub login>` on Windows (new terminals pick it
+   up), or `export PITSTOP_DEVELOPER=<your GitHub login>` in the shell profile elsewhere. Without
+   it, a lease still blocks the other agent, but its holder is told the lease is someone else's and
+   the daemon does not renew it (it expires after its minutes).
+4. **Browsers.** The owner's browser is on the projector, signed in as the owner. The teammate uses
+   their own browser (on one laptop: a second browser profile or a private window).
+5. **Run the whole sheet once, a day before.** A used repository cannot be reset or deleted (the log
+   is append-only), so each take gets its own name: `teamdb-take1`, `teamdb-take2`, … under the
+   owner's login.
 
-## Reset: both laptops, about a minute
+## Before each take: about five minutes, off camera
 
-Laptop A, then laptop B:
+The setup prompt makes Claude Code run `pitstop setup … --token pst_…`, and Claude Code prints that
+command with the full token. Do this part before recording, or revoke the tokens under Account
+afterwards. The Set up Claude tab itself masks the token (`pst_ab12…`) unless you press Show token.
 
-```bash
-bash demo/scripts/rehearse.sh A ~/pitstop-A
-```
-
-```bash
-bash demo/scripts/rehearse.sh B ~/pitstop-B
-```
-
-What it does, in order: checks `$S/healthz` and that the token is accepted; checks that the
-repository is at the start state (A: not there or empty; B: the import alone), and refuses with
-the fresh-name hint otherwise; builds the protocol, the daemon and the agent side; stops the daemon
-from the previous take and replaces the work dir with a fresh copy of the slice (`reset.sh`: git +
-jj, dependencies, typecheck and tests green); `pitstop init $S --repo teamdb/demo` (A imports the
-slice as entry #1; B passes `--no-import` and only joins); writes `.mcp.json`,
-`.claude/settings.json` (the pitstop MCP tools and the safe-point hook), `CLAUDE.md` (house rules
-for the agent: declare an intent first, commit with the tool, obey a rejection) and `.env`
-(`PITSTOP_AGENT`, `PITSTOP_DEVELOPER`, server and repository, not the token) into the work dir,
-all of them excluded from jj so the agent's commit never carries them; starts the daemon in the
-background with its log at `.pitstop/daemon.log`, and waits for it to be watching (B: to have
-applied #1).
-
-The last lines on A:
-
-```
-ready: laptop A is agent-a (vazovski) in /c/Users/you/pitstop-A at #1, on https://… (teamdb/demo)
-  daemon: pid 11320, log /c/Users/you/pitstop-A/.pitstop/daemon.log
-  stop it: node -e "process.kill(require(process.argv[1]).pid)" /c/Users/you/pitstop-A/.pitstop/daemon.json
-  next: cd /c/Users/you/pitstop-A && claude      (the pitstop tools and the safe-point hook are configured there)
-  live view: https://…/#teamdb%2Fdemo
-```
-
-Timing: A took 44 s on the first run of the day and 27 s after that (npm's cache is warm); B the
-same. The first take needs no name; every later take on the same server:
+**Laptop A, the source checkout:**
 
 ```bash
-PITSTOP_REPO=teamdb/take-2 bash demo/scripts/rehearse.sh A ~/pitstop-A
+bash demo/scripts/reset.sh /c/code/teamdb
 ```
 
-A different server: `PITSTOP_SERVER=http://127.0.0.1:8097 bash demo/scripts/rehearse.sh A ~/pitstop-A`
-(see "If the server is down"). `--foreground` keeps the daemon in the terminal instead
-(ctrl-c stops it), handy when its log should be on screen.
+It ends `ready: /c/code/teamdb (typecheck and tests green)`. If the folder held an earlier take,
+close Claude Code there and run `pitstop stop` in it first: Windows will not delete a folder a daemon
+runs in.
 
-After the reset:
+**Laptop A, on the website:**
+1. Home page, New repository: Name `teamdb-take1`, `Create repository`. Toast:
+   `<owner>/teamdb-take1 is ready. Next: set up Claude.`, and the page opens the Set up Claude tab.
+2. The state line says `This repository is empty: the first setup imports the code from your
+   existing checkout as entry #1.` Press `Create a token and write the prompt`, then `Copy prompt`.
+3. In a terminal, start `claude` anywhere and paste the prompt, plus one line of your own:
+   `Use --agent agent-a on the pitstop setup line.` When Claude asks where the project is, answer
+   `C:\code\teamdb`. Approve its commands as it installs the client and runs setup.
+4. Setup's last lines:
+   ```
+   [pitstop] imported teamdb as #1
+   [pitstop] ready: C:\code\teamdb is a checkout of <owner>/teamdb-take1 at #1; the agent there commits as "agent-a"
+   [pitstop] daemon started (pid N); its log: C:\code\teamdb\.pitstop\daemon.log
+   [pitstop] next: open Claude Code in that directory (cd "C:\code\teamdb" && claude): the pitstop tools, the hook and CLAUDE.local.md are in place
+   [pitstop] to stop the daemon: `pitstop stop` there (Claude Code starts it again when it needs it)
+   ```
+   On Windows also `set jj's working-copy.eol-conversion to input-output …`; that is expected.
+5. Close that Claude Code session. Open the second terminal and run `cd "C:\code\teamdb"`, then `claude` (two commands: Windows PowerShell 5.1, Windows Terminal's default, rejects `&&`). Trust
+   the folder. The pitstop tools and the hook are already allowed; nothing else asks.
+
+**Laptop A, Members tab:**
+1. `Invite a teammate`: GitHub login of the teammate, Role `Writer`, `Send invite`. Toast:
+   `<login> is added as writer.` (if it says `is invited … They join the first time they sign in`,
+   they have not signed in yet: do that, then reload this tab).
+2. Your own row: switch `Resolver` on. Toast: `<owner> now decides on conflicts.` The row gets the
+   badge `resolver`.
+
+**Laptop B, after #1 landed:**
+1. The teammate signs in, opens the repository card on their home page, `Set up Claude` tab. Reload
+   the tab if it still says the repository is empty: it must say `This repository has 1 entry: setup
+   builds a fresh checkout from them and keeps it in sync.`
+2. `Create a token and write the prompt`, `Copy prompt`. In a terminal on B, `claude` in `C:\code`,
+   paste the prompt plus `Use --agent agent-b on the pitstop setup line. Then run npm ci in the
+   checkout.` Answer `C:\code` when it asks where the checkout should go.
+3. Setup clones: `applied #1 of 1`, then `ready: C:\code\teamdb-take1 is a checkout of
+   <owner>/teamdb-take1 at #1; the agent there commits as "agent-b"`. `npm ci` installs the slice's
+   tools (without it `npx tsc` fetches an unrelated package).
+4. Close that session; `cd "C:\code\teamdb-take1"`, then `claude`.
+
+On one laptop for both: run B's setup from `C:\code` as above (it clones beside checkout A, into `C:\code\teamdb-take1`), never from inside `C:\code\teamdb`: there setup finds checkout A (same repository and server), reuses it, writes agent-b and the teammate's token into its config and restarts its daemon with them.
+
+**Check, on the projector (Live tab):**
 
 | Where | What it shows |
 | --- | --- |
-| Daemon log, A | `watching C:\…\pitstop-A from #1 on https://… (teamdb/demo); local API on 127.0.0.1:<port>` |
-| Daemon log, B | `watching C:\…\pitstop-B from #0 …` then `applied #1 import pitstop-A` |
-| `GET /log?repo=teamdb/demo` | one entry: `#1 "import pitstop-A"` by `agent-a`, base #0, 14 files, empty symbol sets |
-| Live view | `head #1`, pill `live`, Log "1 entry" (`#1 import pitstop-A agent-a 14 files base #0`), Open intents "None open.", As it happens `replayed 1 entry up to #1` |
+| Header | `head #1`, pill `live`, tabs `Live`, `Conflicts`, `Brain v0`, `Members`, `Set up Claude` |
+| Log | `1 entry`: `#1 import teamdb`, agent-a, the owner, `14 files`, `base #0` |
+| Who's here | 2: `agent-a` and `agent-b`, each `idle`, `applied #1 of #1` |
+| Worktrees | 2: two rows `● worktree · applied #1 of #1` (named `worktree` while the daemon has no open intent; each row appears with its daemon's first heartbeat, about 30 s after the daemon starts) |
+| Open intents | `None open.` |
 
-Keep a second pair of work dirs ready (`~/pitstop-A2`, `~/pitstop-B2` on `teamdb/take-9`, reset
-in the morning) so a failed take costs the time to switch terminals, not a minute of silence.
+The onboarding box (`Get this repository going`) disappears once the repository has an entry and a
+second member; that is expected.
 
-## The ten-minute version
+## The run: about twelve minutes
 
-Times are from the first prompt. Agent time is the uncertain part: Claude Code took two to four
-minutes per task in rehearsal, so the clock below assumes three.
+Times are from the first prompt. Agent time is the uncertain part: two to four minutes per task in
+rehearsal, so the clock assumes three. Do not reload the projector's page during the run: a reload
+replays only the head, the open intents and who is here, not the event history.
 
-### 0:00 Open the agents (both laptops)
+### 0:00 Both agents check in
 
-Type, on each laptop, in the second terminal:
+Type on each laptop: `Call the pitstop status tool.`
 
-```bash
-cd ~/pitstop-A && claude
-```
-
-(`~/pitstop-B` on B.) Claude Code asks whether to trust the folder and whether to use the project's
-MCP server from `.mcp.json`: yes to both. `/mcp` lists `pitstop` with five tools (`declare_intent`,
-`commit`, `why`, `callers`, `status`). Then, on A, type:
-
-> Call the pitstop status tool.
-
-- **A's screen:** `C:\Users\you\pitstop-A is at #1 (head #1), nothing pending; no open intent of yours.`
-- **Live view:** unchanged. **Log:** unchanged.
-- **If it fails:** no `pitstop` under `/mcp`: start Claude Code with the config named,
-  `claude --mcp-config .mcp.json`. "no daemon" in the tool result: the daemon is not running in
-  this work dir; see "If a daemon died".
+- **Each screen:** `C:\code\… is at #1 (head #1), nothing pending; no open intent of yours.`
+- **Say:** "Two checkouts, each a live replica of one log on the server."
 
 ### 0:30 Laptop A gets its task
 
@@ -127,271 +137,288 @@ Type on A, the prompt from `scenario.md`:
 > session has expired. Return null in that case instead of throwing, and make the callers handle
 > it. Turn the todo test into a real one.
 
-The house rules in the work dir's `CLAUDE.md` make the agent declare its intent first.
+The house rules in `CLAUDE.local.md` make the agent declare its intent first.
 
-- **A's screen:** the `declare_intent` call, answered
-  `Intent int_… is open at #1: "Fix the expired-session bug in auth". Declared: src/auth/session.ts#getCurrentUser. Use the commit tool when the work is done.`
-  Then it reads `src/auth/session.ts`, `src/router.ts`, the tests, and starts editing.
-- **Daemon log, both laptops:** `agent-a started: Fix the expired-session bug in auth`.
-- **Live view:** Open intents 1: `agent-a Fix the expired-session bug in auth`, its symbol, `from #1`.
-  As it happens: `agent-a intends: "Fix the expired-session bug in auth"`.
-- **Log:** unchanged (intents are not entries).
-- **Timing:** the intent is open within 10 s of the prompt.
-- **If it fails:** the agent edits without declaring: type
-  `Declare your intent with the pitstop declare_intent tool first, symbols src/auth/session.ts#getCurrentUser.`
+- **A's screen:** `Intent int_… is open at #1: "Fix the expired-session bug in auth". Declared: src/auth/session.ts#getCurrentUser. Use the commit tool when the work is done.` and `Brain v0: no accepted ADRs.`
+- **Live:** Open intents 1; Who's here `agent-a … working` with the intent; As it happens
+  `agent-a intends: "Fix the expired-session bug in auth"`.
+- **If it fails:** the agent edits without declaring: `Declare your intent with the pitstop declare_intent tool first, symbols src/auth/session.ts#getCurrentUser.`
 
 ### 0:45 Laptop B gets its task
 
-Type on B, the prompt from `scenario.md` plus one sentence that keeps the commit in your hands:
+Type on B:
 
 > Show when the user was last seen on the profile page (issue #61), like 'Last seen 3 hours ago'.
 > Keep the router as it is; the page can ask the session layer for the current user. When tsc and
 > vitest pass, stop and tell me; do not commit until I say so.
 
 - **B's screen:** `Intent int_… is open at #1: "Show last-seen on the profile page". Declared: src/pages/ProfilePage.ts#renderProfile, src/auth/session.ts#getCurrentUser. …`
-  After its next tool call, the hook delivers the early warning as context:
-  `Pitstop:` / `warning: agent-a is already working on src/auth/session.ts#getCurrentUser (intent: Fix the expired-session bug in auth); expect a conflict unless you coordinate`.
-  The agent usually mentions it and carries on.
-- **A's screen,** at A's next tool call: `warning: agent-b just started on src/auth/session.ts#getCurrentUser (intent: Show last-seen on the profile page)`.
-- **Daemon logs:** `agent-b started: …`, then the two `warning for …` lines.
-- **Live view:** Open intents 2. As it happens, newest first:
-  `for agent-a: agent-b just started on src/auth/session.ts#getCurrentUser (…)`,
-  `for agent-b: agent-a is already working on src/auth/session.ts#getCurrentUser (…); expect a conflict unless you coordinate`
-  (both orange), `agent-b intends: "Show last-seen on the profile page"`.
-- **Say:** "Pitstop saw the overlap before either agent wrote a line."
-- **If it fails:** B's agent stops to ask whether to go on: `Go ahead; A's change is small, you will be told what it did.`
-  No warning on B: the declared symbols must include `src/auth/session.ts#getCurrentUser`; tell the
-  agent to declare again with it.
+  After its next tool call the hook adds, under `Pitstop:`:
+  `warning: agent-a is already working on src/auth/session.ts#getCurrentUser (intent: Fix the expired-session bug in auth); expect a conflict unless you coordinate`
+  and `agent-a (<owner>) is also changing src/auth/session.ts#getCurrentUser, for 'Fix the expired-session bug in auth'`.
+- **A's screen,** at A's next tool call, under `Pitstop:`: `warning: agent-b just started on src/auth/session.ts#getCurrentUser (intent: Show last-seen on the profile page)` and `agent-b (<teammate>) is also changing src/auth/session.ts#getCurrentUser, for 'Show last-seen on the profile page'` (the second line can come one tool call later).
+- **Live:** Open intents 2; As it happens, newest first:
+  `for agent-a: agent-b just started on src/auth/session.ts#getCurrentUser (…)` and
+  `for agent-b: agent-a is already working on src/auth/session.ts#getCurrentUser (…); expect a conflict unless you coordinate`, both orange.
+- **Say:** "Like pg_stat_activity: Pitstop saw the overlap before either agent wrote a line."
+- **If it fails:** no warning: the warnings fire only on exactly the same declared symbol; tell B's
+  agent to declare again with `src/auth/session.ts#getCurrentUser`. B stops to ask whether to go
+  on: `Go ahead; A's change is small, you will be told what it did.`
 
 ### 1:00 to 4:00 Both agents work
 
-Nothing to type. A edits `src/auth/session.ts` (`getCurrentUser` returns `SessionUser | null`),
-`src/router.ts` (redirect to `/login`), `src/pages/HomePage.ts`, the two test files, and runs
-`npx tsc -p tsconfig.json --noEmit` and `npx vitest run`. B edits `src/pages/ProfilePage.ts` to call
-`getCurrentUser()` and `timeAgo`, runs the same checks, and stops: "tests pass, ready to commit".
+Nothing to type. A edits `session.ts`, `router.ts`, `HomePage.ts` and the two test files, and runs
+`npx tsc -p tsconfig.json --noEmit` and `npx vitest run`. B edits `ProfilePage.ts`, runs the same,
+and stops: "tests pass, ready to commit".
 
-- **Live view:** nothing new; the two intents' "ago" ticks (the daemons heartbeat them).
-- **Say:** what the log is (every change with its intent, its read set and its write set) and what
-  the daemon is (a replica that applies entries only between the agent's tool calls).
-- **If it fails:** B finishes long before A: fine, it waits. A finishes first and commits on its
-  own: fine too, that is the next step. B commits on its own before A: see "B lands first" below.
+- **Live:** Who's here shows each agent's files as chips while they edit.
+- **Say:** what the log is (every change with its intent, its read set and its write set) and what a
+  daemon is (a replica that applies entries only between its agent's tool calls, like a garbage
+  collector's safe points).
+- **If it fails:** B finishes first: fine, it waits. A commits on its own: fine, that is the next
+  step. B commits before A: see "B lands first".
 
 ### 4:00 Laptop A commits
 
-A's house rules say to commit once the checks pass; when it asks instead, type on A:
-
-> Commit it with the pitstop commit tool.
+When A's checks pass (or type `Commit it with the pitstop commit tool.`):
 
 - **A's screen:** `Committed as #2 "Fix the expired-session bug in auth" (5 files); main moved to it.`
-- **Daemon log, A:** `symbols: 3 written (1 signatures), 10 read`, `accepted as #2; main moved to it`.
-- **Daemon log, B:** nothing yet. B's agent is attached, so #2 waits for B's next safe point.
-- **Log:** `#2` by `agent-a`, base #1, 5 files (`src/auth/session.ts`, `src/auth/session.test.ts`,
-  `src/router.ts`, `src/router.test.ts`, `src/pages/HomePage.ts`); `sigWriteSet` is
-  `["src/auth/session.ts#getCurrentUser"]`; `writeSet` adds `src/router.ts#handle` and
-  `src/pages/HomePage.ts#renderHome`; `readSet` has 10 symbols.
-- **Live view:** `head #2`; the `#2` row slides in at the top with the orange badge `1 signature`;
-  As it happens: `#2 landed: "Fix the expired-session bug in auth" by agent-a, 5 files`. Click the
-  row: "signatures: src/auth/session.ts#getCurrentUser".
-- **Say:** "That badge is the point: a public signature changed. B read that symbol ten seconds
-  ago and does not know."
-- **Timing:** the commit tool answers in about 2 s (the daemon computes the symbol sets).
-- **If it fails:** `Commit rejected (constraint_failed)`: someone else changed the same files;
-  only possible if B landed first (below). `nothing to commit`: the agent did not save its edits;
-  tell it to check `git status` and try again.
+- **Live:** `head #2`; the `#2` row on top with the orange badge `1 signature`; As it happens, newest first:
+  `agent-a's intent committed: "Fix the expired-session bug in auth"` and
+  `#2 landed: "Fix the expired-session bug in auth" by agent-a, 5 files`. Click the row: signatures
+  `src/auth/session.ts#getCurrentUser`.
+- **B's checkout:** nothing yet. B's agent is attached, so #2 waits for B's next tool call.
+- **Say:** "That badge is the point: a public signature changed, and B's code relies on it."
 
-### 4:30 Laptop B commits, and is refused
+### 4:30 Laptop B commits, and it is held for the resolver
 
-Type on B:
+Type on B: `Commit now with the pitstop commit tool.`
 
-> Commit now with the pitstop commit tool.
-
-The commit tool runs before B's hook has applied #2, so B's files are still at #1: the server sees
-that B read `getCurrentUser` and that #2 changed its signature in between.
-
-- **B's screen,** the tool result:
-  `Commit rejected (escalated): write skew: #2 changed src/auth/session.ts#getCurrentUser (signature). Changed by: #2 "Fix the expired-session bug in auth" (src/auth/session.test.ts, src/auth/session.ts, src/pages/HomePage.ts, src/router.test.ts, src/router.ts). Re-read those files at head #2, adapt your change to them, and commit again with baseLsn 2. Conflicts with #2. Re-read what changed, adapt your change to it, and commit again.`
-  Right after it, the hook (B's next safe point) applies #2 and adds:
-  `Pitstop applied #2 to this worktree.` / `#2 "Fix the expired-session bug in auth" changed src/auth/session.ts#getCurrentUser (signature), which your change reads`.
-- **Daemon log, B:** `symbols: 1 written (0 signatures), 5 read`,
-  `reads are checked from #2 from now on: the server named what to re-read`, then
-  `applied #2 Fix the expired-session bug in auth`. The rejection text itself goes to the agent,
-  not to the log.
-- **Log:** unchanged, still two entries. A refused commit is not an entry.
-- **Live view:** unchanged. In `PITSTOP_REPAIR=agent` mode (what Azure runs) the refusal goes to
-  the agent only; nothing crosses the stream. Narrate it from B's screen, or show B's terminal.
+- **B's screen,** the tool result (the server's message after the tool's prefix):
+  `write skew: #2 changed src/auth/session.ts#getCurrentUser (signature). This repository's resolver (<owner>) decides on it: your commit waits as pk_… at $S/#/r/<owner>/teamdb-take1/conflicts. Do not commit this change again; at a later safe point you will be told whether it landed or what to change.`
+  To Claude Code the refusal is a failed tool, and it runs no PostToolUse hook after a failed tool, so nothing is applied yet. At B's next tool call (the agent usually re-reads a file at once; if B is idle, type on B: `Check the pitstop status tool.`) the hook applies #2 and adds, in this order: `Pitstop applied #2 to this worktree.`,
+  `warning: "Show last-seen on the profile page" by <teammate> waits for <owner>: write skew, #2 changed src/auth/session.ts#getCurrentUser (signature) (pk_…)`,
+  and `#2 "Fix the expired-session bug in auth" changed src/auth/session.ts#getCurrentUser (signature), which your change reads`.
+  (If B's agent ran another tool before the commit, #2 was applied then with the `#2 "…" changed …` line, and the warning comes alone under `Pitstop:`.)
+- **Live:** As it happens `for agent-b: "Show last-seen on the profile page" by <teammate> waits for <owner>: write skew, #2 changed src/auth/session.ts#getCurrentUser (signature) (pk_…)`;
+  the `Conflicts` tab gets the badge `1`. The log still has two entries: a held commit is not an entry.
 - **Say:** "Git would have merged this: different files. The app would have crashed on the profile
-  page. Pitstop refused it, named the symbol, and told the agent what to re-read."
-- **Timing:** immediate.
-- **If it fails:** the commit is accepted as `#3` without a refusal: the server is not running
-  with a resolver (`PITSTOP_REPAIR=agent`) but with `PITSTOP_VALIDATE=warn`; then the live view
-  shows a `write skew` badge on #3 and the event `#3 write skew, not repaired (…)`, and the story
-  becomes "flagged, not blocked". With `PITSTOP_REPAIR=groq` the server repairs it itself: #3 lands
-  with the `repaired` badge and `repaired against #2 (semantic): …` under the row, and B is told
-  `The server repaired it: …`. Both are fine stories; say which one you got.
+  page. Pitstop held it, and a person on the team decides."
+- **If it fails:** see "The commit is not held".
 
-### 5:00 Laptop B adapts and lands
+Known today: the tool shows the prefix twice (`Commit rejected (escalated): commit rejected
+(escalated): …`) and ends with its generic advice to adapt and commit again, which contradicts the
+server's "Do not commit this change again". If B's agent commits again while it waits, the tool answers `Commit rejected (constraint_failed): commit rejected (constraint_failed): your commit "Show last-seen on the profile page" (pk_…) is waiting for this repository's resolver; you will be told at a safe point whether it landed or what to change Those entries have been applied to your worktree where possible; re-read the files named above, adapt your change, and commit again.` (no period before `Those`): this refusal also ends by telling it to commit again, so it may keep trying. Type on B: `Wait:
+the resolver decides. Do not commit until Pitstop tells you.`
 
-Most of the time the agent reads the rejection and the note, runs `tsc` (it now fails with
-`src/pages/ProfilePage.ts(10,79): error TS18047: 'me' is possibly 'null'.`), adds the guard,
-re-runs the checks and commits without being asked. If it waits, type on B:
+### 5:00 The owner decides on the Conflicts tab
 
-> Do what the rejection says, then commit again.
+On the projector, open `Conflicts`. The card:
 
-- **B's screen:** `Committed as #3 "Show last-seen on the profile page" (1 file); main moved to it.`
-- **Daemon log, B:** `symbols: 1 written (0 signatures), 5 read`, `accepted as #3; main moved to it`.
-- **Log:** `#3` by `agent-b`, base #2, 1 file; `writeSet` `src/pages/ProfilePage.ts#renderProfile`;
-  `readSet` includes `src/auth/session.ts#getCurrentUser`, `src/auth/session.ts#SessionUser` and
-  `src/utils/timeAgo.ts#timeAgo`; no repairs (the agent was the repairer).
-- **Live view:** `head #3`, the `#3` row on top, `#3 landed: "Show last-seen on the profile page" by agent-b, 1 file`.
-  Click it: "reads" lists `getCurrentUser` and `timeAgo`.
-- **Say:** "Second attempt, checked from #2, lands. The log shows it read the new signature."
-- **Timing:** one to two minutes of agent time.
-- **If it fails:** rejected again with the same message: the daemon did not move the read base
-  (`.pitstop/state.json` should say `"readBaseLsn": 2`); tell the agent to call `status`, then
-  commit again. Type errors it cannot fix: paste the guard,
-  `const seen = me ? \`\n<p>Last seen ${timeAgo(me.lastSeenAt)}</p>\` : "";`.
+- the intent `Show last-seen on the profile page`, the badge `Waiting for a decision`, `agent-b`,
+  `for <teammate>`, the `pk_…` id;
+- the box `Write skew: something it relied on changed underneath it`: "Entry **#2** changed the
+  signature of `getCurrentUser` in `src/auth/session.ts`." and "This commit's agent read that code
+  before the change landed (the log was at #2 when it tried to land), so its files may still rely on
+  the old version. Git would have merged it without a word.";
+- `1 file`, `src/pages/ProfilePage.ts`, expandable.
+
+Type in `Note for its author (sent with Send back)`: `guard the null user before reading
+lastSeenAt`, then press `Send back with a note`.
+
+- **Owner's screen:** toast `"Show last-seen on the profile page" went back to <teammate>; their agent adapts and commits again.`; the card now reads `Sent back by <owner>` with the note.
+- **Live:** `for agent-b: <owner> sent "Show last-seen on the profile page" (pk_…) back: guard the null user before reading lastSeenAt. Re-read what changed (#2 changed src/auth/session.ts#getCurrentUser (signature)), adapt your change, and commit again.`
+- **Say:** "The resolver is a teammate, not a model. The final word on a semantic conflict belongs to
+  the team."
+- **Do not press `Let it through` on stage.** It lands B's page as it was, as #3, with the badges
+  `repaired` and `write skew` and the line `repaired against #2 (semantic): write skew accepted as is
+  by <owner>`, and that page does not type-check against #2.
+
+### 5:30 Laptop B adapts and lands
+
+The note reaches B's agent only at its next tool call. If B's agent is idle, type on B:
+`Check the pitstop status tool.`
+
+- **B's screen:** the hook's note `warning: <owner> sent "Show last-seen on the profile page" (pk_…) back: guard the null user …`. The agent runs `tsc` (it now fails where the page reads `lastSeenAt`: `'me' is possibly 'null'`, with whatever name the agent gave the result of `getCurrentUser()`, or `Object is possibly 'null'` if it calls `getCurrentUser().lastSeenAt` inline), adds the guard, re-runs the checks and commits.
+- **B's screen, the commit:** `Committed as #3 "Show last-seen on the profile page" (1 file); main moved to it.`
+- **Live:** `head #3`, the `#3` row on top, no repair badge; As it happens, newest first: `agent-b's intent committed: …` and `#3 landed: "Show last-seen on the profile page" by agent-b, 1 file`. Click the row: reads include `getCurrentUser` and `timeAgo`.
+- **Say:** "The agent read the note and fixed it. No human edited code."
+- **If it fails:** held again for the same skew: that refusal is a new `pk_…` card on `Conflicts`,
+  and while it waits every commit from B is refused as waiting. The same skew again means #2 is not
+  applied in B's checkout (`.pitstop/state.json` shows `"appliedLsn": 1`): tell the agent to call
+  `status`, whose hook applies it, and check the file now shows `"appliedLsn": 2` (still 1: the
+  apply failed, see `.pitstop/daemon.log`). Then send the new card back and tell the agent to commit
+  again. Type errors it cannot fix: paste the guard,
+  ``const seen = me ? `\n<p>Last seen ${timeAgo(me.lastSeenAt)}</p>` : "";``.
 
 ### 6:30 Laptop A receives it
 
-A's daemon holds #3 until A's agent's next tool call (that is the safe-point rule). Type on A:
+Type on A: `Call the pitstop status tool, then run npx vitest run.`
 
-> Run npx vitest run.
+- **A's screen:** the status result `C:\code\teamdb is at #2 (head #3), 1 pending (applied at your
+  next safe point); no open intent of yours.` (entries land between tool calls, so the status call
+  comes first). The hook then applies #3 without printing anything: it writes only when it has a
+  note, and #3 touches nothing A is editing. Then the tests run green with B's profile line
+  included. If #3 landed more than ten minutes after A's last tool call, A's daemon applied it on
+  arrival, and the status says `is at #3 (head #3), nothing pending`.
+- **Live:** Who's here shows both at `applied #3 of #3`.
+- **Say:** "Both checkouts hold the same tree, through the log, never through a merge."
 
-- **A's screen:** the tests pass, with B's profile line included; the hook prints nothing (nothing
-  touched A's work).
-- **Daemon log, A:** `applied #3 Show last-seen on the profile page`.
-- **Say:** "Both laptops now hold the same tree, through the log, never through a merge."
+### 7:00 The brain: an architecture decision
 
-### 7:00 Close
+On the projector, `Brain` tab, `Propose a decision`:
+- Title `Pages never import models`
+- Decision `Pages get their data through the session layer or a service, never by importing src/models.`
+- Why `One place owns how users are loaded.`
+- Rule: `Files may not import`, files `src/pages/**`, module `src/models/**`. Both boxes must be
+  filled, or the rule is dropped and the ADR is text only.
 
-On B, in a third terminal:
+`Propose`: toast `ADR-1 proposed: an owner accepts it to put it in force`. Then `Accept` on the card:
+toast `ADR-1 accepted: brain v1`; the tab badge becomes `v1`; As it happens
+`ADR-1 accepted: Pages never import models (brain v1)`.
 
-```bash
-cd ~/pitstop-B && npx vitest run
-```
+- **Each agent,** at its next tool call: `brain v1: ADR-1 accepted: Pages never import models: Pages get their data … Rules: forbid_import src/pages/** -> src/models/**.`
+- **Re-check now** (look at `src/pages/ProfilePage.ts` at head first: the result depends on whether
+  B's page still imports `findUser`): `N files at #3 checked against brain v1.`, a violation
+  `ADR-1 Pages never import models` / `src/pages/ProfilePage.ts:N` / `imports src/models/user.ts` (N is the line of the `findUser` import in B's page at head: `2` when B added its `getCurrentUser` import above it, as the gate scripts do; `1` when B put it below),
+  and queue lines like `#1 "import teamdb" by agent-a passed brain v0, before ADR-1: src/pages/ProfilePage.ts`.
+  If B removed the import, it says `Everything at head follows the accepted rules.`
+- **A refused commit.** An agent told about the ADR will avoid breaking it, so do this one by hand
+  in a terminal in checkout A: add `import { findUser } from "../models/user.js";` as line 2 of
+  `src/pages/HomePage.ts`, then `pitstop commit -m "Home page reads the user model"`:
+  ```
+  [pitstop] symbols: 0 written (0 signatures), 0 read
+  [pitstop] commit rejected (constraint_failed): refused by this repository's architecture decisions (brain v1):
+  ADR-1 "Pages never import models": src/pages/HomePage.ts:2 imports src/models/user.ts, which the rule forbid_import src/pages/** -> src/models/** forbids. Do instead: Pages get their data through the session layer or a service, never by importing src/models.
+  Change those lines to follow the decision and commit again.
+  ```
+  Then remove the line again. An ADR refusal goes only to the committer: narrate it from the
+  terminal; nothing appears on the Live tab.
+- **Say:** "A CHECK constraint for architecture, versioned like a schema: every entry records the
+  brain version it passed, and Re-check finds the older code that breaks the new rule."
 
-Green, with `sends an expired session to the login page` among them: the profile page for an
-expired session redirects instead of crashing. Then the log as data:
+### 9:00 The brain: a lease
 
-```bash
-curl -s -H "authorization: Bearer $T" "$S/log?repo=teamdb/demo" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{for(const e of JSON.parse(s))console.log(`#${e.lsn} ${e.intent} by ${e.author.agent} (base #${e.baseLsn}; ${e.files.length} files; signatures ${e.sigWriteSet.join(",")||"-"}; reads ${e.readSet.length}; repairs ${e.repairs.length})`)})'
-```
+Type on A:
 
-```
-#1 import pitstop-A by agent-a (base #0; 14 files; signatures -; reads 0; repairs 0)
-#2 Fix the expired-session bug in auth by agent-a (base #1; 5 files; signatures src/auth/session.ts#getCurrentUser; reads 10; repairs 0)
-#3 Show last-seen on the profile page by agent-b (base #2; 1 files; signatures -; reads 5; repairs 0)
-```
+> Declare an intent to make sessions expire after 30 minutes, symbol src/auth/session.ts#getCurrentUser, and take a pitstop lease on that symbol with the reason "changing session expiry".
 
-On the live view, reload the page (F5) if the Open intents panel still lists the two intents: the
-server closed them at the commits, but the page only learns that on reload.
+- **A's screen:** the intent, then `Lease taken: src/auth/session.ts#getCurrentUser is yours until HH:MMZ. Other agents' commits that write it are refused until you commit (which releases it) or it expires; your daemon renews it while your intent is open.`
+- **Live:** `agent-a leased src/auth/session.ts#getCurrentUser: changing session expiry`; the Brain tab's Leases card lists it with a `Release` button.
+
+Then type on B:
+
+> Declare an intent to make getCurrentUser refresh lastSeenAt, symbol src/auth/session.ts#getCurrentUser.
+
+- **B's screen,** in the declare answer: `Leased by another agent (your commit writing it is refused until it is released or expires): src/auth/session.ts#getCurrentUser leased to agent-a (<owner>) until HH:MMZ: changing session expiry.` B's agent usually stops there and says it will wait. Asked to take the lease itself, it gets `Lease refused: src/auth/session.ts#getCurrentUser is leased to agent-a (<owner>) for intent int_… until …: changing session expiry. Leave that symbol alone (a commit writing it is refused) or wait until the lease ends.`
+- **Say:** "A lease has exactly one winner, granted in one Postgres transaction. Presence is a CRDT
+  because it never needs one."
+- **End it:** type on A `Make that change and commit it with the pitstop commit tool.` The commit closes the intent and releases the lease: Live `agent-a released src/auth/session.ts#getCurrentUser`. A commit with nothing changed fails (`nothing to commit: @ has no changes against main`), and the lease stays. Or press `Release` on the Brain tab: toast `src/auth/session.ts#getCurrentUser released`, and the same Live line.
 
 ## The three-minute version
 
-The same story with the agent time taken out: do steps 0:00 to 4:00 before the talk, so both agents
-have declared, edited and passed their checks and B is waiting for the word. On stage, with the
-live view already on the projector:
+Do the steps from 0:00 through "1:00 to 4:00" before the talk and stop before "4:00 Laptop A commits" (add `When tsc and vitest pass, stop and tell me; do not commit until I say so.` to A's prompt too, or A commits on its own). Also fill in the ADR from 7:00 on the Brain tab and press `Propose`, not `Accept`. Then both agents have declared, edited and passed their checks
+and B is waiting for the word. On stage, with the Live tab on the projector:
 
-| | Laptop | Type | Expect |
+| | Who | Do | Expect |
 | --- | --- | --- | --- |
-| 0:00 | A | `Commit it with the pitstop commit tool.` | `Committed as #2 …`; live view `#2`, badge `1 signature` |
-| 0:20 | B | `Commit now with the pitstop commit tool.` | `Commit rejected (escalated): write skew: #2 changed src/auth/session.ts#getCurrentUser (signature) …`; then `Pitstop applied #2 …` |
-| 0:40 | B | (nothing, or `Do what the rejection says, then commit again.`) | `Committed as #3 …`; live view `#3` on top |
-| 2:00 | A | `Run npx vitest run.` | green; daemon log `applied #3` |
-| 2:30 | B | the `curl` from "Close" | the three entries |
-
-Point at the live view's As it happens list while B's agent works: the two intents, the two orange
-warnings, `#2 landed`, `#3 landed`, newest first, with times.
-
-If the prepared state was lost (a laptop restarted, an agent session gone): the agents' edits are
-exactly the files `scripts/gate4.sh` writes in its beat 4 and beat 5 heredocs; paste them into the
-work dirs, run `pitstop intent` from `.env` (`set -a; . ./.env; set +a; node <pitstop>/daemon/dist/index.js intent -m "…" -s …`)
-and drive the commits with `node <pitstop>/daemon/dist/index.js commit -m "…"` instead of the agents.
-The refusal, the notes (`node <pitstop>/mcp/dist/hook.js </dev/null` prints them) and the log are
-identical; only the "agent reads and adapts" minute is yours.
-
-Ninety seconds, one laptop, no network: `bash demo/scripts/gate4.sh ~/g4` runs every beat against a
-local server on port 8098 and prints each as it passes; open `http://127.0.0.1:8098/#teamdb%2Fdemo`
-while it runs (no token there) for the live view.
+| 0:00 | A | `Commit it with the pitstop commit tool.` | `Committed as #2 …`; Live `#2`, badge `1 signature` |
+| 0:20 | B | `Commit now with the pitstop commit tool.` | held: `… your commit waits as pk_… Do not commit this change again …`; Live `for agent-b: … waits for <owner> …`; Conflicts badge `1` |
+| 0:50 | owner | Conflicts tab: note `guard the null user before reading lastSeenAt`, `Send back with a note` | card `Sent back by <owner>`; Live `for agent-b: <owner> sent … back: …` |
+| 1:10 | B | `Check the pitstop status tool.` (if idle) | the note; the agent guards the null and commits: `Committed as #3 …` |
+| 2:20 | owner | Brain tab: accept the prepared ADR, `Re-check now` | `brain v1`; `src/pages/ProfilePage.ts:2` (the line of B's `findUser` import; `:1` if B added its imports below it, none if B dropped it) |
+| 2:45 | | the numbers | |
 
 ## If it fails
 
-**The server is down** (`rehearse.sh` says "the server does not answer", or the live view pill stays
-`offline`). Check `$S/healthz` once in the browser; the Container App can take 30 s to wake. If it
-stays down, run the server on laptop A with the in-memory store and the same token, so nothing else
-changes:
+**The commit is not held** (B's commit lands as #3, or B gets the plain `Re-read those files at head
+#2 …` refusal and the Conflicts tab stays empty). Someone other than B's committer must be able to
+decide: check the Members tab. The owner's row should carry `resolver`, and B must be signed in as the
+teammate, not as the owner. If the only resolver is the teammate, B's skew goes back to agent B; the
+Live tab then says `"…" by <teammate> went back to agent-b to adapt: write skew, …`, and the story
+becomes "the agent adapts on its own", which is also fine to narrate.
 
-```bash
-PITSTOP_STORE=memory PITSTOP_REPAIR=agent PITSTOP_TOKEN="$T" PORT=8097 npx tsx server/src/index.ts
-```
+**B declared its intent after #2 was applied on B** (then B's reads are checked from #2): the commit
+lands with no skew. Keep the "do not commit until I say so" sentence and the order: A commits only
+once B waits.
 
-It serves the live view at `http://127.0.0.1:8097/` when `web/dist` exists (`npm run build` made
-it). Laptop B reaches it as `http://<A's address>:8097` (the server listens on every interface;
-Windows asks once to allow node through the firewall; `ipconfig` on A for the address). Then on
-both laptops `PITSTOP_SERVER=http://<address>:8097 bash demo/scripts/rehearse.sh …`. If the laptops
-cannot see each other, run both work dirs on A: `rehearse.sh B ~/pitstop-B` there too, and B's
-person types on A's second Claude Code. Nothing is persisted: a restart of that server is a fresh
-log, which for a demo is a feature.
+**B lands first** (B committed before A, so B is #2, clean). The skew then hits A, whose router
+change reads `renderProfile`. A is the owner and the only decider, so A's commit is not held: A gets
+the plain escalation, adapts and commits again. Narrate it mirrored rather than resetting.
 
-**The token is refused** (`the server answered 401 to GET /repos with this token`): `.env`'s
-`PITSTOP_TOKEN` is not the GitHub secret the server was provisioned with. Fix `.env`; nothing else
-caches it (the work dir's `.pitstop/config.json` is rewritten by the next reset).
+**The note never arrives on B.** Notes and warnings reach an agent only at its next tool call. Type
+anything on B that makes it call a tool (`Check the pitstop status tool.`).
 
-**"already has N entries and the log is append-only":** that name was used. `PITSTOP_REPO=teamdb/take-3`
-on both laptops; pick `teamdb/take-3` in the live view's dropdown.
+**Both agents have the same name** (`<os user>-claude`): setup ran without `--agent`. Run setup
+again in the checkout with `--agent agent-b` (it needs the token again: `--token` or
+`PITSTOP_TOKEN`); it restarts the daemon (`stopped the daemon (pid N) to start it with the new
+settings`). With the same name, each agent also receives the other's warnings.
 
-**"cannot replace … something still runs in it":** Claude Code, its MCP server or a shell is still
-inside the work dir. Close them (`/exit` in Claude Code), run again.
+**The lease holder is told its own lease is another agent's** (`lease: agent-a (<owner>) holds …;
+a commit of yours that changes it is refused until then`): `PITSTOP_DEVELOPER` is not the GitHub
+login on that laptop (see "Before the day"). The lease still blocks B; it is just not renewed.
 
-**A daemon died** (`.pitstop/daemon.log` ends with `stopped at #N: …`, or the tools answer "no
-daemon"). Restart it in the work dir; the server, token and repository are in
-`.pitstop/config.json`, the agent name in `.env`:
+**Setup refuses laptop A's folder** (`… has changes that are not committed to main …`, then the files): something changed after `reset.sh`. Run
+`reset.sh` again. Setup also refuses a folder already set up for another repository: use a fresh
+`reset.sh` folder per take.
 
-```bash
-cd ~/pitstop-A && set -a && . ./.env && set +a && node <pitstop>/daemon/dist/index.js daemon
-```
+**Setup cannot read the repository** (`… has no repository <id> that this token can read: check the
+name, and that the repository's owner has added your GitHub login as a member …`): B is not a member
+yet, or the repository name on the setup line is wrong. A prompt from an older take does not stop here. With its token revoked, setup says `… answered 401 for <owner>/teamdb-take1: check the token; with accounts on, the repository's owner adds you as a member.`. With a live token, it sets up that older repository: it reuses the old folder if it is still there (`… is already a checkout of <owner>/teamdb-take1`), and clones it otherwise. Check that setup's `ready:` line names this take's repository.
 
-It resubscribes from the LSN in `.pitstop/state.json` and applies what it missed. An entry that
-failed to apply (jj conflict markers) is reported to the agent at its next safe point: let the agent
-resolve, or `jj resolve --list` by hand.
+**The Resolver switch is greyed out:** the teammate's row is still an invite. They sign in once; the
+owner reloads the Members tab (it does not refresh on its own).
+
+**Claude Code does not show the pitstop tools:** `/mcp` in the session. Setup pre-approves the
+project's MCP server and the pitstop tools in `.claude/settings.local.json`; if the repository
+already tracks a `.mcp.json`, setup prints a `claude mcp add --scope local pitstop -- …` line to run
+once.
+
+**A daemon stopped applying** (`.pitstop/daemon.log` ends with `apply failed, stopped at #N: …` or
+`gave up, stopped at #N: …`). The process is still alive and its local API still answers, so neither
+opening Claude Code nor `pitstop start` replaces it (`pitstop start` prints `daemon already running
+in …`): run `pitstop stop`, then `pitstop start`, in the checkout. **No daemon at all** (the tools
+say so): opening Claude Code in the checkout starts one, and so does the next pitstop tool call. A
+new daemon resubscribes from its last applied entry.
 
 **jj problems:** "The system cannot find the path specified" from `jj git init` is the long-path
-bug; the work dir must be short (`~/pitstop-A` is). `jj` not found: the script looks under
-WinGet's packages folder; otherwise `export PATH="<folder of jj.exe>:$PATH"` before running it.
+bug; keep checkouts short (`C:\code\…`). `jj` not found: open a new terminal after installing it.
 
-**Claude Code does not show the pitstop tools:** `/mcp` in the session. The project server must be
-approved on first use; `claude --mcp-config .mcp.json` forces it. The hook is in
-`.claude/settings.json`; `/hooks` lists it. Neither needs the token.
+**The Live tab looks stale:** `offline` pill: it reconnects every 2 s. `no access`: the signed-in
+person cannot read this repository. Ages in the log do not tick on their own (they move when an entry lands or one is clicked); the ages under Open intents redraw every 5 s. Do not
+reload mid-run.
 
-**The agent refuses to go on after the warning,** or asks whether to coordinate: `Go ahead; A's
-change is small, you will be told what it did.`
+**The server is down** (`$S/healthz` does not answer): the resolver beat needs the hosted server,
+since a local server has no GitHub sign-in and therefore no members. Switch to the offline story
+below.
 
-**B lands first** (B's agent committed before A, so B is `#2`, clean). The skew then hits A instead:
-A's `router.ts` reads `renderProfile`, which #2 changed, so A's commit is refused with the same
-kind of message naming `src/pages/ProfilePage.ts#renderProfile`, A's hook applies #2, A adapts
-(usually nothing to change: the guard is in the router) and commits again. The story holds, mirrored;
-narrate it that way rather than resetting. The "do not commit until I say so" sentence in B's prompt
-is there to avoid this.
+## Offline: the gates
 
-**The refusal never comes** and B's commit lands as #3 straight away: either the server runs without
-a resolver (`write skew` badge on #3, event `#3 write skew, not repaired`), or B's intent was
-declared after #2 had been applied on B (then B's reads were checked from #2 and were fine). Say
-what the badge says; the type error B would have shipped is the same.
+These need no GitHub accounts and no website sign-in. gate1 and gate4 start their own server on this laptop. rehearse.sh uses the hosted server unless `PITSTOP_SERVER` names another one. When the hosted server is down, it stops and prints the command for a local in-memory server on port 8097. Its Claude Code sessions need the internet in any case. All three run `reset.sh`, whose `npm install` needs the npm registry or the packages already in npm's cache. They use the shared
+token or an open server, so their repositories have no members and the skew always goes back to the
+agent (the plain escalation); nothing waits on a Conflicts tab.
 
-**The live view looks stale:** `offline` pill: it reconnects every 2 s; if the token field
-reappears, the server restarted with another token. Open intents still listed after their commits:
-reload (F5). Wrong repository: the dropdown, or the URL's `#owner%2Fname`.
+- `bash demo/scripts/gate4.sh ~/g4`: the whole story on one laptop in about ninety seconds, against
+  a local server on port 8098, driven by the CLI instead of agents. Open `http://127.0.0.1:8098/#/r/teamdb/demo` once it prints `== beat 3` (the bare `/` shows only the landing on this open server; opened earlier, before `init` has made teamdb/demo, the pill says `no access` and never retries, so reload it), while
+  it runs for the live view. It ends `A and B are identical: Phase 4 gate PASSED (write skew caught,
+  the agent repaired it)`.
+- `bash demo/scripts/rehearse.sh A ~/pitstop-A` and `… B ~/pitstop-B`: two checkouts with real
+  Claude Code sessions, against the hosted server with the administrator's shared `PITSTOP_TOKEN`
+  from the repo-root `.env` (`PITSTOP_REPO=teamdb/take-N` for a fresh name), or a local one with
+  `PITSTOP_SERVER=…`. Its repository is visible only to the shared token, which the website on a
+  sign-in server does not take, so show the agents' screens rather than the website.
+- `bash demo/scripts/gate1.sh`: the Phase 1 gate (two replicas stay identical), port 8097.
 
-**Everything at once:** the gate: `bash demo/scripts/gate4.sh ~/g4` on either laptop. It needs no
-server, no token, no agent, and prints the whole story in ninety seconds.
+## Known issues, worth fixing before the day
 
-## Seen in rehearsal, worth fixing before the day
-
-- The refusal is invisible on the live view in `agent` mode: the server answers the daemon and
-  broadcasts nothing. A `warning` of kind `dependency_changed` on escalation would put
-  `for agent-b: write skew: #2 changed … (signature)` in As it happens, which is the moment the
-  judges should see. (server/, Vazovski.)
-- Intents stay in the Open intents panel after their commit until the page reloads: the store marks
-  them `committed`, but no `intent` message with that status crosses the stream. (server/.)
-- The import's intent reads `import pitstop-A` (the work dir's name); `pitstop init` has no `-m`.
-  Cosmetic. (daemon/, teammate.)
+- The commit tool shows refusals with the prefix twice (`Commit rejected (X): commit rejected (X):`)
+  and appends advice that does not fit every refusal: "adapt and commit again" after a held commit
+  that says "Do not commit this change again", and "Those entries have been applied to your
+  worktree" after an ADR or lease refusal (`mcp/src/tools.ts`, `daemon/src/commit.ts`).
+- The daemon compares lease holders with the OS user name while the server records the GitHub login,
+  so with a personal token a holder does not recognise or renew its own lease unless
+  `PITSTOP_DEVELOPER` is the login (`daemon/src/daemon.ts`, `config.ts`).
+- The setup prompt on the website has no `--agent`, so two checkouts of one OS user share a name.
+- ADR and lease refusals reach only the committer; the Live tab shows write skew but not those.
+- After `Let it through`, B's Who's here row keeps its old intent until B declares or commits again.
+- The import's intent is `import <folder name>`; setup takes no message for it.
