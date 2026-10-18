@@ -13,6 +13,9 @@
  *   (views hide an entry older than two minutes, so this keeps it alive);
  * - on close: a tombstone (`state: "gone"`).
  *
+ * A safe-point publish whose values did not change sends nothing (the heartbeat keeps the entry
+ * alive), and the daemon does not wait for it: the hook never waits on jj and git for presence.
+ *
  * The clock observes every stamp it receives, so a write here orders after everything this
  * worktree has seen. Presence is never used for decisions: an overlap with another replica is a
  * note for the agent, once, never a refusal.
@@ -41,9 +44,17 @@ export const REPLICA_FILE = "replica";
 /** Views show entries written this recently; the server's PRESENCE_TTL_MS is the same. */
 export const PRESENCE_TTL_MS = 2 * 60_000;
 /** Unfinished edits are diffed at most this often at safe points, which follow every tool call. */
-export const PRESENCE_FILES_MS = 3_000;
+export const PRESENCE_FILES_MS = 5_000;
 /** How long after an apply the keepalive with the new applied LSN goes out (a replay applies many at once). */
 export const PRESENCE_BUMP_MS = 250;
+/** A safe point with nothing new still writes once this long has passed since the last write (the heartbeat's default period). */
+export const PRESENCE_REFRESH_MS = 30_000;
+/** At most one rewrite of this worktree's entry over someone else's write of it in this long. */
+export const PRESENCE_REWRITE_MS = 5_000;
+/** At most this many entries in this copy of the document (the server keeps as many); the oldest tombstones go first. */
+export const PRESENCE_MAX_ENTRIES = 500;
+/** Files and symbols named per overlap note; the rest is counted, and the `who` tool lists them all. */
+const NOTE_ITEMS = 5;
 
 const REPLICA = /^[A-Za-z0-9_-]{1,64}$/;
 /** The schema's limits on an entry (packages/protocol/src/presence.ts). */
@@ -92,6 +103,10 @@ export interface PresenceOptions {
   /** Minimum time between two diffs at safe points; default PRESENCE_FILES_MS. */
   filesMs?: number;
   bumpMs?: number;
+  /** A publish with unchanged values writes nothing until this long after the last write; default PRESENCE_REFRESH_MS. */
+  refreshMs?: number;
+  /** Minimum time between two rewrites over someone else's write of this worktree's key; default PRESENCE_REWRITE_MS. */
+  rewriteMs?: number;
   log?: (line: string) => void;
 }
 
@@ -110,6 +125,10 @@ export class Presence {
   /** This worktree's entry as last computed; keepalives resend it with a new stamp. */
   private mine: Values | undefined;
   private lastStamp: string | undefined;
+  private lastWriteAt = Number.NEGATIVE_INFINITY;
+  private lastRewriteAt = Number.NEGATIVE_INFINITY;
+  /** Another process writes this worktree's key (a copied checkout): said once in the log. */
+  private twinWarned = false;
   private files: string[] = [];
   private filesAt = Number.NEGATIVE_INFINITY;
   /** Overlaps already told to the agent, `replica\0path-or-symbol`: each once while it lasts. */
@@ -146,11 +165,36 @@ export class Presence {
       this.doc = applyPresence(this.doc, entry);
       if (entry.replica !== this.clock.replica && this.doc[entry.replica] === entry) this.logChange(before, entry);
     }
-    // Someone wrote this worktree's key after its own last write (the tombstone a server leaves
-    // when an old socket of ours closes late, say): this worktree is still here, so write again.
-    // The clock has observed that stamp, so the new write wins.
+    this.prune();
+    // Someone wrote this worktree's key after its own last write. A tombstone (the server's, when
+    // an old socket of ours closes late) is wrong while this worktree is here, so it writes again;
+    // the clock has observed that stamp, so the new write wins. A live entry means another
+    // process shares this replica id (a copied checkout, two daemons): answering it would start
+    // an endless exchange of rewrites, so it is said once and left to the keepalives.
     const own = this.doc[this.clock.replica];
-    if (own !== undefined && this.lastStamp !== undefined && own.stamp > this.lastStamp) this.keepalive();
+    if (own === undefined || this.lastStamp === undefined || !(own.stamp > this.lastStamp)) return;
+    if (own.state !== "gone") {
+      if (!this.twinWarned) {
+        this.twinWarned = true;
+        this.opts.log?.(
+          `presence: another process writes this worktree's replica id ${this.clock.replica} (a copied checkout? delete .pitstop/replica in the copy)`,
+        );
+      }
+      return;
+    }
+    const now = this.now();
+    if (now - this.lastRewriteAt < (this.opts.rewriteMs ?? PRESENCE_REWRITE_MS)) return; // the next keepalive heals it
+    this.lastRewriteAt = now;
+    this.keepalive();
+  }
+
+  /**
+   * The unfinished edits as the daemon's own safe-point notes just listed them: the next publish
+   * uses them instead of diffing again.
+   */
+  setFiles(paths: Iterable<string>): void {
+    this.files = [...new Set(paths)].sort();
+    this.filesAt = this.now();
   }
 
   /**
@@ -164,8 +208,12 @@ export class Presence {
     if (fresh || now - this.filesAt >= (this.opts.filesMs ?? PRESENCE_FILES_MS)) {
       this.filesAt = now;
       try {
-        const changes = await withWorktreeLock(this.opts.worktree, () => this.opts.applier.diffAgainstMain());
-        this.files = [...new Set(changes.map((f) => f.path))].sort();
+        const { applier } = this.opts;
+        // Paths only when the applier can (no file contents read just to be dropped).
+        const paths = await withWorktreeLock(this.opts.worktree, async () =>
+          applier.changedPaths !== undefined ? applier.changedPaths() : (await applier.diffAgainstMain()).map((f) => f.path),
+        );
+        this.files = [...new Set(paths)].sort();
       } catch (err) {
         this.opts.log?.(`presence: could not list the unfinished edits: ${err instanceof Error ? err.message : String(err)}`);
       }
@@ -173,7 +221,7 @@ export class Presence {
     const intent = await this.opts.intent().catch(() => undefined);
     if (this.left) return undefined;
     const text = intent?.text.trim().slice(0, MAX_INTENT) ?? "";
-    this.mine = {
+    const values: Values = {
       replica: this.clock.replica,
       repo: this.opts.repo,
       author: this.opts.author,
@@ -184,7 +232,12 @@ export class Presence {
       symbols: (intent?.symbols ?? []).filter((s) => SymbolId.safeParse(s).success).slice(0, MAX_LIST),
       appliedLsn: this.opts.appliedLsn(),
     };
-    return this.write(this.mine);
+    // Nothing new since the last write, which is recent: the heartbeat keeps the entry alive, so
+    // a safe point (one per tool call) sends nothing. A fresh publish (connect, declare, commit) always goes.
+    const unchanged = this.mine !== undefined && sameValues(this.mine, values);
+    this.mine = values;
+    if (!fresh && unchanged && this.now() - this.lastWriteAt < (this.opts.refreshMs ?? PRESENCE_REFRESH_MS)) return undefined;
+    return this.write(values);
   }
 
   /** The keepalive: the values last computed, the current applied LSN, a new stamp. */
@@ -247,11 +300,12 @@ export class Presence {
       const newSymbols = symbols.filter((s) => !this.told.has(key(s)));
       if (newFiles.length === 0 && newSymbols.length === 0) continue;
       const doing = [
-        newFiles.length > 0 ? `editing ${newFiles.join(", ")}` : "",
-        newSymbols.length > 0 ? `changing ${newSymbols.join(", ")}` : "",
+        newFiles.length > 0 ? `editing ${some(newFiles)}` : "",
+        newSymbols.length > 0 ? `changing ${some(newSymbols)}` : "",
       ].filter((s) => s !== "");
       const why = entry.intent === undefined ? "" : `, for '${entry.intent}'`;
-      notes.push(`${entry.author.agent} (${entry.author.developer}) is also ${doing.join(" and ")}${why}`);
+      const more = newFiles.length > NOTE_ITEMS || newSymbols.length > NOTE_ITEMS ? " (call who for the full list)" : "";
+      notes.push(`${entry.author.agent} (${entry.author.developer}) is also ${doing.join(" and ")}${why}${more}`);
     }
     this.told = current;
     return notes;
@@ -268,6 +322,7 @@ export class Presence {
     const entry = parsed.data;
     this.doc = applyPresence(this.doc, entry);
     this.lastStamp = entry.stamp;
+    this.lastWriteAt = this.now();
     try {
       // Callers fire and forget (heartbeats, `head`): a socket that fails mid-send must not take the daemon down.
       this.opts.send({ type: "presence", entry });
@@ -275,6 +330,22 @@ export class Presence {
       this.opts.log?.(`presence: not sent: ${err instanceof Error ? err.message : String(err)}`);
     }
     return entry;
+  }
+
+  /**
+   * Keeps this copy of the document under PRESENCE_MAX_ENTRIES, as the server keeps its own:
+   * tombstones first, then the oldest entries, never this worktree's. Only a flood of replicas
+   * gets here; dropping a key is outside the CRDT, but views hide such entries soon anyway.
+   */
+  private prune(): void {
+    const all = Object.values(this.doc);
+    if (all.length <= PRESENCE_MAX_ENTRIES) return;
+    const own = this.clock?.replica;
+    const order = all
+      .filter((e) => e.replica !== own)
+      .sort((a, b) => Number(b.state === "gone") - Number(a.state === "gone") || (a.stamp < b.stamp ? -1 : 1));
+    const drop = new Set(order.slice(0, all.length - PRESENCE_MAX_ENTRIES).map((e) => e.replica));
+    this.doc = Object.fromEntries(all.filter((e) => !drop.has(e.replica)).map((e) => [e.replica, e]));
   }
 
   /** One log line when another replica arrives, changes state or task, or leaves: not for every keepalive. */
@@ -288,4 +359,24 @@ export class Presence {
     const task = after.intent === undefined ? "" : `: ${after.intent}`;
     this.opts.log?.(`presence: ${who} is ${after.state}${task}`);
   }
+}
+
+/** Whether two computed entries say the same (the stamp aside). */
+function sameValues(a: Values, b: Values): boolean {
+  const list = (xs: string[], ys: string[]) => xs.length === ys.length && xs.every((x, i) => x === ys[i]);
+  return (
+    a.state === b.state &&
+    a.intentId === b.intentId &&
+    a.intent === b.intent &&
+    a.appliedLsn === b.appliedLsn &&
+    a.author.agent === b.author.agent &&
+    a.author.developer === b.author.developer &&
+    list(a.files, b.files) &&
+    list(a.symbols, b.symbols)
+  );
+}
+
+/** A list for a note: the first few, then how many more. */
+function some(items: string[]): string {
+  return items.length <= NOTE_ITEMS ? items.join(", ") : `${items.slice(0, NOTE_ITEMS).join(", ")} and ${items.length - NOTE_ITEMS} more`;
 }

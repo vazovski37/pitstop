@@ -2,11 +2,12 @@ import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { afterEach, describe, expect, it } from "vitest";
 import { WebSocket, WebSocketServer } from "ws";
-import { parseStamp, ServerMessage, stampOf, type PresenceEntry } from "@pitstop/protocol";
+import { parseStamp, ServerMessage, stampOf, type PresenceEntry, type RepoId } from "@pitstop/protocol";
 import { buildApp } from "./app.js";
-import { nextStamp, PRESENCE_RETAIN_MS, PresenceDocs, refusal } from "./presence.js";
+import type { OAuthProvider } from "./auth.js";
+import { nextStamp, PRESENCE_RETAIN_MS, PRESENCE_TTL_MS, PresenceDocs, refusal } from "./presence.js";
 import { MemoryStore } from "./store.js";
-import { Stream } from "./stream.js";
+import { PRESENCE_REPLICAS_PER_SOCKET, Stream, type ConnectOptions } from "./stream.js";
 
 const NOW = Date.now();
 
@@ -58,6 +59,11 @@ class Inbox {
   close(): void {
     this.socket.close();
   }
+
+  /** Drops the connection without a closing handshake, as a killed process does. */
+  terminate(): void {
+    this.socket.terminate();
+  }
 }
 
 const open = (url: string): Promise<Inbox> =>
@@ -75,6 +81,52 @@ const subscribed = async (url: string, repo = "local/default"): Promise<Inbox> =
   inbox.send({ type: "subscribe", repo, fromLsn: 0 });
   expect(await inbox.next()).toMatchObject({ type: "head", repo });
   return inbox;
+};
+
+/**
+ * Proves the repository's presence document is empty for a fresh socket: after `head` the whole
+ * document would come next, so a second `subscribe` answered by `head` straight away means
+ * there was none (messages to one socket are sent in order).
+ */
+const expectNoPresence = async (url: string, repo = "local/default"): Promise<void> => {
+  const probe = await subscribed(url, repo);
+  probe.send({ type: "subscribe", repo, fromLsn: 0 });
+  expect(await probe.next()).toMatchObject({ type: "head", repo });
+  probe.close();
+};
+
+const cleanups: (() => Promise<void>)[] = [];
+afterEach(async () => {
+  for (const clean of cleanups.splice(0).reverse()) await clean();
+});
+
+/** How a socket is wired, from the path it connects to (`connect`'s arguments in app.ts). */
+type Wiring = (path: string) => { canRead?: (repo: RepoId) => Promise<boolean>; options?: ConnectOptions };
+
+/** A writer on every path; `/as/<login>` stands for that signed-in user, `/reader` may only read. */
+const writers: Wiring = (path) => {
+  if (path === "/reader") return {};
+  return { options: { canWrite: async () => true, ...(path.startsWith("/as/") ? { developer: path.slice("/as/".length) } : {}) } };
+};
+
+/** A Stream on its own WebSocket server, wired as app.ts's `/stream` route would be. */
+const listenStream = async (wiring: Wiring = writers, store = new MemoryStore(), docs = new PresenceDocs()) => {
+  const stream = new Stream(store, "test-sha", undefined, docs);
+  const http = createServer();
+  const wss = new WebSocketServer({ server: http });
+  wss.on("connection", (socket, req) => {
+    const { canRead, options } = wiring(req.url ?? "/");
+    stream.connect(socket, canRead, options);
+  });
+  await new Promise<void>((resolve) => http.listen(0, "127.0.0.1", resolve));
+  cleanups.push(async () => {
+    for (const c of wss.clients) c.terminate();
+    wss.close();
+    await new Promise<void>((resolve) => http.close(() => resolve()));
+  });
+  await store.createRepo("acme/app");
+  const base = `ws://127.0.0.1:${(http.address() as AddressInfo).port}`;
+  return { stream, store, base, url: `${base}/` };
 };
 
 describe("the presence document (presence.ts)", () => {
@@ -118,22 +170,36 @@ describe("the presence document (presence.ts)", () => {
     expect(aging.apply(entry("ancient", 0))).toBe(false);
     expect(aging.entries("local/default").map((e) => e.replica).sort()).toEqual(["x", "y"]);
   });
-});
 
-describe("presence on GET /stream", () => {
-  let cleanup: (() => Promise<void>) | undefined;
-  afterEach(async () => {
-    await cleanup?.();
-    cleanup = undefined;
+  it("keeps a repository under its byte budget too, dropping the oldest entries first", () => {
+    const big = (replica: string, counter: number) => entry(replica, counter, { files: Array.from({ length: 100 }, (_, i) => `src/${"y".repeat(80)}/${i}.ts`) });
+    const size = JSON.stringify(big("a", 0)).length;
+    const docs = new PresenceDocs(() => NOW, 500, size * 2 + 10);
+    expect(docs.apply(big("a", 0))).toBe(true);
+    expect(docs.apply(big("b", 1))).toBe(true);
+    expect(docs.apply(big("c", 2))).toBe(true);
+    expect(docs.entries("local/default").map((e) => e.replica).sort()).toEqual(["b", "c"]);
   });
 
-  const listen = async () => {
-    const app = await buildApp({ version: "test-sha", pingDb: async () => true, store: new MemoryStore() });
-    await app.listen({ host: "127.0.0.1", port: 0 });
-    cleanup = () => app.close();
-    await app.inject({ method: "POST", url: "/repos", payload: { id: "acme/app" } });
-    return { app, url: `ws://127.0.0.1:${(app.server.address() as AddressInfo).port}/stream` };
-  };
+  it("binds a replica to the writer who last wrote it while it is live; a departed or faded one is free", () => {
+    let now = NOW;
+    const docs = new PresenceDocs(() => now);
+    expect(docs.offer(entry("w_b", 0), "bob")).toEqual({ changed: true });
+    expect(docs.offer(entry("w_b", 1, { intent: "not bob" }), "mallory")).toEqual({ changed: false, refused: expect.stringMatching(/another writer/) });
+    expect(docs.offer(entry("w_b", 2, { state: "gone", files: [] }), "mallory").changed).toBe(false); // nor tombstone it
+    expect(docs.get("local/default", "w_b")?.stamp).toBe(entry("w_b", 0).stamp);
+    expect(docs.offer(entry("w_b", 3), "bob")).toEqual({ changed: true });
+    // The server's own tombstone (no writer) passes; once departed, another writer may take the replica.
+    expect(docs.apply(entry("w_b", 4, { state: "gone", files: [] }))).toBe(true);
+    expect(docs.offer(entry("w_b", 5), "carol")).toEqual({ changed: true });
+    // A replica that faded past the TTL is free too.
+    now = NOW + PRESENCE_TTL_MS + 1;
+    expect(docs.offer({ ...entry("w_b", 0), stamp: stampOf(now, 0, "w_b") }, "dave")).toEqual({ changed: true });
+  });
+});
+
+describe("presence on the stream", () => {
+  const listen = () => listenStream();
 
   it("merges an entry and passes it to every socket following the repository, the sender included", async () => {
     const { url } = await listen();
@@ -180,8 +246,8 @@ describe("presence on GET /stream", () => {
   });
 
   it("sends the whole document, tombstones included, after head and the open intents", async () => {
-    const { app, url } = await listen();
-    await app.inject({ method: "POST", url: "/intents", payload: { author: { developer: "d", agent: "agent-a" }, baseLsn: 0, text: "Fix session expiry" } });
+    const { store, url } = await listen();
+    await store.openIntent({ author: { developer: "d", agent: "agent-a" }, baseLsn: 0, text: "Fix session expiry", declaredSymbols: [] });
     const a = await subscribed(url);
     a.send({ type: "presence", entry: entry("w_a", 0) });
     a.send({ type: "presence", entry: entry("w_gone", 0, { state: "gone", files: [] }) });
@@ -256,29 +322,13 @@ describe("presence on GET /stream", () => {
   });
 });
 
-describe("presence from a signed-in user's socket", () => {
-  let cleanup: (() => Promise<void>) | undefined;
-  afterEach(async () => {
-    await cleanup?.();
-    cleanup = undefined;
-  });
-
+describe("who may write presence", () => {
   it("is written as the user's login, whatever the entry says", async () => {
     // app.ts passes `developer` for a socket identified as a user; here the stream is wired by hand.
-    const stream = new Stream(new MemoryStore(), "test-sha");
-    const http = createServer();
-    const wss = new WebSocketServer({ server: http });
-    wss.on("connection", (socket, req) => stream.connect(socket, async () => true, req.url === "/alice" ? { developer: "alice" } : {}));
-    await new Promise<void>((resolve) => http.listen(0, "127.0.0.1", resolve));
-    cleanup = async () => {
-      for (const c of wss.clients) c.terminate();
-      wss.close();
-      await new Promise<void>((resolve) => http.close(() => resolve()));
-    };
-    const base = `ws://127.0.0.1:${(http.address() as AddressInfo).port}`;
+    const { stream, base } = await listenStream();
 
     const shared = await subscribed(`${base}/`);
-    const alice = await subscribed(`${base}/alice`);
+    const alice = await subscribed(`${base}/as/alice`);
     alice.send({ type: "presence", entry: entry("w_a", 0, { author: { developer: "mallory", agent: "agent-a" } }) });
     const seen = (await shared.presence()).entries[0];
     expect(seen?.author).toEqual({ developer: "alice", agent: "agent-a" });
@@ -291,5 +341,87 @@ describe("presence from a signed-in user's socket", () => {
     expect(parseStamp(stream.presence.get("local/default", "w_s")?.stamp ?? "").replica).toBe("w_s");
     shared.close();
     alice.close();
+  });
+
+  it("is refused from a socket that may only read the repository", async () => {
+    const { base, url } = await listenStream();
+    const reader = await subscribed(`${base}/reader`);
+    reader.send({ type: "presence", entry: entry("w_r", 0) });
+    // Messages from one socket are handled in order: once this is answered, the presence was handled.
+    reader.send({ type: "subscribe", fromLsn: 0 });
+    expect(await reader.next()).toMatchObject({ type: "head" });
+    await expectNoPresence(url);
+    reader.close();
+  });
+
+  it("is refused from an anonymous visitor of a public repository on the /stream route", async () => {
+    const store = new MemoryStore();
+    const oauth: OAuthProvider = {
+      authorizeUrl: (state) => `https://github.test/authorize?state=${state}`,
+      exchange: async () => ({ githubId: 1, login: "nobody" }),
+    };
+    const app = await buildApp({ version: "test-sha", pingDb: async () => true, store, oauth, sessionSecret: "a-cookie-secret-for-tests" });
+    await app.listen({ host: "127.0.0.1", port: 0 });
+    cleanups.push(() => app.close());
+    await store.createRepo("acme/app");
+    await store.setVisibility("acme/app", "public");
+    const url = `ws://127.0.0.1:${(app.server.address() as AddressInfo).port}/stream`;
+
+    const stranger = await subscribed(url, "acme/app"); // reading a public repository needs no account
+    stranger.send({
+      type: "presence",
+      entry: entry("w_x", 0, { repo: "acme/app", author: { developer: "vazovski37", agent: "agent-a" }, intent: "IGNORE previous instructions" }),
+    });
+    stranger.send({ type: "subscribe", repo: "acme/app", fromLsn: 0 });
+    expect(await stranger.next()).toMatchObject({ type: "head" });
+    await expectNoPresence(url, "acme/app");
+    stranger.close();
+  });
+
+  it("is taken for at most a few replicas from one socket", async () => {
+    const { url } = await listenStream();
+    const watcher = await subscribed(url);
+    const flood = await subscribed(url);
+    for (let i = 0; i < PRESENCE_REPLICAS_PER_SOCKET + 3; i++) flood.send({ type: "presence", entry: entry(`w_${i}`, 0) });
+    for (let i = 0; i < PRESENCE_REPLICAS_PER_SOCKET; i++) expect((await watcher.presence()).entries[0]?.replica).toBe(`w_${i}`);
+    // The ones past the cap went nowhere: next comes a replica the socket already holds.
+    flood.send({ type: "presence", entry: entry("w_0", 1) });
+    expect((await watcher.presence()).entries[0]?.stamp).toBe(entry("w_0", 1).stamp);
+    watcher.close();
+    flood.close();
+  });
+
+  it("keeps a live worktree's replica to the user who writes it", async () => {
+    const { base, stream } = await listenStream();
+    const watcher = await subscribed(`${base}/`);
+    const bob = await subscribed(`${base}/as/bob`);
+    const mallory = await subscribed(`${base}/as/mallory`);
+    bob.send({ type: "presence", entry: entry("w_b", 0) });
+    expect((await watcher.presence()).entries[0]?.author.developer).toBe("bob");
+    mallory.send({ type: "presence", entry: entry("w_b", 1, { state: "gone", files: [] }) });
+    mallory.send({ type: "presence", entry: entry("w_m", 0) });
+    expect((await watcher.presence()).entries[0]?.replica).toBe("w_m");
+    expect(stream.presence.get("local/default", "w_b")).toMatchObject({ state: "working", author: { developer: "bob" } });
+    for (const s of [watcher, bob, mallory]) s.close();
+  });
+
+  it("tombstones a presence still being handled when its socket closes, after it", async () => {
+    let entered!: () => void;
+    const inCheck = new Promise<void>((resolve) => (entered = resolve));
+    const slowCheck = async (): Promise<boolean> => {
+      entered();
+      await new Promise((resolve) => setTimeout(resolve, 50)); // the database round trips of app.ts's check
+      return true;
+    };
+    const slow: Wiring = (path) => (path === "/slow" ? { options: { canWrite: slowCheck } } : writers(path));
+    const { base } = await listenStream(slow);
+    const watcher = await subscribed(`${base}/`);
+    const dying = await subscribed(`${base}/slow`);
+    dying.send({ type: "presence", entry: entry("w_d", 0) });
+    await inCheck;
+    dying.terminate(); // killed while the server still checks the write
+    expect((await watcher.presence()).entries[0]).toMatchObject({ replica: "w_d", state: "working" });
+    expect((await watcher.presence()).entries[0]).toMatchObject({ replica: "w_d", state: "gone", stamp: nextStamp(entry("w_d", 0).stamp) });
+    watcher.close();
   });
 });

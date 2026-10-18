@@ -186,8 +186,9 @@ export class Daemon {
     this.attachedUntil = Date.now() + (this.opts.attachMs ?? 10 * 60_000);
     const applied = await this.stream.applyPending();
     const notes = await this.notes(applied);
-    // Presence: this worktree's files now, and the other agents working in the same ones (once each).
-    await this.presence.publish();
+    // Presence: the other agents in the same files (once each), from this worktree's last publish;
+    // the new one runs in the background, so the hook never waits on jj and git for presence.
+    void this.presence.publish().catch((err) => this.opts.log?.(`presence: publish failed: ${err instanceof Error ? err.message : String(err)}`));
     notes.push(...this.presence.overlapNotes());
     // The read base stays where the work began: the notes see the agent's edits, not what it read
     // before editing, and that read-before-edit is the skew the server checks for. Only a skew
@@ -303,6 +304,7 @@ export class Daemon {
     if (applied.length === 0) return notes;
 
     const editing = new Set((await this.opts.applier.diffAgainstMain()).map((f) => f.path));
+    this.presence.setFiles(editing); // presence's next publish uses this diff instead of running its own
     let sets: SymbolSets | undefined;
     if (editing.size > 0) {
       const after = await this.opts.applier.treeFiles("@");

@@ -19,6 +19,8 @@ const MAX_EVENTS = 200;
 const PRESENCE_TTL_MS = 2 * 60_000;
 /** How often "Who's here" is redrawn without news, so ages move on and old entries fade out. */
 const PRESENCE_REDRAW_MS = 2_000;
+/** At most this many entries in the page's copy of the document (the server keeps as many); the oldest tombstones go first. */
+const PRESENCE_MAX_ENTRIES = 500;
 
 /**
  * One connected worktree, from `GET /repos/:owner/:name/worktrees` (`WorktreesResponse` in
@@ -259,7 +261,23 @@ const wallOf = (entry: PresenceEntry): number => Number(entry.stamp.split(".")[0
  * "Now" for ages: this browser's clock, or the newest stamp seen when that is ahead (a clock
  * behind the daemons' would otherwise show every entry as written in the future).
  */
-const presenceNow = (): number => Math.max(Date.now(), ...Object.values(state.presence).map(wallOf));
+const presenceNow = (): number => {
+  let top = Date.now();
+  for (const e of Object.values(state.presence)) top = Math.max(top, wallOf(e)); // a loop: spreading a large document overflows the stack
+  return top;
+};
+
+/**
+ * Keeps the page's copy under PRESENCE_MAX_ENTRIES, as the server keeps its own: tombstones
+ * first, then the oldest. Only a flood of replicas gets here; views hide such entries soon anyway.
+ */
+function prunePresence(): void {
+  const all = Object.values(state.presence);
+  if (all.length <= PRESENCE_MAX_ENTRIES) return;
+  const order = [...all].sort((a, b) => Number(b.state === "gone") - Number(a.state === "gone") || (a.stamp < b.stamp ? -1 : 1));
+  const drop = new Set(order.slice(0, all.length - PRESENCE_MAX_ENTRIES).map((e) => e.replica));
+  state.presence = Object.fromEntries(all.filter((e) => !drop.has(e.replica)).map((e) => [e.replica, e]));
+}
 
 /** The entries to show: not departed, written within the TTL; by agent, then replica. */
 function livePresence(): PresenceEntry[] {
@@ -282,6 +300,7 @@ function onPresence(entries: PresenceEntry[]): void {
       addEvent("presence", `${who} is here${entry.intent === undefined ? "" : `, working on "${entry.intent}"`}`);
     }
   }
+  prunePresence();
   renderPresence();
 }
 
@@ -297,22 +316,46 @@ function agentColour(agent: string): string {
 
 const ageText = (ms: number): string => (ms < 5_000 ? "just now" : ms < 60_000 ? `${Math.round(ms / 1000)}s ago` : `${Math.round(ms / 60_000)}m ago`);
 
+/** How faded a row is and what its tooltip says, from the entry's age. */
+function presenceAge(e: PresenceEntry, now: number): { opacity: string; title: string } {
+  const age = Math.max(0, now - wallOf(e));
+  return { opacity: (1 - 0.6 * Math.min(1, age / PRESENCE_TTL_MS)).toFixed(2), title: `${e.replica} · ${ageText(age)}` };
+}
+
+/** What the rows of "Who's here" last showed, ages aside: while it stays the same, a redraw only moves the ages on. */
+let presenceShown = "";
+
 /**
  * "Who's here": one line per live worktree, the agent in its colour, its developer, working or
  * idle, its intent, the files it has unfinished edits in (a file two worktrees are both in is
  * highlighted), and how far it has applied the log. Older entries fade as they near the TTL.
+ * The rows are rebuilt only when what they say changed (not for a keepalive or the 2 s tick), so
+ * tooltips stay open, the pulse runs on and the fade is a transition.
  */
 function renderPresence(): void {
   const live = livePresence();
   const now = presenceNow();
   const head = state.head ?? 0;
+  const shown = JSON.stringify([head, live.map((e) => [e.replica, e.author, e.state, e.intent, e.files, e.symbols, e.appliedLsn])]);
+  if (shown === presenceShown) {
+    const byReplica = new Map(live.map((e) => [e.replica, e]));
+    for (const row of $("presence").querySelectorAll<HTMLLIElement>("li[data-replica]")) {
+      const e = byReplica.get(row.dataset.replica ?? "");
+      if (e === undefined) continue;
+      const { opacity, title } = presenceAge(e, now);
+      row.style.opacity = opacity;
+      row.title = title;
+    }
+    return;
+  }
+  presenceShown = shown;
   const inFile = new Map<string, string[]>();
   for (const e of live) for (const f of e.files) inFile.set(f, [...(inFile.get(f) ?? []), e.author.agent]);
   $("presence-count").textContent = live.length === 0 ? "" : String(live.length);
   $("no-presence").hidden = live.length > 0;
   $("presence").replaceChildren(
     ...live.map((e) => {
-      const age = Math.max(0, now - wallOf(e));
+      const { opacity, title } = presenceAge(e, now);
       const behind = Math.max(0, head - e.appliedLsn);
       const colour = agentColour(e.author.agent);
       const chips = e.files.map((f) => {
@@ -322,7 +365,7 @@ function renderPresence(): void {
       });
       return el(
         "li",
-        { class: e.state, style: `opacity: ${(1 - 0.6 * Math.min(1, age / PRESENCE_TTL_MS)).toFixed(2)}`, title: `${e.replica} · ${ageText(age)}` },
+        { class: e.state, "data-replica": e.replica, style: `opacity: ${opacity}`, title },
         el(
           "div",
           { class: "who" },
