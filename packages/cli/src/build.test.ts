@@ -42,7 +42,7 @@ describe("the pitstop-cli bundle", { timeout: 60_000 }, () => {
     expect(await node([join(dist, "pitstop-hook.js")], { cwd: elsewhere, input: JSON.stringify({ cwd: elsewhere }) })).toEqual({ code: 0, stdout: "", stderr: "" });
   });
 
-  it("serves MCP over stdio: the handshake carries the house rules, and the five tools are listed", async () => {
+  it("serves MCP over stdio: the handshake carries the house rules, and the eight tools are listed", async () => {
     const child = spawn(process.execPath, [join(dist, "pitstop-mcp.js")], { cwd: elsewhere, stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
     const answers: Record<number, unknown> = {};
     let buffer = "";
@@ -69,7 +69,7 @@ describe("the pitstop-cli bundle", { timeout: 60_000 }, () => {
       send({ jsonrpc: "2.0", method: "notifications/initialized" });
       send({ jsonrpc: "2.0", id: 2, method: "tools/list" });
       const tools = (await answer(2)).result.tools as { name: string }[];
-      expect(tools.map((t) => t.name).sort()).toEqual(["callers", "commit", "declare_intent", "status", "why"]);
+      expect(tools.map((t) => t.name).sort()).toEqual(["brain", "callers", "commit", "declare_intent", "history", "lease", "status", "why"]);
     } finally {
       child.kill();
     }
