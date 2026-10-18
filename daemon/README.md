@@ -56,28 +56,33 @@ The token comes from `--token` or `PITSTOP_TOKEN` only, never from a `.pitstop/c
 
 **The daemon.** `pitstop stop` anywhere in the checkout stops it, `pitstop start` starts it again in the background, with the server, repository, token and agent in the checkout's `.pitstop/config.json` (whatever your shell says). Both, like `commit`, `intent` and `status`, act on the nearest directory at or above the current one that has `.pitstop/config.json`, and `start` outside any checkout refuses. You rarely need either: when Claude Code opens the checkout and finds no daemon, the MCP server starts one, and so does the hook after a tool call.
 
-**The house rules** (`CLAUDE.local.md`, and the MCP server's instructions): declare an intent with `declare_intent` before changing code; commit only with the `commit` tool, never `git commit`, `git push`, `jj commit` or `jj git push`; a refused commit names what changed, so re-read it, adapt, and commit again.
+**The house rules** (`CLAUDE.local.md`, and the MCP server's instructions): declare an intent with `declare_intent` before changing code; commit only with the `commit` tool, never `git commit`, `git push`, `jj commit` or `jj git push`; a refused commit names what changed, so re-read it, adapt, and commit again; follow the repository's architecture decisions, and leave a symbol another agent leased alone until its lease ends.
 
 With accounts on, a teammate needs to be a writer of the repository first: after the teammate has signed in to the server once, the owner runs `PUT /repos/myteam/my-repo/members/<github-login>` with `{"role":"writer"}` against the server, with their own token (`reader` is enough to clone, not to commit).
 
 ## What Claude Code gets
 
-Six tools:
+Nine tools:
 
 | Tool | What it does |
 | --- | --- |
-| `declare_intent` | opens a transaction: one line on what you are about to do, and the symbols you expect to touch (`path#name`); other agents see it, and the server warns about overlapping work |
+| `declare_intent` | opens a transaction: one line on what you are about to do, and the symbols you expect to touch (`path#name`); other agents see it, and the server warns about overlapping work. The answer carries the repository's **brain**: its version, each accepted architecture decision (ADR) with its rules in one line, and any lease another agent holds on the symbols you declared |
 | `commit` | sends the unfinished work as a commit with one line of intent; the answer says it landed, was repaired, or what to re-read and retry |
-| `why` | which entries touched a file, latest first, with their intents and repairs |
-| `callers` | which entries read a symbol and which changed it |
+| `brain` | the repository's brain: version, accepted (and proposed) ADRs with their rules, live leases, open intents |
+| `lease` | takes a short lease on one hot symbol (`path#name`) with a reason, before a risky change to it: while you hold it, another agent's commit that writes it is refused. Declare your intent first: the lease lives while that intent is open (your daemon renews it; five minutes by default if the daemon stops) and goes when you commit; `release: true` gives it back early. Refused, with the holder, when another agent (or your own other checkout) has it; the answer also says when there is nothing of yours to release, or when your intent went stale and needs declaring again |
+| `history` | every change to a symbol, newest first: who, which intent, whether its signature changed; who has it declared or leased now |
+| `why` | which entries touched a file, latest first, with their intents, repairs and the brain version they passed |
+| `callers` | which entries read a symbol (from the read sets of landed changes, not a parsed call graph) and what they wrote, and which entries changed it |
 | `status` | where this checkout stands: applied and head entry, pending entries, open intents |
 | `who` | who else is working in the repository right now: each agent, its developer, working or idle, its intent, the files and symbols it is in, how fresh that is, and which of those files you are in too |
 
-After every tool call the hook tells the daemon the agent is between tools. Entries that arrived meanwhile are applied then, and the agent is told what they touched: a symbol its change reads, a file it is editing, a conflict left in a file, a warning from the server, and another agent working in the same files or symbols right now (once, while it lasts). Without an agent attached, the daemon applies entries as they arrive.
+After every tool call the hook tells the daemon the agent is between tools. Entries that arrived meanwhile are applied then, and the agent is told what they touched: a symbol its change reads, a file it is editing, a conflict left in a file, a warning from the server, and another agent working in the same files or symbols right now (once, while it lasts). The same note says when an ADR was accepted or superseded (`brain v3: ADR-3 accepted: <title>: <decision>`), when another agent took or gave up a lease on a symbol you declared or a file you are editing, when a lease of yours ended without your asking, and when your intent was marked stale. Without an agent attached, the daemon applies entries as they arrive.
 
 **Presence.** Each checkout's daemon tells the server, every heartbeat, what its agent is doing: working or idle, the open intent, the files with unfinished edits, the declared symbols. The server merges these into one live document per repository (a CRDT, so every copy agrees whatever order updates arrive in) and passes it to every checkout and to the website's Live tab. It is only ever a heads-up: nothing is refused because of it. A stopped daemon leaves at once; one that vanishes (a laptop that sleeps) fades out after two minutes. The daemon's own id for the checkout is in `.pitstop/replica`; if you copy a checkout folder, delete that file in the copy (the daemon's log says so when two checkouts share one).
 
-The same loop by hand, from a terminal in the checkout: `pitstop intent -m "…" -s path#name`, `pitstop commit -m "…"`, `pitstop status`, `pitstop safe-point`.
+The same loop by hand, from a terminal in the checkout: `pitstop intent -m "…" -s path#name` (prints the brain in brief too), `pitstop commit -m "…"`, `pitstop status`, `pitstop safe-point`, `pitstop brain`, `pitstop lease path#name [-r "why"] [--release]`.
+
+**Architecture decisions** are proposed by a writer and accepted by an owner on the server (`POST /repos/:owner/:name/adrs`, then `…/adrs/<n>/accept`; the website shows them). An ADR is a decision in a sentence or two with its reason and consequences, which every agent receives when it declares an intent, plus rules the server checks on every commit: `forbid_import` (files matching a glob may not import a module matching another glob, or a package), `forbid_call` (may not call `db.query` or `eval`), `forbid_pattern` (may not contain a line matching a regular expression), and `ai_review` (a question a model answers about changes in scope, as advice only, when the server has a model). Accepting or superseding one moves the repository's brain version; every entry records the version it passed.
 
 ## By hand
 
@@ -132,6 +137,8 @@ The server's owner chooses: `PITSTOP_VALIDATE` is `warn` by default (a commit wi
 - **`constraint_failed`**: a file or symbol you changed was also changed by an entry that landed first. The daemon has applied that entry to your checkout; re-read the named files, adapt, and commit again.
 - **`escalated`** (or `repair_failed`): write skew. You read something, for example a function's signature, that another entry changed after you read it. The message names the entries and the symbols. Re-read them at the current head, adapt your change, and commit again. From then on your reads are checked from the entry you were told about, so the adapted commit is not refused for the same reason.
 - **`escalated` that says a resolver decides**: on a repository with members, write skew waits for the member marked resolver (or the owners) on the website. Do not commit the change again (the server refuses it while it waits); at a later safe point the note says whether it landed as it is or was sent back, and with what to change.
+- **`constraint_failed` that names an ADR**: your change breaks an architecture decision. The message gives each offending line and the rule, then what the decision says to do instead, for example `ADR-1 "Pages never touch the database": src/pages/Profile.tsx:3 imports src/db/client.ts, which the rule forbid_import src/pages/** -> src/db/** forbids. Do instead: Pages read data through src/services.` Change those lines and commit again; there is no way around it short of an owner superseding the ADR. Only what your change brings is refused: a violation the file already had is noted ("pre-existing, on the re-check queue") and does not stop your edit.
+- **`constraint_failed` that names a lease**: your change writes a symbol another agent holds a lease on; the message names the holder, their intent and when the lease ends. Leave that symbol out of this commit (commit the rest), or wait: the lease goes when its holder commits, when they release it, or when it expires (a crashed agent stops renewing it, and its intent goes stale after five minutes without a heartbeat, its leases with it). A repository without a root `tsconfig.json` sends no symbol sets, so there a lease holds the whole file of its symbol.
 - **`invalid_request`**: the request itself was wrong: a repository that does not exist on the server (`pitstop init` first), a base LSN ahead of the log, a malformed file. The message says which. "Nothing to commit" is raised on your side before any request, and a token that may not write the repository is a plain `401`/`403` (see "When something is off").
 
 ## What lives where
@@ -146,7 +153,8 @@ The server's owner chooses: `PITSTOP_VALIDATE` is `warn` by default (a commit wi
 - Read and write sets, which make write skew detectable, exist for **TypeScript** projects: the checkout needs its own `tsconfig.json`. Other languages commit fine, with empty sets, so only file-level conflicts are caught.
 - Text files only. `import` skips binary files with a note; `commit` does not yet, so do not add binary files to a Pitstop repository. The server's type-check gate needs the `tsconfig.json` to work without `node_modules`.
 - A clone replays the log entry by entry, about a second each; fine for hundreds of entries. A clone contains only what the log has: a repository initialised with `--no-import` and never imported cannot be cloned completely.
-- `why` and `callers` look at the first 500 entries of the log.
+- `callers` knows what landed changes referred to (their read sets), not a parsed call graph of the whole repository: code nobody changed through Pitstop has no callers yet.
+- The ADR rules read TypeScript and JavaScript text (imports, calls, patterns); other languages, and text files such as Markdown, only meet `forbid_pattern`. Globs take `**`, `*`, `?`, `{a,b}` and a trailing `/`; patterns run on a linear-time engine, so one with backreferences or lookahead is refused when proposed. Imports through `tsconfig.json` `paths` (and `@/` for `src/`) count; `import type` does not.
 - On Windows, keep the checkout's path short (jj's index files have 128-character names) and let `jj` write to the checkout freely.
 
 ## When something is off

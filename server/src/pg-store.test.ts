@@ -1,9 +1,10 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { DEFAULT_REPO, type CommitRequest } from "@pitstop/protocol";
+import { DEFAULT_REPO, type CommitRequest, type Lease } from "@pitstop/protocol";
 import { createPool } from "./db.js";
 import { migrate } from "./migrate.js";
 import { PgStore } from "./pg-store.js";
 import { blobHash, InvalidCommit, RejectedCommit, withBlobHashes } from "./store.js";
+import { brainStoreSuite } from "./test-support.js";
 
 // Runs only when a database is available: in CI (Postgres service container)
 // or locally after `npm run db:up` with DATABASE_URL set.
@@ -29,7 +30,7 @@ describe.skipIf(!url)("PgStore against a real Postgres", () => {
 
   beforeAll(async () => {
     await migrate(pool);
-    await pool.query("truncate changesets, changeset_files, changeset_symbols, blobs, intents, leases, parked_commits, repo_invites, repo_members, repo_mirrors cascade");
+    await pool.query("truncate changesets, changeset_files, changeset_symbols, blobs, intents, leases, parked_commits, repo_invites, repo_members, repo_mirrors, repo_leases, repo_brain_versions, repo_adrs cascade");
     await pool.query("delete from repos where id <> $1", [DEFAULT_REPO]);
     await pool.query("insert into repos (id) values ($1) on conflict (id) do nothing", [DEFAULT_REPO]);
   });
@@ -74,9 +75,12 @@ describe.skipIf(!url)("PgStore against a real Postgres", () => {
       declaredSymbols: ["src/pages/ProfilePage.tsx#ProfilePage"],
     });
     expect(intent).toMatchObject({ status: "open", repo: DEFAULT_REPO });
-    await store.append(request("i1", 0, { intentId: intent.id }));
-    const row = await pool.query<{ status: string }>("select status from intents where id = $1", [intent.id]);
-    expect(row.rows[0]?.status).toBe("committed");
+    const status = async () => (await pool.query<{ status: string }>("select status from intents where id = $1", [intent.id])).rows[0]?.status;
+    // Another author naming it does not close it; its own author's commit does.
+    await store.append(request("i0", 0, { intentId: intent.id }));
+    expect(await status()).toBe("open");
+    await store.append(request("i1", 0, { intentId: intent.id, author: { developer: "teammate", agent: "agent-b" } }));
+    expect(await status()).toBe("committed");
     await expect(store.append(request("i2", 0, { intentId: "int_nope" }))).rejects.toBeInstanceOf(InvalidCommit);
   });
 
@@ -152,7 +156,7 @@ describe.skipIf(!url)("PgStore against a real Postgres", () => {
   it("lists a repository's open intents", async () => {
     const a = await store.openIntent({ author: { developer: "vazovski", agent: "agent-a" }, baseLsn: 0, text: "open one", declaredSymbols: ["src/a.ts#a"] });
     const b = await store.openIntent({ author: { developer: "teammate", agent: "agent-b" }, baseLsn: 0, text: "open two", declaredSymbols: [] });
-    await store.append(request("closes-b", 0, { intentId: b.id }));
+    await store.append(request("closes-b", 0, { intentId: b.id, author: b.author }));
     const open = await store.openIntents(DEFAULT_REPO);
     expect(open.map((i) => i.id)).toContain(a.id);
     expect(open.map((i) => i.id)).not.toContain(b.id);
@@ -238,10 +242,40 @@ describe.skipIf(!url)("PgStore against a real Postgres", () => {
     await expect(store.setMirror("no/such", config)).rejects.toThrow(/unknown repo/);
   });
 
+  it("makes a lease grant wait for an append in flight, whose decision reads the live leases under its lock", async () => {
+    let open: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => (open = resolve));
+    let entered: () => void = () => undefined;
+    const inside = new Promise<void>((resolve) => (entered = resolve));
+    let seen: Lease[] | undefined;
+    const appending = store.append(request("lease-race", 0), async (_gap, _head, reads) => {
+      entered();
+      await gate;
+      seen = await reads.leases(new Date());
+      return {};
+    });
+    await inside;
+    let granted = false;
+    const grant = store.acquireLease({ repo: DEFAULT_REPO, symbol: "src/race.ts#r", holder: { developer: "x", agent: "y" }, reason: "", ttlSeconds: 60 }).then((g) => {
+      granted = true;
+      return g;
+    });
+    await new Promise((wake) => setTimeout(wake, 200));
+    expect(granted).toBe(false); // waiting for the append's lock
+    open();
+    await appending;
+    expect(seen?.map((l) => l.symbol)).not.toContain("src/race.ts#r");
+    expect((await grant).granted).toBe(true);
+    expect((await store.liveLeases(DEFAULT_REPO)).map((l) => l.symbol)).toContain("src/race.ts#r");
+  });
+
   it("refuses a repository that does not exist", async () => {
     await expect(store.append(request("nowhere", 0, { repo: "no/such" }))).rejects.toThrow(/unknown repo no\/such/);
     await expect(store.openIntent({ repo: "no/such", author: { developer: "x", agent: "y" }, baseLsn: 0, text: "t", declaredSymbols: [] })).rejects.toThrow(/unknown repo/);
     expect(await store.getRepo("no/such")).toBeUndefined();
     expect(await store.headLsn("no/such")).toBe(0);
   });
+
+  // The brain, stale intents and the query API, the same tests as MemoryStore's (test-support.ts).
+  brainStoreSuite(() => store);
 });

@@ -1,5 +1,7 @@
 import type pg from "pg";
 import type {
+  Adr,
+  AdrRule,
   Author,
   Changeset,
   Checks,
@@ -7,17 +9,25 @@ import type {
   FileChange,
   Intent,
   IntentRequest,
+  Lease,
   Lsn,
   Repair,
   Repo,
   RepoId,
+  SymbolId,
 } from "@pitstop/protocol";
+import { globToRegExpSource } from "./adr-rules.js";
 import {
+  ADR_TRANSITIONS,
   GAP_LIMIT,
   gapStart,
+  holdsLease,
   InvalidCommit,
+  movesBrain,
   newIntentId,
+  notTheirIntent,
   repoOf,
+  sameAuthor,
   SKIPPED_CHECKS,
   unknownRepo,
   newTokenId,
@@ -25,6 +35,14 @@ import {
   newParkedId,
   newUserId,
   tokenHash,
+  type AdrChange,
+  type AdrProposal,
+  type AdrVerdict,
+  type LeaseGrant,
+  type LeaseRequest,
+  type LoggedEntry,
+  type LogQuery,
+  type SymbolState,
   type Decide,
   type Invite,
   type Member,
@@ -146,6 +164,97 @@ interface Queryable {
   query<R extends pg.QueryResultRow>(text: string, values?: unknown[]): Promise<pg.QueryResult<R>>;
 }
 
+const ADR_COLUMNS = "repo, number, title, status, decision, reason, consequences, rules, version, created_by, created_at, decided_by, decided_at";
+interface AdrRow {
+  repo: RepoId;
+  number: number;
+  title: string;
+  status: Adr["status"];
+  decision: string;
+  reason: string;
+  consequences: string;
+  rules: AdrRule[];
+  version: number;
+  created_by: string;
+  created_at: Date;
+  decided_by: string | null;
+  decided_at: Date | null;
+}
+const adrOf = (row: AdrRow): Adr => ({
+  repo: row.repo,
+  number: row.number,
+  title: row.title,
+  status: row.status,
+  decision: row.decision,
+  reason: row.reason,
+  consequences: row.consequences,
+  rules: row.rules,
+  version: row.version,
+  createdBy: row.created_by,
+  createdAt: row.created_at.toISOString(),
+  ...(row.decided_by === null ? {} : { decidedBy: row.decided_by }),
+  ...(row.decided_at === null ? {} : { decidedAt: row.decided_at.toISOString() }),
+});
+
+const LEASE_COLUMNS = "repo, symbol, developer, agent, intent_id, reason, status, expires_at, created_at";
+interface LeaseRow {
+  repo: RepoId;
+  symbol: string;
+  developer: string;
+  agent: string;
+  intent_id: string | null;
+  reason: string;
+  status: Lease["status"];
+  expires_at: Date;
+  created_at: Date;
+}
+const leaseOf = (row: LeaseRow): Lease => ({
+  repo: row.repo,
+  symbol: row.symbol,
+  holder: { developer: row.developer, agent: row.agent },
+  ...(row.intent_id === null ? {} : { intentId: row.intent_id }),
+  reason: row.reason,
+  status: row.status,
+  expiresAt: row.expires_at.toISOString(),
+  createdAt: row.created_at.toISOString(),
+});
+
+const INTENT_COLUMNS = "id, repo, developer, agent, base_lsn::int as base_lsn, text, declared_symbols, status, heartbeat_at";
+interface IntentRow {
+  id: string;
+  repo: RepoId;
+  developer: string;
+  agent: string;
+  base_lsn: number;
+  text: string;
+  declared_symbols: string[];
+  status: Intent["status"];
+  heartbeat_at: Date;
+}
+const intentOf = (row: IntentRow): Intent => ({
+  id: row.id,
+  repo: row.repo,
+  author: { developer: row.developer, agent: row.agent },
+  baseLsn: row.base_lsn,
+  text: row.text,
+  declaredSymbols: row.declared_symbols,
+  status: row.status,
+  heartbeatAt: row.heartbeat_at.toISOString(),
+});
+
+/**
+ * `latest`: the last change per path of repository $1 up to LSN $2, for the paths `where` keeps
+ * (a condition on `path`); a rename also ends its old path there. Callers keep `op <> 'delete'`.
+ */
+const LATEST_FILES = (where: string): string =>
+  `with changes as (
+     select path, lsn, op, blob_hash from changeset_files where repo = $1 and lsn <= $2
+     union all
+     select from_path as path, lsn, 'delete' as op, null as blob_hash
+     from changeset_files where repo = $1 and lsn <= $2 and from_path is not null
+   ),
+   latest as (select distinct on (path) path, op, blob_hash from changes where ${where} order by path, lsn desc)`;
+
 interface ChangesetRow {
   repo: string;
   lsn: number;
@@ -157,6 +266,8 @@ interface ChangesetRow {
   checks: Checks;
   brain_version: number;
   created_at: Date;
+  /** Selected only where an entry's intent is asked for (the query API). */
+  intent_id?: string | null;
 }
 
 interface FileRow {
@@ -217,11 +328,13 @@ export class PgStore implements Store {
         const intent = await client.query("select 1 from intents where id = $1 and repo = $2", [req.intentId, repo]);
         if ((intent.rowCount ?? 0) === 0) throw new InvalidCommit(`unknown intent ${req.intentId}`);
       }
-      const brain = await client.query<{ version: number | null }>("select max(version) as version from brain_versions");
 
       // The validator runs here, under the lock, so nothing lands between its look at the gap and this append.
       const gap = decide ? await this.read(client, repo, gapStart(req), GAP_LIMIT + 1) : [];
-      const decision = decide ? await decide(gap, lsn - 1) : {};
+      // Leases are read here, through this connection, under the lock acquireLease also takes.
+      const decision = decide ? await decide(gap, lsn - 1, { leases: (now) => this.leasesIn(client, repo, now) }) : {};
+      // The repository's brain version the commit was checked against (9.2): the decision says, else the current one.
+      const brainVersion = decision.brainVersion ?? (await this.brainVersionIn(client, repo));
 
       await client.query(
         `insert into changesets
@@ -238,7 +351,7 @@ export class PgStore implements Store {
           req.intentId ?? null,
           JSON.stringify(decision.repairs ?? []),
           JSON.stringify(decision.checks ?? SKIPPED_CHECKS),
-          brain.rows[0]?.version ?? 0,
+          brainVersion,
         ],
       );
       const files = decision.files ?? req.files;
@@ -266,7 +379,11 @@ export class PgStore implements Store {
         );
       }
       if (req.intentId !== undefined) {
-        await client.query("update intents set status = 'committed' where id = $1 and repo = $2 and status = 'open'", [req.intentId, repo]);
+        // A stale intent whose agent came back and committed is closed too; only by its own author.
+        await client.query(
+          "update intents set status = 'committed' where id = $1 and repo = $2 and status in ('open', 'stale') and developer = $3 and agent = $4",
+          [req.intentId, repo, req.author.developer, req.author.agent],
+        );
       }
 
       const [changeset] = await this.read(client, repo, lsn - 1, 1);
@@ -290,19 +407,29 @@ export class PgStore implements Store {
   }
 
   async treeAt(repo: RepoId, lsn: Lsn): Promise<Tree> {
-    // The latest change per path up to `lsn`; a rename also ends its old path there.
+    return this.tree(repo, lsn, "true", []);
+  }
+
+  async filesAt(repo: RepoId, lsn: Lsn, which: { paths?: string[]; globs?: string[] }): Promise<Tree> {
+    const paths = which.paths ?? [];
+    const globs = (which.globs ?? []).map(globToRegExpSource);
+    if (paths.length === 0 && globs.length === 0) return new Map();
+    return this.tree(repo, lsn, "(path = any($3::text[]) or path ~ any($4::text[]))", [paths, globs]);
+  }
+
+  async pathsAt(repo: RepoId, lsn: Lsn): Promise<string[]> {
+    const rows = await this.pool.query<{ path: string }>(`${LATEST_FILES("true")} select path from latest where op <> 'delete' and blob_hash is not null order by path`, [repo, lsn]);
+    return rows.rows.map((r) => r.path);
+  }
+
+  /** The tree at `lsn`, only the paths `where` keeps (a condition on `path`, parameters from $3). */
+  private async tree(repo: RepoId, lsn: Lsn, where: string, params: unknown[]): Promise<Tree> {
     const rows = await this.pool.query<{ path: string; content: string }>(
-      `with changes as (
-         select path, lsn, op, blob_hash from changeset_files where repo = $1 and lsn <= $2
-         union all
-         select from_path as path, lsn, 'delete' as op, null as blob_hash
-         from changeset_files where repo = $1 and lsn <= $2 and from_path is not null
-       ),
-       latest as (select distinct on (path) path, op, blob_hash from changes order by path, lsn desc)
+      `${LATEST_FILES(where)}
        select l.path, convert_from(b.bytes, 'UTF8') as content
        from latest l join blobs b on b.hash = l.blob_hash
        where l.op <> 'delete' order by l.path`,
-      [repo, lsn],
+      [repo, lsn, ...params],
     );
     return new Map(rows.rows.map((r) => [r.path, r.content]));
   }
@@ -360,33 +487,270 @@ export class PgStore implements Store {
   }
 
   async openIntents(repo: RepoId): Promise<Intent[]> {
-    const res = await this.pool.query<{
-      id: string;
-      developer: string;
-      agent: string;
-      base_lsn: number;
-      text: string;
-      declared_symbols: string[];
-      heartbeat_at: Date;
-    }>(
-      `select id, developer, agent, base_lsn::int as base_lsn, text, declared_symbols, heartbeat_at
-       from intents where repo = $1 and status = 'open' order by created_at`,
+    const res = await this.pool.query<IntentRow>(
+      `select ${INTENT_COLUMNS} from intents where repo = $1 and status = 'open' order by created_at, id`,
       [repo],
     );
-    return res.rows.map((row) => ({
-      id: row.id,
-      repo,
-      author: { developer: row.developer, agent: row.agent },
-      baseLsn: row.base_lsn,
-      text: row.text,
-      declaredSymbols: row.declared_symbols,
-      status: "open",
-      heartbeatAt: row.heartbeat_at.toISOString(),
-    }));
+    return res.rows.map(intentOf);
+  }
+
+  async getIntent(repo: RepoId, id: string): Promise<Intent | undefined> {
+    const res = await this.pool.query<IntentRow>(`select ${INTENT_COLUMNS} from intents where repo = $1 and id = $2`, [repo, id]);
+    const row = res.rows[0];
+    return row === undefined ? undefined : intentOf(row);
   }
 
   async heartbeat(repo: RepoId, intentId: string): Promise<void> {
+    // The intent only: leases are renewed by their holder asking again (acquireLease), never by a heartbeat anyone may send.
     await this.pool.query("update intents set heartbeat_at = now() where id = $1 and repo = $2 and status = 'open'", [intentId, repo]);
+  }
+
+  async markStaleIntents(before: Date): Promise<Intent[]> {
+    const res = await this.pool.query<IntentRow>(
+      `update intents set status = 'stale' where status = 'open' and heartbeat_at < $1 returning ${INTENT_COLUMNS}`,
+      [before],
+    );
+    return res.rows.map(intentOf);
+  }
+
+  async proposeAdr(p: AdrProposal): Promise<Adr> {
+    return this.tx(async (db) => {
+      // Numbers count per repository; the brain lock keeps two proposals from taking the same one.
+      await db.query("select pg_advisory_xact_lock(hashtext($1)::bigint)", [`brain:${p.repo}`]);
+      const known = await db.query("select 1 from repos where id = $1", [p.repo]);
+      if ((known.rowCount ?? 0) === 0) throw unknownRepo(p.repo);
+      const res = await db.query<AdrRow>(
+        `insert into repo_adrs (repo, number, title, status, decision, reason, consequences, rules, created_by)
+         values ($1, (select coalesce(max(number), 0) + 1 from repo_adrs where repo = $1), $2, 'proposed', $3, $4, $5, $6, $7)
+         returning ${ADR_COLUMNS}`,
+        [p.repo, p.title, p.decision, p.reason ?? "", p.consequences ?? "", JSON.stringify(p.rules ?? []), p.createdBy],
+      );
+      return adrOf(res.rows[0] as AdrRow);
+    });
+  }
+
+  async listAdrs(repo: RepoId): Promise<Adr[]> {
+    const res = await this.pool.query<AdrRow>(`select ${ADR_COLUMNS} from repo_adrs where repo = $1 order by number`, [repo]);
+    return res.rows.map(adrOf);
+  }
+
+  async getAdr(repo: RepoId, number: number): Promise<Adr | undefined> {
+    const res = await this.pool.query<AdrRow>(`select ${ADR_COLUMNS} from repo_adrs where repo = $1 and number = $2`, [repo, number]);
+    const row = res.rows[0];
+    return row === undefined ? undefined : adrOf(row);
+  }
+
+  async decideAdr(repo: RepoId, number: number, verdict: AdrVerdict, by: string): Promise<AdrChange> {
+    return this.tx(async (db): Promise<AdrChange> => {
+      // The status change and the version move are one transaction, serialised per repository.
+      await db.query("select pg_advisory_xact_lock(hashtext($1)::bigint)", [`brain:${repo}`]);
+      const found = await db.query<AdrRow>(`select ${ADR_COLUMNS} from repo_adrs where repo = $1 and number = $2 for update`, [repo, number]);
+      const row = found.rows[0];
+      if (row === undefined) return { ok: false, error: "not_found" };
+      const adr = adrOf(row);
+      if (adr.status !== ADR_TRANSITIONS[verdict]) return { ok: false, error: "invalid_transition", adr };
+      let version = await this.brainVersionIn(db, repo);
+      if (movesBrain(verdict)) {
+        version += 1;
+        await db.query("insert into repo_brain_versions (repo, version, adr_number, status, changed_by) values ($1, $2, $3, $4, $5)", [
+          repo,
+          version,
+          number,
+          verdict,
+          by,
+        ]);
+      }
+      const updated = await db.query<AdrRow>(
+        `update repo_adrs set status = $3, version = case when $4::boolean then $5 else version end, decided_by = $6, decided_at = now()
+         where repo = $1 and number = $2 returning ${ADR_COLUMNS}`,
+        [repo, number, verdict, movesBrain(verdict), version, by],
+      );
+      return { ok: true, adr: adrOf(updated.rows[0] as AdrRow), version };
+    });
+  }
+
+  brainVersion(repo: RepoId): Promise<number> {
+    return this.brainVersionIn(this.pool, repo);
+  }
+
+  async adrsInForce(repo: RepoId, version: number): Promise<Adr[]> {
+    // Each ADR's last move at or below `version`; in force when that move accepted it.
+    const res = await this.pool.query<AdrRow>(
+      `select ${ADR_COLUMNS.split(", ").map((c) => `a.${c}`).join(", ")}
+       from repo_adrs a
+       join lateral (
+         select b.status from repo_brain_versions b
+         where b.repo = a.repo and b.adr_number = a.number and b.version <= $2
+         order by b.version desc limit 1
+       ) last on true
+       where a.repo = $1 and last.status = 'accepted'
+       order by a.number`,
+      [repo, version],
+    );
+    return res.rows.map(adrOf);
+  }
+
+  async acquireLease(req: LeaseRequest, now = new Date()): Promise<LeaseGrant> {
+    return this.tx(async (db): Promise<LeaseGrant> => {
+      // The append's own lock: a grant waits for a commit in flight on this repository, whose lease
+      // check (under that lock) then saw every lease granted before it, and none granted during it.
+      await db.query("select pg_advisory_xact_lock(hashtext($1)::bigint)", [req.repo]);
+      const known = await db.query("select 1 from repos where id = $1", [req.repo]);
+      if ((known.rowCount ?? 0) === 0) throw unknownRepo(req.repo);
+      if (req.intentId !== undefined) {
+        const intent = await db.query<{ status: string; developer: string; agent: string }>("select status, developer, agent from intents where id = $1 and repo = $2", [
+          req.intentId,
+          req.repo,
+        ]);
+        const row = intent.rows[0];
+        if (row === undefined) throw new InvalidCommit(`unknown intent ${req.intentId}`);
+        if (row.status !== "open") throw new InvalidCommit(`intent ${req.intentId} is ${row.status}, not open`);
+        const owner = { developer: row.developer, agent: row.agent };
+        if (!sameAuthor(owner, req.holder)) throw new InvalidCommit(notTheirIntent(req.intentId, owner, req.holder));
+      }
+      const expired = (
+        await db.query<LeaseRow>(
+          `update repo_leases set status = 'expired', ended_at = $3
+           where repo = $1 and symbol = $2 and status = 'held' and expires_at <= $3 returning ${LEASE_COLUMNS}`,
+          [req.repo, req.symbol, now],
+        )
+      ).rows.map(leaseOf);
+      const expiresAt = new Date(now.getTime() + req.ttlSeconds * 1000);
+      // The partial unique index decides: of two concurrent inserts, the second waits for the first
+      // and then does nothing. A holder that released meanwhile frees the symbol for the second try.
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const inserted = await db.query<LeaseRow>(
+          `insert into repo_leases (repo, symbol, developer, agent, intent_id, reason, ttl_seconds, status, expires_at, created_at)
+           values ($1, $2, $3, $4, $5, $6, $7, 'held', $8, $9)
+           on conflict (repo, symbol) where status = 'held' do nothing
+           returning ${LEASE_COLUMNS}`,
+          [req.repo, req.symbol, req.holder.developer, req.holder.agent, req.intentId ?? null, req.reason, req.ttlSeconds, expiresAt, now],
+        );
+        const row = inserted.rows[0];
+        if (row !== undefined) return { granted: true, lease: leaseOf(row), renewed: false, expired };
+        const held = await db.query<LeaseRow>(
+          `select ${LEASE_COLUMNS} from repo_leases where repo = $1 and symbol = $2 and status = 'held' for update`,
+          [req.repo, req.symbol],
+        );
+        const heldRow = held.rows[0];
+        if (heldRow === undefined) continue;
+        const lease = leaseOf(heldRow);
+        if (!holdsLease(lease, req.holder, req.intentId)) return { granted: false, holder: lease, expired };
+        const renewed = await db.query<LeaseRow>(
+          `update repo_leases set expires_at = $3, reason = $4, ttl_seconds = $5, intent_id = coalesce($6, intent_id)
+           where repo = $1 and symbol = $2 and status = 'held' returning ${LEASE_COLUMNS}`,
+          [req.repo, req.symbol, expiresAt, req.reason, req.ttlSeconds, req.intentId ?? null],
+        );
+        return { granted: true, lease: leaseOf(renewed.rows[0] as LeaseRow), renewed: true, expired };
+      }
+      throw new Error(`the lease on ${req.symbol} changed hands twice while it was being taken; try again`);
+    });
+  }
+
+  async releaseLease(repo: RepoId, symbol: SymbolId, now = new Date(), holder?: Author): Promise<Lease | undefined> {
+    const res = await this.pool.query<LeaseRow>(
+      `update repo_leases set status = 'released', ended_at = $3
+       where repo = $1 and symbol = $2 and status = 'held' and ($4::text is null or (developer = $4 and agent = $5)) returning ${LEASE_COLUMNS}`,
+      [repo, symbol, now, holder?.developer ?? null, holder?.agent ?? null],
+    );
+    const row = res.rows[0];
+    return row === undefined ? undefined : leaseOf(row);
+  }
+
+  async releaseIntentLeases(repo: RepoId, intentId: string, now = new Date()): Promise<Lease[]> {
+    const res = await this.pool.query<LeaseRow>(
+      `update repo_leases set status = 'released', ended_at = $3 where repo = $1 and intent_id = $2 and status = 'held' returning ${LEASE_COLUMNS}`,
+      [repo, intentId, now],
+    );
+    return res.rows.map(leaseOf);
+  }
+
+  async expireLeases(now = new Date()): Promise<Lease[]> {
+    const res = await this.pool.query<LeaseRow>(
+      `update repo_leases set status = 'expired', ended_at = $1 where status = 'held' and expires_at <= $1 returning ${LEASE_COLUMNS}`,
+      [now],
+    );
+    return res.rows.map(leaseOf);
+  }
+
+  liveLeases(repo: RepoId, now = new Date()): Promise<Lease[]> {
+    return this.leasesIn(this.pool, repo, now);
+  }
+
+  private async leasesIn(db: Queryable, repo: RepoId, now: Date): Promise<Lease[]> {
+    const res = await db.query<LeaseRow>(
+      `select ${LEASE_COLUMNS} from repo_leases where repo = $1 and status = 'held' and expires_at > $2 order by symbol collate "C"`,
+      [repo, now],
+    );
+    return res.rows.map(leaseOf);
+  }
+
+  async findEntries(repo: RepoId, q: LogQuery): Promise<LoggedEntry[]> {
+    const params: unknown[] = [repo, q.since ?? 0];
+    const where = ["c.repo = $1", "c.lsn > $2"];
+    const param = (value: unknown): string => {
+      params.push(value);
+      return `$${params.length}`;
+    };
+    if (q.before !== undefined) where.push(`c.lsn < ${param(q.before)}`);
+    if (q.brainBefore !== undefined) where.push(`c.brain_version < ${param(q.brainBefore)}`);
+    if (q.writes !== undefined) {
+      where.push(`exists (select 1 from changeset_symbols s where s.repo = c.repo and s.lsn = c.lsn and s.symbol_id = ${param(q.writes)} and s.kind <> 'read')`);
+    }
+    if (q.reads !== undefined) {
+      where.push(`exists (select 1 from changeset_symbols s where s.repo = c.repo and s.lsn = c.lsn and s.symbol_id = ${param(q.reads)} and s.kind = 'read')`);
+    }
+    if (q.touches !== undefined) {
+      const re = param(globToRegExpSource(q.touches));
+      where.push(`exists (select 1 from changeset_files f where f.repo = c.repo and f.lsn = c.lsn and (f.path ~ ${re} or f.from_path ~ ${re}))`);
+    }
+    if (q.paths !== undefined) {
+      const paths = param(q.paths);
+      where.push(`exists (select 1 from changeset_files f where f.repo = c.repo and f.lsn = c.lsn and (f.path = any(${paths}::text[]) or f.from_path = any(${paths}::text[])))`);
+    }
+    const res = await this.pool.query<{ lsn: number }>(
+      `select c.lsn::int as lsn from changesets c where ${where.join(" and ")} order by c.lsn ${q.newestFirst ? "desc" : "asc"} limit ${param(q.limit)}`,
+      params,
+    );
+    return this.load(
+      repo,
+      res.rows.map((r) => r.lsn),
+      q.contents === true,
+    );
+  }
+
+  async symbolStates(repo: RepoId, prefix: string, limit: number): Promise<SymbolState[]> {
+    const res = await this.pool.query<{
+      symbol_id: string;
+      lsn: number;
+      intent: string;
+      intent_id: string | null;
+      developer: string;
+      agent: string;
+      created_at: Date;
+      signature: boolean;
+    }>(
+      `with last as (
+         select symbol_id, max(lsn) as lsn from changeset_symbols
+         where repo = $1 and kind <> 'read' and starts_with(symbol_id, $2)
+         group by symbol_id
+       )
+       select l.symbol_id, l.lsn::int as lsn, c.intent, c.intent_id, c.developer, c.agent, c.created_at,
+              exists (select 1 from changeset_symbols x
+                      where x.repo = $1 and x.lsn = l.lsn and x.symbol_id = l.symbol_id and x.kind = 'sig_write') as signature
+       from last l join changesets c on c.repo = $1 and c.lsn = l.lsn
+       order by l.symbol_id collate "C" limit $3`,
+      [repo, prefix, limit],
+    );
+    return res.rows.map((r) => ({
+      symbol: r.symbol_id,
+      lsn: r.lsn,
+      signature: r.signature,
+      intent: r.intent,
+      ...(r.intent_id === null ? {} : { intentId: r.intent_id }),
+      author: { developer: r.developer, agent: r.agent },
+      createdAt: r.created_at.toISOString(),
+    }));
   }
 
   async getMirror(repo: RepoId): Promise<Mirror | undefined> {
@@ -621,9 +985,46 @@ export class PgStore implements Store {
     if ((res.rowCount ?? 0) === 0) throw unknownRepo(repo);
   }
 
+  /** Runs `fn` in one transaction on one connection. */
+  private async tx<T>(fn: (db: Queryable) => Promise<T>): Promise<T> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("begin");
+      const result = await fn(client);
+      await client.query("commit");
+      return result;
+    } catch (err) {
+      await client.query("rollback").catch(() => undefined);
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
+  private async brainVersionIn(db: Queryable, repo: RepoId): Promise<number> {
+    const res = await db.query<{ version: number }>("select coalesce(max(version), 0)::int as version from repo_brain_versions where repo = $1", [repo]);
+    return res.rows[0]?.version ?? 0;
+  }
+
   private async head(db: Queryable, repo: RepoId): Promise<Lsn> {
     const res = await db.query<{ head: number }>("select coalesce(max(lsn), 0)::int as head from changesets where repo = $1", [repo]);
     return res.rows[0]?.head ?? 0;
+  }
+
+  /** The entries at these LSNs, in the order given, with the intent each closed; file contents only when asked for. */
+  private async load(repo: RepoId, lsns: Lsn[], contents: boolean): Promise<LoggedEntry[]> {
+    if (lsns.length === 0) return [];
+    const heads = await this.pool.query<ChangesetRow>(
+      `select repo, lsn::int as lsn, base_lsn::int as base_lsn, developer, agent, intent, repairs, checks,
+              brain_version, created_at, intent_id
+       from changesets where repo = $1 and lsn = any($2::bigint[])`,
+      [repo, lsns],
+    );
+    const byLsn = new Map((await this.hydrate(this.pool, repo, heads.rows, contents)).map((e) => [e.lsn, e]));
+    return lsns.flatMap((lsn) => {
+      const entry = byLsn.get(lsn);
+      return entry === undefined ? [] : [entry];
+    });
   }
 
   private async read(db: Queryable, repo: RepoId, fromLsn: Lsn, limit: number): Promise<Changeset[]> {
@@ -633,12 +1034,21 @@ export class PgStore implements Store {
        from changesets where repo = $1 and lsn > $2 order by lsn limit $3`,
       [repo, fromLsn, limit],
     );
-    if (heads.rows.length === 0) return [];
+    return this.hydrate(db, repo, heads.rows);
+  }
+
+  /** Changesets from their rows: files (with contents, unless `contents` is false) and symbol sets read in two queries. */
+  private async hydrate(db: Queryable, repo: RepoId, rows: ChangesetRow[], contents = true): Promise<LoggedEntry[]> {
+    if (rows.length === 0) return [];
+    const heads = { rows };
     const lsns = heads.rows.map((r) => r.lsn);
     const files = await db.query<FileRow>(
-      `select f.lsn::int as lsn, f.path, f.op, f.blob_hash, f.from_path, convert_from(b.bytes, 'UTF8') as content
-       from changeset_files f left join blobs b on b.hash = f.blob_hash
-       where f.repo = $1 and f.lsn = any($2::bigint[]) order by f.lsn, f.path`,
+      contents
+        ? `select f.lsn::int as lsn, f.path, f.op, f.blob_hash, f.from_path, convert_from(b.bytes, 'UTF8') as content
+           from changeset_files f left join blobs b on b.hash = f.blob_hash
+           where f.repo = $1 and f.lsn = any($2::bigint[]) order by f.lsn, f.path`
+        : `select f.lsn::int as lsn, f.path, f.op, f.blob_hash, f.from_path, null::text as content
+           from changeset_files f where f.repo = $1 and f.lsn = any($2::bigint[]) order by f.lsn, f.path`,
       [repo, lsns],
     );
     const symbols = await db.query<SymbolRow>(
@@ -669,6 +1079,7 @@ export class PgStore implements Store {
         checks: row.checks,
         brainVersion: row.brain_version,
         createdAt: row.created_at.toISOString(),
+        ...(row.intent_id === undefined || row.intent_id === null ? {} : { intentId: row.intent_id }),
       };
     });
   }

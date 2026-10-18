@@ -1,9 +1,8 @@
 #!/usr/bin/env node
 /**
  * The Pitstop MCP server for coding agents (Claude Code for the hackathon), over stdio.
- * Tools: declare_intent, commit, why, callers, status, who (who.ts). Each talks to the worktree's daemon
- * (its port in .pitstop/daemon.json), never to the server. `similar` waits for the server's
- * semantic endpoint.
+ * Tools: declare_intent, commit, why, callers, history, brain, lease, status, who (who.ts). Each
+ * talks to the worktree's daemon (its port in .pitstop/daemon.json), never to the server.
  *
  * The worktree is PITSTOP_WORKTREE, else the nearest directory at or above the current one with
  * `.pitstop/config.json` (Claude Code starts MCP servers in the project directory). When no daemon
@@ -36,6 +35,7 @@ export const INSTRUCTIONS = [
   "Commit only with the commit tool. Never run git commit, git push, jj commit or jj git push, and never move or reset main: the daemon owns them.",
   "A refused commit says what changed meanwhile: re-read the files and symbols it names, adapt your change, and commit again. Do not work around it.",
   'A note starting with "Pitstop" after a tool call means entries landed here: re-read what it names before going on.',
+  "declare_intent answers with the repository's architecture decisions (ADRs): follow them, a commit that breaks one is refused. A symbol another agent leased is theirs until the lease ends; take a lease (lease tool) before a risky change to a symbol others use.",
 ].join("\n");
 
 const asContent = (result: ToolResult) => ({
@@ -93,6 +93,44 @@ export function buildServer(worktree: string, opts: ServerOptions = {}): McpServ
       inputSchema: { symbol: z.string().min(1).describe("path#qualified.name") },
     },
     async ({ symbol }) => asContent(await tools.callers(symbol)),
+  );
+
+  server.registerTool(
+    "history",
+    {
+      title: "Every change to a symbol",
+      description: DESCRIPTIONS.history,
+      inputSchema: { symbol: z.string().min(1).describe("path#qualified.name") },
+    },
+    async ({ symbol }) => asContent(await tools.history(symbol)),
+  );
+
+  server.registerTool(
+    "brain",
+    { title: "The repository's brain: ADRs, leases, intents", description: DESCRIPTIONS.brain, inputSchema: {} },
+    async () => asContent(await tools.brain()),
+  );
+
+  server.registerTool(
+    "lease",
+    {
+      title: "Lease a hot symbol",
+      description: DESCRIPTIONS.lease,
+      inputSchema: {
+        symbol: z.string().min(1).describe("path#qualified.name"),
+        reason: z.string().optional().describe("Why you need it, one line; other agents see it"),
+        minutes: z.number().min(1).max(30).optional().describe("How long without a heartbeat before it expires (default 5)"),
+        release: z.boolean().optional().describe("true to release your lease instead"),
+      },
+    },
+    async ({ symbol, reason, minutes, release }) =>
+      asContent(
+        await tools.lease(symbol, {
+          ...(reason === undefined ? {} : { reason }),
+          ...(minutes === undefined ? {} : { minutes }),
+          ...(release === undefined ? {} : { release }),
+        }),
+      ),
   );
 
   server.registerTool(

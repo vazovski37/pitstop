@@ -44,4 +44,6 @@ COPY --from=build /app/web/dist ./web/dist
 
 USER node
 EXPOSE 8080
-CMD ["node", "server/dist/index.js"]
+# The linear-time regular expression engine, for patterns and globs users write (adr-rules.ts also
+# turns it on at load; this makes sure the process starts with it).
+CMD ["node", "--enable-experimental-regexp-engine", "server/dist/index.js"]

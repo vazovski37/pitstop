@@ -95,6 +95,88 @@ describe("MCP tools against a fake daemon", () => {
     });
   });
 
+  it("declare_intent passes the brain on; brain, lease, history and callers render short text", async () => {
+    const symbol = "src/auth/session.ts#getCurrentUser";
+    const fake = await fakeDaemon(worktree, {
+      "POST /intents": {
+        status: 201,
+        body: {
+          id: "int_03",
+          text: "Fix auth",
+          baseLsn: 4,
+          declaredSymbols: [symbol],
+          brief: ["Brain v1: a commit that breaks one of these rules is refused.", "ADR-1 Pages never touch the database: Pages read through services. Rules: forbid_import src/pages/** -> src/db/**."],
+        },
+      },
+      "GET /brain": { body: { version: 1, lines: ["Brain v1 of acme/app: 1 accepted ADR, 0 live leases, 0 open intents.", "ADR-1 Pages never touch the database: Pages read through services."] } },
+      "POST /lease": { status: 409, body: { status: "leased", message: `${symbol} is leased to agent-a (alice) until 03:15Z: changing its return type` } },
+      "GET /history": {
+        body: {
+          symbol,
+          history: [{ lsn: 5, intent: "Fix auth", intentId: "int_01", author: { developer: "alice", agent: "agent-a" }, createdAt: "2026-10-18T03:10:00Z", signature: true, brainVersion: 1, repairs: [] }],
+          declaredBy: [{ id: "int_03", text: "Fix auth", author: { developer: "bob", agent: "agent-b" } }],
+          lease: { expiresAt: "2026-10-18T03:15:00Z", reason: "", holder: { developer: "alice", agent: "agent-a" } },
+        },
+      },
+      "GET /callers": {
+        body: {
+          readers: [{ lsn: 6, intent: "Profile", agent: "agent-b", files: ["src/pages/Profile.tsx"], wrote: ["src/pages/Profile.tsx#Profile"] }],
+          writers: [],
+          note: "read sets, not a parsed call graph",
+        },
+      },
+    });
+    close = fake.close;
+    const tools = makeTools(new DaemonClient(worktree));
+    expect((await tools.declare_intent("Fix auth", [symbol])).text).toBe(
+      `Intent int_03 is open at #4: "Fix auth". Declared: ${symbol}. Use the commit tool when the work is done.\nBrain v1: a commit that breaks one of these rules is refused.\nADR-1 Pages never touch the database: Pages read through services. Rules: forbid_import src/pages/** -> src/db/**.`,
+    );
+    expect((await tools.brain()).text).toBe("Brain v1 of acme/app: 1 accepted ADR, 0 live leases, 0 open intents.\nADR-1 Pages never touch the database: Pages read through services.");
+    expect(await tools.lease(symbol, { reason: "rename", minutes: 10 })).toEqual({
+      text: `Lease refused: ${symbol} is leased to agent-a (alice) until 03:15Z: changing its return type. Leave that symbol alone (a commit writing it is refused) or wait until the lease ends.`,
+      isError: true,
+    });
+    expect(fake.requests.at(-1)).toMatchObject({ method: "POST", path: "/lease", body: { symbol, reason: "rename", ttlSeconds: 600 } });
+    expect((await tools.history(symbol)).text).toBe(
+      [
+        '#5 agent-a "Fix auth" (int_01), signature changed at 2026-10-18T03:10:00Z',
+        'Declared now by: agent-b "Fix auth" (int_03)',
+        "Leased to agent-a (alice) until 2026-10-18T03:15:00Z",
+      ].join("\n"),
+    );
+    expect(fake.requests.at(-1)?.path).toBe(`/history?symbol=${encodeURIComponent(symbol)}`);
+    expect((await tools.callers(symbol)).text).toBe('Read by (read sets, not a parsed call graph):\n  #6 agent-b "Profile" (wrote src/pages/Profile.tsx#Profile)');
+    await close();
+
+    const granting = await fakeDaemon(worktree, {
+      "POST /lease": { body: { status: "held", message: `${symbol} is yours until 03:20Z` } },
+    });
+    close = granting.close;
+    expect((await tools.lease(symbol)).text).toMatch(/^Lease taken: src\/auth\/session\.ts#getCurrentUser is yours until 03:20Z\. /);
+    await close();
+    const releasing = await fakeDaemon(worktree, { "POST /lease": { body: { status: "released", message: "released" } } });
+    close = releasing.close;
+    expect((await tools.lease(symbol, { release: true })).text).toBe(`Released the lease on ${symbol}.`);
+    expect(releasing.requests[0]?.body).toEqual({ symbol, release: true });
+    await close();
+
+    // Nothing to release, a stale intent, no intent: never "leave that symbol alone".
+    const gone = await fakeDaemon(worktree, { "POST /lease": { body: { status: "not_held", message: `nobody holds a lease on ${symbol}` } } });
+    close = gone.close;
+    expect(await tools.lease(symbol, { release: true })).toEqual({ text: `You hold no lease on ${symbol} (it expired or was released); nothing to release.` });
+    await close();
+    const stale = await fakeDaemon(worktree, { "POST /lease": { body: { status: "invalid", message: "intent int_03 is stale, not open" } } });
+    close = stale.close;
+    expect(await tools.lease(symbol)).toEqual({
+      text: "Lease not taken: intent int_03 is stale, not open. Your intent is closed or stale: call declare_intent again, then take the lease.",
+      isError: true,
+    });
+    await close();
+    const none = await fakeDaemon(worktree, { "POST /lease": { body: { status: "invalid", message: "Declare your intent first (declare_intent), then take the lease; it lives and ends with that intent." } } });
+    close = none.close;
+    expect((await tools.lease(symbol)).text).toBe("Lease not taken: Declare your intent first (declare_intent), then take the lease; it lives and ends with that intent.");
+  });
+
   it("says so when no daemon runs", async () => {
     const tools = makeTools(new DaemonClient(worktree));
     expect(await tools.status()).toEqual({ text: `No daemon is running in ${worktree}: run \`pitstop start\` there.`, isError: true });

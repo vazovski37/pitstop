@@ -1,6 +1,8 @@
 import { createHash, randomBytes } from "node:crypto";
 import {
   DEFAULT_REPO,
+  type Adr,
+  type AdrRule,
   type Author,
   type Changeset,
   type Checks,
@@ -9,11 +11,14 @@ import {
   type FileChange,
   type Intent,
   type IntentRequest,
+  type Lease,
   type Lsn,
   type Repair,
   type Repo,
   type RepoId,
+  type SymbolId,
 } from "@pitstop/protocol";
+import { globToRegExp } from "./adr-rules.js";
 
 /**
  * What the server needs from its storage: the repositories, each with its own log, the blobs,
@@ -38,6 +43,13 @@ export interface Store {
    * as a full import at its first entry.
    */
   treeAt(repo: RepoId, lsn: Lsn): Promise<Tree>;
+  /**
+   * The files of `treeAt(repo, lsn)` that are among `paths` or match one of `globs` (adr-rules.ts),
+   * and only those: what the brain reads instead of the whole tree.
+   */
+  filesAt(repo: RepoId, lsn: Lsn, which: { paths?: string[]; globs?: string[] }): Promise<Tree>;
+  /** The paths of `treeAt(repo, lsn)`, without their contents. */
+  pathsAt(repo: RepoId, lsn: Lsn): Promise<string[]>;
   /** Creates the repository, or returns it when it exists. */
   createRepo(id: RepoId): Promise<{ repo: Repo; created: boolean }>;
   getRepo(id: RepoId): Promise<Repo | undefined>;
@@ -46,8 +58,53 @@ export interface Store {
   openIntent(req: IntentRequest): Promise<Intent>;
   /** The repository's open intents: the catalog's live view (design doc 9.3), for early warnings. */
   openIntents(repo: RepoId): Promise<Intent[]>;
-  /** Refreshes an open intent's heartbeat. Unknown or closed intents are ignored. */
+  getIntent(repo: RepoId, id: string): Promise<Intent | undefined>;
+  /**
+   * Refreshes an open intent's heartbeat (9.3). Unknown or closed intents are ignored. It renews
+   * no lease: any reader of the stream may send a heartbeat naming any intent, so a lease is
+   * renewed only by its holder asking again (`acquireLease`), which the daemon does on a timer.
+   */
   heartbeat(repo: RepoId, intentId: string): Promise<void>;
+  /** Marks every open intent whose last heartbeat is before `before` stale (9.3), in every repository; returns them. */
+  markStaleIntents(before: Date): Promise<Intent[]>;
+
+  // The brain (design doc section 9, migration 009): ADRs, the brain version, leases.
+  /** A proposed ADR with the repository's next number. An unknown repository is an `InvalidCommit`. */
+  proposeAdr(proposal: AdrProposal): Promise<Adr>;
+  /** By number. */
+  listAdrs(repo: RepoId): Promise<Adr[]>;
+  getAdr(repo: RepoId, number: number): Promise<Adr | undefined>;
+  /**
+   * An owner's verdict on an ADR, with the brain version moved in the same step when the rules in
+   * force change (accepting or superseding; rejecting a proposal changes no rule).
+   */
+  decideAdr(repo: RepoId, number: number, verdict: AdrVerdict, by: string): Promise<AdrChange>;
+  /** The repository's brain version: 0 until an ADR is accepted, then one more per accept or supersede. */
+  brainVersion(repo: RepoId): Promise<number>;
+  /** The ADRs that were accepted, and not yet superseded, at brain version `version` (9.2). */
+  adrsInForce(repo: RepoId, version: number): Promise<Adr[]>;
+  /**
+   * Takes a lease atomically: granted when nobody else holds an unexpired one on the symbol (its
+   * holder renews it: see `holdsLease`), refused with the holder otherwise. Held leases past their
+   * expiry on the symbol are expired first. In Postgres it waits for an append in flight on the
+   * repository, so a commit's lease check and a grant never interleave. An unknown repository,
+   * or an intent that is not open or not the holder's, is an `InvalidCommit`.
+   */
+  acquireLease(request: LeaseRequest, now?: Date): Promise<LeaseGrant>;
+  /** Releases the held lease on the symbol, if there is one (and, given `holder`, only if it is theirs). */
+  releaseLease(repo: RepoId, symbol: SymbolId, now?: Date, holder?: Author): Promise<Lease | undefined>;
+  /** Releases every lease the intent holds (it committed, or went stale). */
+  releaseIntentLeases(repo: RepoId, intentId: string, now?: Date): Promise<Lease[]>;
+  /** Expires every held lease past its expiry, in every repository; returns them. */
+  expireLeases(now?: Date): Promise<Lease[]>;
+  /** Held, unexpired leases of the repository, by symbol. */
+  liveLeases(repo: RepoId, now?: Date): Promise<Lease[]>;
+
+  // The query API (design doc section 10).
+  /** Entries matching every filter given, oldest first unless `newestFirst`. */
+  findEntries(repo: RepoId, query: LogQuery): Promise<LoggedEntry[]>;
+  /** Every symbol the log saw written whose id starts with `prefix`, with its last writer, by id. */
+  symbolStates(repo: RepoId, prefix: string, limit: number): Promise<SymbolState[]>;
   getMirror(repo: RepoId): Promise<Mirror | undefined>;
   /** Creates or replaces the repository's mirror; its position starts over at `baseCommit`. */
   setMirror(repo: RepoId, config: MirrorConfig): Promise<Mirror>;
@@ -198,14 +255,109 @@ export interface MirrorPatch {
 /** Path to text. */
 export type Tree = Map<string, string>;
 
+/** What a writer proposes (`POST /repos/:o/:n/adrs`); the store gives it the next number. */
+export interface AdrProposal {
+  repo: RepoId;
+  title: string;
+  decision: string;
+  reason?: string;
+  consequences?: string;
+  rules?: AdrRule[];
+  createdBy: string;
+}
+/** An owner's verdict on an ADR. */
+export type AdrVerdict = "accepted" | "rejected" | "superseded";
+/** The status each verdict may be given from: a proposal is accepted or rejected, an accepted ADR superseded. */
+export const ADR_TRANSITIONS: Record<AdrVerdict, Adr["status"]> = { accepted: "proposed", rejected: "proposed", superseded: "accepted" };
+/** Whether a verdict changes the rules in force, and so moves the brain version. */
+export const movesBrain = (verdict: AdrVerdict): boolean => verdict !== "rejected";
+export type AdrChange =
+  | { ok: true; adr: Adr; /** The repository's brain version after the change. */ version: number }
+  | { ok: false; error: "not_found" }
+  | { ok: false; error: "invalid_transition"; adr: Adr };
+
+/** A lease asked for (`POST /repos/:o/:n/leases`, design doc 9.4). */
+export interface LeaseRequest {
+  repo: RepoId;
+  symbol: SymbolId;
+  holder: Author;
+  intentId?: string;
+  reason: string;
+  ttlSeconds: number;
+}
+export type LeaseGrant =
+  | { granted: true; lease: Lease; /** The holder already had it. */ renewed: boolean; /** Held leases on the symbol that had run out. */ expired: Lease[] }
+  | { granted: false; /** The live lease someone else holds. */ holder: Lease; expired: Lease[] };
+/** Seconds a lease lives without a heartbeat. */
+export const LEASE_TTL = { default: 300, min: 60, max: 1_800 } as const;
+
+export const sameAuthor = (a: Author, b: Author): boolean => a.developer === b.developer && a.agent === b.agent;
+
+/**
+ * Whether `author`, working on `intentId`, is the lease's holder. A lease tied to an intent is
+ * held by that intent: two checkouts of one person share an author (developer and agent name),
+ * and only the one whose task took the lease holds it. A lease without an intent: the author.
+ */
+export const holdsLease = (lease: Pick<Lease, "holder" | "intentId">, author: Author, intentId: string | undefined): boolean =>
+  sameAuthor(lease.holder, author) && (lease.intentId === undefined || lease.intentId === intentId);
+
+/** Why a lease may not be tied to someone else's intent. */
+export const notTheirIntent = (intentId: string, owner: Author, asker: Author): string =>
+  `intent ${intentId} is ${owner.agent}'s (${owner.developer}), not ${asker.agent}'s (${asker.developer}): a lease is tied to its holder's own intent`;
+
+/** Filters for `Store.findEntries`: all given ones must hold. */
+export interface LogQuery {
+  /** Entries that wrote this symbol (write or signature write). */
+  writes?: SymbolId;
+  /** Entries whose read set holds this symbol. */
+  reads?: SymbolId;
+  /** Entries with a file (or a rename's old path) matching this glob (adr-rules.ts). */
+  touches?: string;
+  /** Entries with a file (or a rename's old path) among these. */
+  paths?: string[];
+  /** Only `lsn > since`. */
+  since?: Lsn;
+  /** Only `lsn < before`: the next page of a newest-first answer. */
+  before?: Lsn;
+  /** Only entries validated against a brain version below this one (the re-check queue, 9.2). */
+  brainBefore?: number;
+  newestFirst?: boolean;
+  limit: number;
+  /** Load the files' contents too; the query API never needs them, so by default they are left out. */
+  contents?: boolean;
+}
+/** A log entry with the intent it closed, when it named one. */
+export type LoggedEntry = Changeset & { intentId?: string };
+/** A symbol as the log knows it: its last writer. */
+export interface SymbolState {
+  symbol: SymbolId;
+  lsn: Lsn;
+  /** Whether that entry changed its signature (or removed it). */
+  signature: boolean;
+  intent: string;
+  intentId?: string;
+  author: Author;
+  createdAt: string;
+}
+
 /** What a decision records with the changeset. Defaults: skipped checks, no repairs, the files as sent. */
 export interface Decision {
   checks?: Checks;
   repairs?: Repair[];
   /** The files to land instead of the request's: a repair's output, hashes filled in. */
   files?: FileChange[];
+  /** The repository's brain version the commit was validated against (9.2); default the current one. */
+  brainVersion?: number;
 }
-export type Decide = (gap: Changeset[], head: Lsn) => Decision | Promise<Decision>;
+/**
+ * What a decision may read while the append holds the repository's lock, through the append's own
+ * connection (a second pool connection there could wait on a pool the lock's waiters exhausted).
+ */
+export interface AppendReads {
+  /** The repository's held, unexpired leases: exact, since a grant waits for the lock (9.4). */
+  leases(now: Date): Promise<Lease[]>;
+}
+export type Decide = (gap: Changeset[], head: Lsn, reads: AppendReads) => Decision | Promise<Decision>;
 
 /** How far behind head a commit may be before the daemon must rebase first. */
 export const GAP_LIMIT = 500;
@@ -285,6 +437,12 @@ export class MemoryStore implements Store {
   private readonly invites = new Map<string, Invite>(); // `${repo}\n${login}`
   private readonly visibilities = new Map<RepoId, Visibility>();
   private readonly parked = new Map<string, Parked>();
+  /** `${repo}\n${lsn}` to the intent the entry closed. */
+  private readonly entryIntents = new Map<string, string>();
+  private readonly adrs = new Map<RepoId, Adr[]>();
+  /** Each repository's brain version moves, in order. */
+  private readonly brainLog = new Map<RepoId, { version: number; adr: number; status: "accepted" | "superseded" }[]>();
+  private readonly leases: { lease: Lease }[] = [];
 
   async append(req: CommitRequest, decide?: Decide): Promise<Changeset> {
     const seen = this.byKey.get(req.idempotencyKey);
@@ -300,7 +458,7 @@ export class MemoryStore implements Store {
     const intent = req.intentId === undefined ? undefined : this.intents.get(req.intentId);
     if (req.intentId !== undefined && (intent === undefined || intent.repo !== repo)) throw new InvalidCommit(`unknown intent ${req.intentId}`);
     const gap = log.filter((e) => e.lsn > gapStart(req)).slice(0, GAP_LIMIT + 1);
-    const decision = decide ? await decide(gap, lsn - 1) : {};
+    const decision = decide ? await decide(gap, lsn - 1, { leases: (now) => this.liveLeases(repo, now) }) : {};
     const changeset: Changeset = {
       repo,
       lsn,
@@ -313,12 +471,16 @@ export class MemoryStore implements Store {
       readSet: req.readSet,
       repairs: decision.repairs ?? [],
       checks: decision.checks ?? SKIPPED_CHECKS,
-      brainVersion: 0,
+      brainVersion: decision.brainVersion ?? (await this.brainVersion(repo)),
       createdAt: new Date().toISOString(),
     };
     log.push(changeset);
     this.byKey.set(req.idempotencyKey, changeset);
-    if (intent?.status === "open") this.intents.set(intent.id, { ...intent, status: "committed" });
+    if (req.intentId !== undefined) this.entryIntents.set(`${repo}\n${lsn}`, req.intentId);
+    // A stale intent whose agent came back and committed is closed too; only by its own author.
+    if ((intent?.status === "open" || intent?.status === "stale") && sameAuthor(intent.author, req.author)) {
+      this.intents.set(intent.id, { ...intent, status: "committed" });
+    }
     return changeset;
   }
 
@@ -334,6 +496,18 @@ export class MemoryStore implements Store {
     const tree: Tree = new Map();
     for (const entry of this.logs.get(repo) ?? []) if (entry.lsn <= lsn) applyFiles(tree, entry.files);
     return tree;
+  }
+
+  async filesAt(repo: RepoId, lsn: Lsn, which: { paths?: string[]; globs?: string[] }): Promise<Tree> {
+    const paths = new Set(which.paths ?? []);
+    const globs = (which.globs ?? []).map(globToRegExp);
+    const out: Tree = new Map();
+    for (const [path, content] of await this.treeAt(repo, lsn)) if (paths.has(path) || globs.some((g) => g.test(path))) out.set(path, content);
+    return out;
+  }
+
+  async pathsAt(repo: RepoId, lsn: Lsn): Promise<string[]> {
+    return [...(await this.treeAt(repo, lsn)).keys()].sort();
   }
 
   async createRepo(id: RepoId): Promise<{ repo: Repo; created: boolean }> {
@@ -376,9 +550,191 @@ export class MemoryStore implements Store {
     return [...this.intents.values()].filter((i) => i.repo === repo && i.status === "open");
   }
 
+  async getIntent(repo: RepoId, id: string): Promise<Intent | undefined> {
+    const intent = this.intents.get(id);
+    return intent?.repo === repo ? intent : undefined;
+  }
+
   async heartbeat(repo: RepoId, intentId: string): Promise<void> {
     const intent = this.intents.get(intentId);
-    if (intent?.status === "open" && intent.repo === repo) this.intents.set(intentId, { ...intent, heartbeatAt: new Date().toISOString() });
+    if (intent?.status !== "open" || intent.repo !== repo) return;
+    this.intents.set(intentId, { ...intent, heartbeatAt: new Date().toISOString() });
+  }
+
+  async markStaleIntents(before: Date): Promise<Intent[]> {
+    const stale: Intent[] = [];
+    for (const intent of this.intents.values()) {
+      if (intent.status !== "open" || Date.parse(intent.heartbeatAt) >= before.getTime()) continue;
+      const next: Intent = { ...intent, status: "stale" };
+      this.intents.set(intent.id, next);
+      stale.push(next);
+    }
+    return stale;
+  }
+
+  async proposeAdr(p: AdrProposal): Promise<Adr> {
+    if (!this.repos.has(p.repo)) throw unknownRepo(p.repo);
+    const list = this.adrs.get(p.repo) ?? [];
+    const adr: Adr = {
+      repo: p.repo,
+      number: list.length + 1,
+      title: p.title,
+      status: "proposed",
+      decision: p.decision,
+      reason: p.reason ?? "",
+      consequences: p.consequences ?? "",
+      rules: p.rules ?? [],
+      version: 0,
+      createdBy: p.createdBy,
+      createdAt: new Date().toISOString(),
+    };
+    this.adrs.set(p.repo, [...list, adr]);
+    return adr;
+  }
+
+  async listAdrs(repo: RepoId): Promise<Adr[]> {
+    return [...(this.adrs.get(repo) ?? [])];
+  }
+
+  async getAdr(repo: RepoId, number: number): Promise<Adr | undefined> {
+    return this.adrs.get(repo)?.find((a) => a.number === number);
+  }
+
+  async decideAdr(repo: RepoId, number: number, verdict: AdrVerdict, by: string): Promise<AdrChange> {
+    const list = this.adrs.get(repo) ?? [];
+    const at = list.findIndex((a) => a.number === number);
+    const adr = list[at];
+    if (adr === undefined) return { ok: false, error: "not_found" };
+    if (adr.status !== ADR_TRANSITIONS[verdict]) return { ok: false, error: "invalid_transition", adr };
+    // Read and written with no await in between, so two concurrent accepts cannot both pass the check.
+    let version = this.brainLog.get(repo)?.at(-1)?.version ?? 0;
+    if (movesBrain(verdict)) {
+      version += 1;
+      this.brainLog.set(repo, [...(this.brainLog.get(repo) ?? []), { version, adr: number, status: verdict as "accepted" | "superseded" }]);
+    }
+    const next: Adr = { ...adr, status: verdict, version: movesBrain(verdict) ? version : adr.version, decidedBy: by, decidedAt: new Date().toISOString() };
+    list[at] = next;
+    return { ok: true, adr: next, version };
+  }
+
+  async brainVersion(repo: RepoId): Promise<number> {
+    return this.brainLog.get(repo)?.at(-1)?.version ?? 0;
+  }
+
+  async adrsInForce(repo: RepoId, version: number): Promise<Adr[]> {
+    const last = new Map<number, string>();
+    for (const move of this.brainLog.get(repo) ?? []) if (move.version <= version) last.set(move.adr, move.status);
+    return (this.adrs.get(repo) ?? []).filter((a) => last.get(a.number) === "accepted");
+  }
+
+  async acquireLease(req: LeaseRequest, now = new Date()): Promise<LeaseGrant> {
+    if (!this.repos.has(req.repo)) throw unknownRepo(req.repo);
+    if (req.intentId !== undefined) {
+      const intent = this.intents.get(req.intentId);
+      if (intent === undefined || intent.repo !== req.repo) throw new InvalidCommit(`unknown intent ${req.intentId}`);
+      if (intent.status !== "open") throw new InvalidCommit(`intent ${req.intentId} is ${intent.status}, not open`);
+      if (!sameAuthor(intent.author, req.holder)) throw new InvalidCommit(notTheirIntent(req.intentId, intent.author, req.holder));
+    }
+    const expired = this.endLeases(
+      (l) => l.repo === req.repo && l.symbol === req.symbol && l.status === "held" && Date.parse(l.expiresAt) <= now.getTime(),
+      "expired",
+    );
+    const expiresAt = new Date(now.getTime() + req.ttlSeconds * 1000).toISOString();
+    const held = this.leases.find((h) => h.lease.repo === req.repo && h.lease.symbol === req.symbol && h.lease.status === "held");
+    if (held !== undefined) {
+      if (!holdsLease(held.lease, req.holder, req.intentId)) return { granted: false, holder: held.lease, expired };
+      const intentId = req.intentId ?? held.lease.intentId;
+      held.lease = { ...held.lease, reason: req.reason, expiresAt, ...(intentId === undefined ? {} : { intentId }) };
+      return { granted: true, lease: held.lease, renewed: true, expired };
+    }
+    const lease: Lease = {
+      repo: req.repo,
+      symbol: req.symbol,
+      holder: req.holder,
+      ...(req.intentId === undefined ? {} : { intentId: req.intentId }),
+      reason: req.reason,
+      status: "held",
+      expiresAt,
+      createdAt: now.toISOString(),
+    };
+    this.leases.push({ lease });
+    return { granted: true, lease, renewed: false, expired };
+  }
+
+  async releaseLease(repo: RepoId, symbol: SymbolId, _now?: Date, holder?: Author): Promise<Lease | undefined> {
+    const theirs = (l: Lease) => holder === undefined || sameAuthor(l.holder, holder);
+    return this.endLeases((l) => l.repo === repo && l.symbol === symbol && l.status === "held" && theirs(l), "released")[0];
+  }
+
+  async releaseIntentLeases(repo: RepoId, intentId: string): Promise<Lease[]> {
+    return this.endLeases((l) => l.repo === repo && l.intentId === intentId && l.status === "held", "released");
+  }
+
+  async expireLeases(now = new Date()): Promise<Lease[]> {
+    return this.endLeases((l) => l.status === "held" && Date.parse(l.expiresAt) <= now.getTime(), "expired");
+  }
+
+  async liveLeases(repo: RepoId, now = new Date()): Promise<Lease[]> {
+    return this.leases
+      .map((h) => h.lease)
+      .filter((l) => l.repo === repo && l.status === "held" && Date.parse(l.expiresAt) > now.getTime())
+      .sort((a, b) => (a.symbol < b.symbol ? -1 : a.symbol > b.symbol ? 1 : 0));
+  }
+
+  private endLeases(match: (lease: Lease) => boolean, status: "released" | "expired"): Lease[] {
+    const ended: Lease[] = [];
+    for (const held of this.leases) {
+      if (!match(held.lease)) continue;
+      held.lease = { ...held.lease, status };
+      ended.push(held.lease);
+    }
+    return ended;
+  }
+
+  async findEntries(repo: RepoId, q: LogQuery): Promise<LoggedEntry[]> {
+    const touches = q.touches === undefined ? undefined : globToRegExp(q.touches);
+    const paths = q.paths === undefined ? undefined : new Set(q.paths);
+    const fileHit = (f: FileChange, hit: (path: string) => boolean) => hit(f.path) || (f.fromPath !== undefined && hit(f.fromPath));
+    const found = (this.logs.get(repo) ?? []).filter(
+      (e) =>
+        e.lsn > (q.since ?? 0) &&
+        (q.before === undefined || e.lsn < q.before) &&
+        (q.brainBefore === undefined || e.brainVersion < q.brainBefore) &&
+        (q.writes === undefined || e.writeSet.includes(q.writes) || e.sigWriteSet.includes(q.writes)) &&
+        (q.reads === undefined || e.readSet.includes(q.reads)) &&
+        (touches === undefined || e.files.some((f) => fileHit(f, (p) => touches.test(p)))) &&
+        (paths === undefined || e.files.some((f) => fileHit(f, (p) => paths.has(p)))),
+    );
+    const page = (q.newestFirst ? found.reverse() : found).slice(0, q.limit).map((e) => this.logged(e));
+    // As in PgStore: contents only when asked for.
+    return q.contents === true ? page : page.map((e) => ({ ...e, files: e.files.map(({ content: _content, ...f }) => f) }));
+  }
+
+  async symbolStates(repo: RepoId, prefix: string, limit: number): Promise<SymbolState[]> {
+    const latest = new Map<SymbolId, Changeset>();
+    for (const e of this.logs.get(repo) ?? []) {
+      for (const symbol of new Set([...e.writeSet, ...e.sigWriteSet])) if (symbol.startsWith(prefix)) latest.set(symbol, e);
+    }
+    return [...latest.entries()]
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+      .slice(0, limit)
+      .map(([symbol, e]) => {
+        const intentId = this.entryIntents.get(`${repo}\n${e.lsn}`);
+        return {
+          symbol,
+          lsn: e.lsn,
+          signature: e.sigWriteSet.includes(symbol),
+          intent: e.intent,
+          ...(intentId === undefined ? {} : { intentId }),
+          author: e.author,
+          createdAt: e.createdAt,
+        };
+      });
+  }
+
+  private logged(e: Changeset): LoggedEntry {
+    const intentId = this.entryIntents.get(`${e.repo}\n${e.lsn}`);
+    return intentId === undefined ? e : { ...e, intentId };
   }
 
   async getMirror(repo: RepoId): Promise<Mirror | undefined> {
