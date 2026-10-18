@@ -402,6 +402,8 @@ describe("the brain", () => {
     expect(symbol.length).toBeGreaterThan(110);
     expect((await call("GET", `/repos/${REPO}/symbols/${encodeURIComponent(symbol)}/history`)).status).toBe(200);
     expect((await call("GET", `/repos/${REPO}/symbols/${encodeURIComponent(symbol)}/callers`)).status).toBe(200);
+    expect((await call("GET", `/repos/${REPO}/history?symbol=${encodeURIComponent(symbol)}`)).status).toBe(200);
+    expect((await call("GET", `/repos/${REPO}/callers?symbol=${encodeURIComponent(symbol)}`)).status).toBe(200);
   });
 
   it("broadcasts a plain escalation as a warning, as a parked one is", async () => {
@@ -438,6 +440,16 @@ describe("the brain", () => {
     const callers = await call("GET", `/repos/${REPO}/symbols/${enc}/callers`);
     expect(callers.body.derivedFrom).toMatch(/read sets.*not a parsed call graph/);
     expect(callers.body.callers).toEqual([expect.objectContaining({ lsn: 3, intent: "profile page", author: bob, wrote: ["src/pages/Profile.tsx#Profile"] })]);
+
+    // The same with the symbol in the query string, which the daemon uses: a proxy in front of the
+    // server may rewrite an encoded `/` in a path (Azure Container Apps' ingress does).
+    expect((await call("GET", `/repos/${REPO}/history?symbol=${enc}`)).body).toEqual(history.body);
+    expect((await call("GET", `/repos/${REPO}/callers?symbol=${enc}`)).body).toEqual(callers.body);
+    expect(((await call("GET", `/repos/${REPO}/history?symbol=${enc}&limit=1`)).body.history as unknown[]).length).toBe(1);
+    for (const bad of ["", "?symbol=", "?symbol=no-hash"]) {
+      expect((await call("GET", `/repos/${REPO}/history${bad}`)).status).toBe(400);
+      expect((await call("GET", `/repos/${REPO}/callers${bad}`)).status).toBe(400);
+    }
 
     const why = await call("GET", `/repos/${REPO}/why?path=src/auth/session.ts`);
     expect((why.body.entries as unknown as { lsn: number; op: string }[]).map((e) => [e.lsn, e.op])).toEqual([[2, "modify"], [1, "add"]]);
@@ -484,7 +496,8 @@ describe("the brain with accounts", () => {
     expect((await release(stranger.headers)).statusCode).toBe(404);
     expect((await release(owner.headers)).statusCode).toBe(200);
 
-    for (const url of ["/repos/alice/app/brain", "/repos/alice/app/adrs", "/repos/alice/app/leases", "/repos/alice/app/brain/recheck", "/repos/alice/app/symbols", "/repos/alice/app/why?path=a"]) {
+    const sym = encodeURIComponent("src/a.ts#a");
+    for (const url of ["/repos/alice/app/brain", "/repos/alice/app/adrs", "/repos/alice/app/leases", "/repos/alice/app/brain/recheck", "/repos/alice/app/symbols", "/repos/alice/app/why?path=a", `/repos/alice/app/history?symbol=${sym}`, `/repos/alice/app/callers?symbol=${sym}`, `/repos/alice/app/symbols/${sym}/history`]) {
       expect((await app.inject({ method: "GET", url, headers: stranger.headers })).statusCode).toBe(404);
     }
     expect((await app.inject({ method: "POST", url: "/repos/alice/app/adrs", headers: stranger.headers, payload: { title: "t", decision: "d" } })).statusCode).toBe(404);

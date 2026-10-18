@@ -476,12 +476,9 @@ export function registerBrainRoutes(app: FastifyInstance, ctx: BrainContext): vo
     };
   });
 
-  app.get<{ Params: { owner: string; name: string; id: string }; Querystring: { limit?: string; before?: string } }>("/repos/:owner/:name/symbols/:id/history", async (req, reply) => {
-    const repo = `${req.params.owner}/${req.params.name}`;
-    if (!(await ctx.access(req, reply, repo, "reader"))) return reply;
-    const symbol = req.params.id;
+  const symbolHistory = async (repo: string, symbol: string, query: { limit?: string; before?: string }) => {
     const [entries, intents, leases] = await Promise.all([
-      store.findEntries(repo, { writes: symbol, newestFirst: true, limit: limitOf(req.query.limit, 50, 500), ...beforeOf(req.query.before) }),
+      store.findEntries(repo, { writes: symbol, newestFirst: true, limit: limitOf(query.limit, 50, 500), ...beforeOf(query.before) }),
       store.openIntents(repo),
       store.liveLeases(repo, ctx.now()),
     ]);
@@ -492,18 +489,45 @@ export function registerBrainRoutes(app: FastifyInstance, ctx: BrainContext): vo
       declaredBy: intents.filter((i) => i.declaredSymbols.includes(symbol)).map((i) => ({ id: i.id, text: i.text, author: i.author })),
       ...(lease === undefined ? {} : { lease }),
     };
-  });
-
-  app.get<{ Params: { owner: string; name: string; id: string }; Querystring: { limit?: string; before?: string } }>("/repos/:owner/:name/symbols/:id/callers", async (req, reply) => {
-    const repo = `${req.params.owner}/${req.params.name}`;
-    if (!(await ctx.access(req, reply, repo, "reader"))) return reply;
-    const symbol = req.params.id;
-    const entries = await store.findEntries(repo, { reads: symbol, newestFirst: true, limit: limitOf(req.query.limit, 50, 500), ...beforeOf(req.query.before) });
+  };
+  const symbolCallers = async (repo: string, symbol: string, query: { limit?: string; before?: string }) => {
+    const entries = await store.findEntries(repo, { reads: symbol, newestFirst: true, limit: limitOf(query.limit, 50, 500), ...beforeOf(query.before) });
     return {
       symbol,
       derivedFrom: "the read sets of landed entries (what each change referred to), not a parsed call graph",
       callers: entries.map((e) => ({ ...entryView(e), wrote: [...new Set([...e.writeSet, ...e.sigWriteSet])] })),
     };
+  };
+
+  app.get<{ Params: { owner: string; name: string; id: string }; Querystring: { limit?: string; before?: string } }>("/repos/:owner/:name/symbols/:id/history", async (req, reply) => {
+    const repo = `${req.params.owner}/${req.params.name}`;
+    if (!(await ctx.access(req, reply, repo, "reader"))) return reply;
+    return symbolHistory(repo, req.params.id, req.query);
+  });
+
+  app.get<{ Params: { owner: string; name: string; id: string }; Querystring: { limit?: string; before?: string } }>("/repos/:owner/:name/symbols/:id/callers", async (req, reply) => {
+    const repo = `${req.params.owner}/${req.params.name}`;
+    if (!(await ctx.access(req, reply, repo, "reader"))) return reply;
+    return symbolCallers(repo, req.params.id, req.query);
+  });
+
+  // The same two with the symbol in the query string. Some proxies (Azure Container Apps' ingress
+  // among them) rewrite an encoded `/` in a path, so a symbol id in the path never reaches this
+  // server there; a query string arrives intact. The daemon uses these.
+  app.get<RepoParams & { Querystring: { symbol?: string; limit?: string; before?: string } }>("/repos/:owner/:name/history", async (req, reply) => {
+    const repo = repoOfParams(req);
+    if (!(await ctx.access(req, reply, repo, "reader"))) return reply;
+    const symbol = SymbolId.safeParse(req.query.symbol);
+    if (!symbol.success) return reply.code(400).send({ error: "invalid_request", message: "expected ?symbol=path#name" });
+    return symbolHistory(repo, symbol.data, req.query);
+  });
+
+  app.get<RepoParams & { Querystring: { symbol?: string; limit?: string; before?: string } }>("/repos/:owner/:name/callers", async (req, reply) => {
+    const repo = repoOfParams(req);
+    if (!(await ctx.access(req, reply, repo, "reader"))) return reply;
+    const symbol = SymbolId.safeParse(req.query.symbol);
+    if (!symbol.success) return reply.code(400).send({ error: "invalid_request", message: "expected ?symbol=path#name" });
+    return symbolCallers(repo, symbol.data, req.query);
   });
 
   app.get<RepoParams & { Querystring: { path?: string; limit?: string; before?: string } }>("/repos/:owner/:name/why", async (req, reply) => {

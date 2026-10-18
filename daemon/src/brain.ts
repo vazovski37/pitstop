@@ -318,12 +318,14 @@ export type Callers = z.infer<typeof Callers>;
 export const Why = z.object({ path: z.string(), entries: z.array(QueryEntry.extend({ op: z.string() })) });
 export type Why = z.infer<typeof Why>;
 
+// The symbol goes in the query string, not the path: a proxy in front of the server (Azure
+// Container Apps' ingress) rewrites an encoded `/` in a path, and every symbol id holds one.
 export async function symbolHistory(a: ServerAccess, symbol: SymbolId, limit = 20): Promise<History> {
-  return History.parse(await get(a, `/symbols/${encodeURIComponent(symbol)}/history?limit=${limit}`));
+  return History.parse(await get(a, `/history?symbol=${encodeURIComponent(symbol)}&limit=${limit}`));
 }
 
 export async function symbolCallers(a: ServerAccess, symbol: SymbolId, limit = 20): Promise<Callers> {
-  return Callers.parse(await get(a, `/symbols/${encodeURIComponent(symbol)}/callers?limit=${limit}`));
+  return Callers.parse(await get(a, `/callers?symbol=${encodeURIComponent(symbol)}&limit=${limit}`));
 }
 
 export async function whyPath(a: ServerAccess, path: string, limit = 5): Promise<Why> {
