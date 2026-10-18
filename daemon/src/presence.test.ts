@@ -319,9 +319,10 @@ describe("two daemons sharing one replica id (a copied checkout)", () => {
     await b.publish(true);
     a.keepalive();
     b.keepalive();
+    // Wait for the clash to be noticed rather than a fixed time: CI machines are slow.
+    await waitFor(() => logs.some((l) => l.includes(`another process writes this worktree's replica id ${replica}`)));
     await new Promise((resolve) => setTimeout(resolve, 300));
     expect(relayed).toBeLessThanOrEqual(4); // their own writes only, no exchange of rewrites
-    expect(logs.some((l) => l.includes(`another process writes this worktree's replica id ${replica}`))).toBe(true);
 
     a.leave();
     await waitFor(() => doc[replica]?.author.agent === "agent-b" && doc[replica]?.state !== "gone");
