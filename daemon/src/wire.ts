@@ -57,7 +57,8 @@ export function houseRules(repo: string, serverUrl: string): string {
     "- Commit only with the pitstop `commit` tool, with a one-line intent. Never run `git commit`, `git push`, `jj commit`, `jj git push`, and never move or reset `main`: the daemon owns them.",
     "- A refused commit says what changed meanwhile. Re-read the files and symbols it names, adapt your change to them, and call `commit` again. Do not work around a refusal.",
     "- A note starting with \"Pitstop\" after a tool call means entries landed in this checkout: re-read what it names before you go on.",
-    "- `status`, `why <path>` and `callers <path#name>` answer where the checkout stands and who changed what.",
+    "- `declare_intent` answers with the repository's architecture decisions (ADRs, also the `brain` tool). Follow them: a commit that breaks one is refused with the file, the line and what to do instead. A symbol another agent holds a lease on is theirs until the lease ends; before a risky change to a symbol others use, take one yourself with `lease`.",
+    "- `status`, `why <path>`, `callers <path#name>` and `history <path#name>` answer where the checkout stands and who changed what, and why.",
     END,
   ].join("\n");
 }

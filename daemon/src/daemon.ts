@@ -4,10 +4,15 @@
  *
  *   GET  /status                       applied LSN, head, open intent, pending entries, agent attached
  *   POST /safe-point                   apply pending entries now; returns what was applied and notes for the agent
- *   POST /intents {text, symbols?}     declare an intent through the server; remembered for heartbeats and the commit
+ *   POST /intents {text, symbols?}     declare an intent through the server; remembered for heartbeats and the commit;
+ *                                      the answer carries the brain in brief (ADRs, leases on the declared symbols)
  *   POST /commit {intent}              commit @; 200 accepted, 409 with the server's rejection verbatim
- *   GET  /why?path=                    the entries that touched a file, latest first (from GET /log)
- *   GET  /callers?symbol=              the entries that read or changed a symbol (from GET /log)
+ *   GET  /brain                        the repository's brain: version, ADRs, leases, open intents (one line each)
+ *   POST /lease {symbol, reason?, ttlSeconds?, release?}
+ *                                      take (or release) a lease on one symbol for the open intent; 409 when held
+ *   GET  /history?symbol=              every change to a symbol, with intents (the server's query API)
+ *   GET  /why?path=                    the entries that touched a file, latest first (the server's query API)
+ *   GET  /callers?symbol=              the entries that read a symbol, and those that changed it (the server's query API)
  *   GET  /presence                     who is working in the repository right now (presence.ts)
  *
  * The port is written to .pitstop/daemon.json so the tools find it. Safe points: once an agent has
@@ -19,14 +24,29 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import type { AddressInfo } from "node:net";
 import { join } from "node:path";
 import { z } from "zod";
-import { Changeset, DEFAULT_REPO, type Author, type Intent, type SymbolId } from "@pitstop/protocol";
+import { Changeset, DEFAULT_REPO, type Author, type Intent, type Lease, type SymbolId } from "@pitstop/protocol";
+import {
+  adrLine,
+  brainBrief,
+  brainLines,
+  clock,
+  fetchBrain,
+  releaseLease,
+  symbolCallers,
+  symbolHistory,
+  takeLease,
+  whyPath,
+  type History,
+  type LeaseAnswer,
+  type ServerAccess,
+} from "./brain.js";
 import { commit, CommitRejected } from "./commit.js";
 import { serverHeaders, streamUrl } from "./config.js";
 import { declareIntent } from "./intents.js";
 import type { Applier } from "./jj.js";
 import { Presence, type PresenceIntent } from "./presence.js";
 import { readState, STATE_DIR, stateDir } from "./state.js";
-import { StreamClient, type Applied, type Warning } from "./stream.js";
+import { StreamClient, type Applied, type BrainChange, type Warning } from "./stream.js";
 import { hasTsProject, symbolSets, type SymbolSets } from "./symbols.js";
 
 export const DAEMON_FILE = "daemon.json";
@@ -96,6 +116,15 @@ export interface Status {
 
 const IntentBody = z.object({ text: z.string().min(1), symbols: z.array(z.string()).optional() });
 const CommitBody = z.object({ intent: z.string().min(1) });
+const LeaseBody = z.object({
+  symbol: z.string().regex(/^[^#]+#.+$/, "expected path#qualified.name"),
+  reason: z.string().optional(),
+  ttlSeconds: z.number().int().positive().optional(),
+  release: z.boolean().optional(),
+});
+
+/** An intent as `POST /intents` answers it: the server's, with the brain in brief for the agent. */
+export type DeclaredIntent = Intent & { brief: string[] };
 
 export class Daemon {
   readonly stream: StreamClient;
@@ -104,6 +133,9 @@ export class Daemon {
   private http: Server | undefined;
   private attachedUntil = 0;
   private warnings: Warning[] = [];
+  /** Brain changes and lease events since the last safe point, for its notes. */
+  private brainChanges: BrainChange[] = [];
+  private leaseEvents: Lease[] = [];
   private readonly intents = new Map<string, Intent>();
   private declared: Intent | undefined;
   port = 0;
@@ -130,6 +162,12 @@ export class Daemon {
       onPresence: (m) => this.presence.receive(m.repo, m.entries),
       onHeartbeat: () => void this.presence.keepalive(),
       onApplied: () => this.presence.bump(),
+      onBrain: (change) => {
+        this.brainChanges.push(change);
+      },
+      onLease: (lease) => {
+        this.leaseEvents.push(lease);
+      },
       ...(opts.onError === undefined ? {} : { onError: opts.onError }),
     });
     this.presence = new Presence({
@@ -215,7 +253,29 @@ export class Daemon {
     };
   }
 
-  async declare(text: string, symbols: SymbolId[] = []): Promise<Intent> {
+  /** Where the server's brain and query API are, for brain.ts. */
+  private get server(): ServerAccess {
+    return {
+      serverUrl: this.opts.serverUrl,
+      ...(this.opts.token === undefined ? {} : { token: this.opts.token }),
+      ...(this.opts.repo === undefined ? {} : { repo: this.opts.repo }),
+      ...(this.opts.fetch === undefined ? {} : { fetch: this.opts.fetch }),
+    };
+  }
+
+  /** Opens the intent, then gives the agent the brain in brief (an unreachable brain leaves it out, never fails the intent). */
+  async declare(text: string, symbols: SymbolId[] = []): Promise<DeclaredIntent> {
+    const intent = await this.open(text, symbols);
+    let brief: string[] = [];
+    try {
+      brief = brainBrief(await fetchBrain(this.server), intent.declaredSymbols, this.opts.author);
+    } catch (err) {
+      this.opts.log?.(`brain unavailable: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    return { ...intent, brief };
+  }
+
+  private async open(text: string, symbols: SymbolId[]): Promise<Intent> {
     const intent = await declareIntent({
       serverUrl: this.opts.serverUrl,
       ...(this.opts.token === undefined ? {} : { token: this.opts.token }),
@@ -268,31 +328,62 @@ export class Daemon {
     return z.array(Changeset).parse(await res.json());
   }
 
-  /** The entries that touched a path, latest first. */
+  /** The entries that touched a path, latest first (`GET /repos/:o/:n/why`). */
   async why(path: string, limit = 5): Promise<WhyEntry[]> {
-    const entries = await this.log();
-    return entries
-      .filter((e) => e.files.some((f) => f.path === path || f.fromPath === path))
-      .sort((a, b) => b.lsn - a.lsn)
-      .slice(0, limit)
-      .map((e) => ({
-        lsn: e.lsn,
-        intent: e.intent,
-        agent: e.author.agent,
-        op: e.files.find((f) => f.path === path || f.fromPath === path)?.op ?? "modify",
-        createdAt: e.createdAt,
-        repairs: e.repairs.map((r) => r.summary),
-      }));
+    const answer = await whyPath(this.server, path, limit);
+    return answer.entries.map((e) => ({
+      lsn: e.lsn,
+      intent: e.intent,
+      ...(e.intentId === undefined ? {} : { intentId: e.intentId }),
+      agent: e.author.agent,
+      op: e.op,
+      createdAt: e.createdAt,
+      brainVersion: e.brainVersion,
+      repairs: e.repairs,
+    }));
   }
 
-  /** The entries that read a symbol (its callers in the log's eyes) and the ones that changed it. */
-  async callers(symbol: SymbolId): Promise<{ readers: Ref[]; writers: Ref[] }> {
-    const entries = await this.log();
-    const ref = (e: Changeset): Ref => ({ lsn: e.lsn, intent: e.intent, agent: e.author.agent, files: e.files.map((f) => f.path) });
+  /**
+   * The entries that read a symbol (its callers as far as the log knows: read sets, not a parsed
+   * call graph), with what they wrote, and the ones that changed it.
+   */
+  async callers(symbol: SymbolId): Promise<{ readers: Ref[]; writers: Ref[]; note: string }> {
+    const [callers, history] = await Promise.all([symbolCallers(this.server, symbol), symbolHistory(this.server, symbol)]);
+    const ref = (e: { lsn: number; intent: string; author: Author; files: { path: string }[] }): Ref => ({
+      lsn: e.lsn,
+      intent: e.intent,
+      agent: e.author.agent,
+      files: e.files.map((f) => f.path),
+    });
     return {
-      readers: entries.filter((e) => e.readSet.includes(symbol)).map(ref),
-      writers: entries.filter((e) => e.writeSet.includes(symbol) || e.sigWriteSet.includes(symbol)).map(ref),
+      readers: callers.callers.map((e) => ({ ...ref(e), wrote: e.wrote })),
+      writers: history.history.map(ref),
+      note: callers.derivedFrom,
     };
+  }
+
+  /** Every change to a symbol, newest first, with the intents behind them; who declared it; its lease. */
+  async history(symbol: SymbolId): Promise<History> {
+    return symbolHistory(this.server, symbol);
+  }
+
+  /** The repository's brain, one line per ADR, lease and open intent. */
+  async brain(): Promise<{ version: number; lines: string[] }> {
+    const brain = await fetchBrain(this.server);
+    return { version: brain.version, lines: brainLines(brain, this.opts.author) };
+  }
+
+  /** Takes (or renews) a lease for this agent's open intent, or releases its own. */
+  async lease(symbol: SymbolId, opts: { reason?: string | undefined; ttlSeconds?: number | undefined; release?: boolean | undefined } = {}): Promise<LeaseAnswer> {
+    if (opts.release === true) return releaseLease(this.server, symbol, this.opts.author);
+    const { intentId } = await readState(this.opts.worktree);
+    return takeLease(this.server, {
+      symbol,
+      holder: this.opts.author,
+      ...(opts.reason === undefined ? {} : { reason: opts.reason }),
+      ...(opts.ttlSeconds === undefined ? {} : { ttlSeconds: opts.ttlSeconds }),
+      ...(intentId === undefined ? {} : { intentId }),
+    });
   }
 
   /** One line per thing the agent should know after a safe point. */
@@ -301,12 +392,20 @@ export class Daemon {
     const mine = this.warnings.filter((w) => w.agent === this.opts.author.agent);
     this.warnings = [];
     for (const w of mine) notes.push(`warning: ${w.message}`);
+    // The brain changed: a rule the next commit answers to, or one that no longer applies.
+    for (const { version, adr } of this.brainChanges.splice(0)) {
+      if (adr.status === "accepted") notes.push(`brain v${version}: ADR-${adr.number} accepted: ${adrLine(adr).slice(`ADR-${adr.number} `.length)}`);
+      else if (adr.status === "superseded") notes.push(`brain v${version}: ADR-${adr.number} superseded: ${adr.title} no longer applies`);
+    }
+    let editing: Set<string> | undefined;
+    const editingNow = async (): Promise<Set<string>> => (editing ??= new Set((await this.opts.applier.diffAgainstMain()).map((f) => f.path)));
+    notes.push(...(await this.leaseNotes(editingNow)));
     if (applied.length === 0) return notes;
 
-    const editing = new Set((await this.opts.applier.diffAgainstMain()).map((f) => f.path));
-    this.presence.setFiles(editing); // presence's next publish uses this diff instead of running its own
+    const editingFiles = await editingNow();
+    this.presence.setFiles(editingFiles); // presence's next publish uses this diff instead of running its own
     let sets: SymbolSets | undefined;
-    if (editing.size > 0) {
+    if (editingFiles.size > 0) {
       const after = await this.opts.applier.treeFiles("@");
       if (hasTsProject(after)) sets = symbolSets(await this.opts.applier.treeFiles("main"), after, this.opts.worktree);
     }
@@ -315,7 +414,7 @@ export class Daemon {
       const signature = new Set(e.sigWriteSet);
       const written = sets?.writeSet.filter((s) => changed.has(s)) ?? [];
       const read = sets?.readSet.filter((s) => changed.has(s) && !written.includes(s)) ?? [];
-      const touched = e.files.map((f) => f.path).filter((p) => editing.has(p));
+      const touched = e.files.map((f) => f.path).filter((p) => editingFiles.has(p));
       const parts: string[] = [];
       if (written.length > 0) parts.push(`changed ${written.join(", ")}, which you also changed`);
       if (read.length > 0) {
@@ -331,6 +430,34 @@ export class Daemon {
       } else if (result.conflicted.length > 0) {
         notes.push(`#${e.lsn} left conflicts in your working copy (jj resolve --list): resolve them before you commit`);
       }
+    }
+    return notes;
+  }
+
+  /**
+   * Leases other agents took or gave up since the last safe point, on symbols this agent declared
+   * or in files it is editing; the last event per symbol.
+   */
+  private async leaseNotes(editing: () => Promise<Set<string>>): Promise<string[]> {
+    const me = this.opts.author;
+    const latest = new Map<string, Lease>();
+    for (const lease of this.leaseEvents.splice(0)) {
+      if (lease.holder.developer === me.developer && lease.holder.agent === me.agent) continue;
+      latest.set(lease.symbol, lease);
+    }
+    if (latest.size === 0) return [];
+    const declared = new Set(this.declared?.declaredSymbols ?? []);
+    const files = await editing();
+    const notes: string[] = [];
+    for (const lease of latest.values()) {
+      const file = lease.symbol.slice(0, lease.symbol.indexOf("#"));
+      if (!declared.has(lease.symbol) && !files.has(file)) continue;
+      const who = `${lease.holder.agent} (${lease.holder.developer})`;
+      notes.push(
+        lease.status === "held"
+          ? `lease: ${who} holds ${lease.symbol} until ${clock(lease.expiresAt)}${lease.reason ? ` (${lease.reason})` : ""}; a commit of yours that changes it is refused until then, so leave it alone or wait`
+          : `lease: ${lease.symbol} is free again (${who}'s lease ${lease.status})`,
+      );
     }
     return notes;
   }
@@ -362,6 +489,19 @@ export class Daemon {
         return json(res, 200, await this.callers(symbol));
       }
       if (req.method === "GET" && url.pathname === "/presence") return json(res, 200, this.presence.view());
+      if (req.method === "GET" && url.pathname === "/history") {
+        const symbol = url.searchParams.get("symbol");
+        if (!symbol) return json(res, 400, { error: "expected ?symbol=" });
+        return json(res, 200, await this.history(symbol));
+      }
+      if (req.method === "GET" && url.pathname === "/brain") return json(res, 200, await this.brain());
+      if (req.method === "POST" && url.pathname === "/lease") {
+        const body = LeaseBody.safeParse(await readJson(req));
+        if (!body.success) return json(res, 400, { error: "expected {symbol: path#name, reason?, ttlSeconds?, release?}" });
+        const { symbol, ...rest } = body.data;
+        const answer = await this.lease(symbol, rest);
+        return json(res, answer.status === "refused" ? 409 : 200, answer);
+      }
       return json(res, 404, { error: "not_found" });
     } catch (err) {
       const message = err instanceof Error ? (err.stack ?? err.message) : String(err);
@@ -374,9 +514,12 @@ export class Daemon {
 export interface WhyEntry {
   lsn: number;
   intent: string;
+  intentId?: string;
   agent: string;
   op: string;
   createdAt: string;
+  /** The brain version the entry was validated against. */
+  brainVersion?: number;
   repairs: string[];
 }
 
@@ -385,6 +528,8 @@ export interface Ref {
   intent: string;
   agent: string;
   files: string[];
+  /** For a reader: the symbols its change wrote. */
+  wrote?: string[];
 }
 
 const json = (res: ServerResponse, status: number, body: unknown) => {

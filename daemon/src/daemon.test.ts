@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, onTestFailed } from "vitest";
-import { type Author, type ServerMessage } from "@pitstop/protocol";
+import { type Adr, type Author, type Lease, type ServerMessage } from "@pitstop/protocol";
 import { Daemon, readDaemonInfo, type SafePointResult, type Status } from "./daemon.js";
 import { startFakeServer, type FakeServer } from "./fake-server.js";
 import { LocalClient, NoDaemon } from "./local-client.js";
@@ -212,14 +212,118 @@ describe("daemon with its local API", () => {
         agent: "agent-b",
         op: "modify",
         createdAt: "2026-10-17T14:20:05Z",
+        brainVersion: 37, // the fixture entry's
         repairs: ["Added null check: redirect to login when the session has expired"],
       },
     ]);
     expect((await api("GET", "/why?path=nope.ts")).body).toEqual([]);
     const callers = await api("GET", `/callers?symbol=${encodeURIComponent("src/auth/session.ts#getCurrentUser")}`);
-    expect(callers.body).toMatchObject({ readers: [{ lsn: 122, agent: "agent-b" }], writers: [] });
+    expect(callers.body).toMatchObject({
+      readers: [{ lsn: 122, agent: "agent-b", wrote: ["src/pages/ProfilePage.tsx#ProfilePage"] }],
+      writers: [],
+      note: expect.stringMatching(/not a parsed call graph/),
+    });
     expect((await api("GET", "/callers")).status).toBe(400);
     expect((await api("GET", "/nothing")).status).toBe(404);
+  });
+
+  describe("the brain", () => {
+    const symbol = "src/auth/session.ts#getCurrentUser";
+    const adr: Adr = {
+      repo: "local/default",
+      number: 1,
+      title: "Pages never touch the database",
+      status: "accepted",
+      decision: "Pages read data through src/services.",
+      reason: "",
+      consequences: "",
+      rules: [{ kind: "forbid_import", files: "src/pages/**", target: "src/db/**" }],
+      version: 1,
+      createdBy: "vazovski37",
+      createdAt: "2026-10-18T03:00:00Z",
+    };
+    const leaseOf = (holder: Author, sym = symbol, extra: Partial<Lease> = {}): Lease => ({
+      repo: "local/default",
+      symbol: sym,
+      holder,
+      reason: "changing its return type",
+      status: "held",
+      expiresAt: "2026-10-18T03:15:00.000Z",
+      createdAt: "2026-10-18T03:05:00.000Z",
+      ...extra,
+    });
+    const agentA: Author = { developer: "vazovski", agent: "agent-a" };
+
+    it("gives the agent the brain in brief when it declares an intent: the ADRs, and leases others hold on its symbols", async () => {
+      await start(fixtureMessages(), 122);
+      server.setBrain({ version: 1, adrs: [adr, { ...adr, number: 2, status: "proposed", title: "Not yet" }] });
+      server.leases.set(symbol, leaseOf(agentA));
+      server.leases.set("src/other.ts#x", leaseOf(agentA, "src/other.ts#x"));
+      const declared = await api("POST", "/intents", { text: "Show last-seen", symbols: [symbol] });
+      expect(declared.status).toBe(201);
+      expect((declared.body as { brief: string[] }).brief).toEqual([
+        "Brain v1: a commit that breaks one of these rules is refused.",
+        "ADR-1 Pages never touch the database: Pages read data through src/services. Rules: forbid_import src/pages/** -> src/db/**.",
+        `Leased by another agent (your commit writing it is refused until it is released or expires): ${symbol} leased to agent-a (vazovski) until 03:15Z: changing its return type.`,
+      ]);
+      server.setBrain({ version: 0, adrs: [] });
+      server.leases.clear();
+      expect(((await api("POST", "/intents", { text: "again" })).body as { brief: string[] }).brief).toEqual(["Brain v0: no accepted ADRs."]);
+    });
+
+    it("notes at a safe point an ADR accepted or superseded, and leases taken or released on the agent's symbols", async () => {
+      await start(fixtureMessages(), 122);
+      await api("POST", "/intents", { text: "Show last-seen", symbols: [symbol] });
+      await safePoint(); // attaches; the fixture's warning goes out with it
+      applier.files = [{ path: "src/pages/ProfilePage.tsx", op: "modify", content: "x" }];
+      server.broadcast({ type: "brain", repo: "local/default", version: 1, adr });
+      server.broadcast({ type: "brain", repo: "local/default", version: 1, adr: { ...adr, number: 2, status: "proposed" } });
+      server.broadcast({ type: "lease", lease: leaseOf(agentA) });
+      server.broadcast({ type: "lease", lease: leaseOf(agentA, "src/pages/ProfilePage.tsx#ProfilePage", { reason: "" }) });
+      server.broadcast({ type: "lease", lease: leaseOf(agentA, "src/elsewhere.ts#e") });
+      server.broadcast({ type: "lease", lease: leaseOf(author, "src/pages/ProfilePage.tsx#Mine") });
+      server.broadcast({ type: "brain", repo: "local/default", version: 2, adr: { ...adr, status: "superseded", version: 2 } });
+      await waitFor(() => log.filter((l) => l.startsWith("brain v") || l.startsWith("lease on")).length === 7);
+      expect((await safePoint()).notes).toEqual([
+        "brain v1: ADR-1 accepted: Pages never touch the database: Pages read data through src/services. Rules: forbid_import src/pages/** -> src/db/**.",
+        "brain v2: ADR-1 superseded: Pages never touch the database no longer applies",
+        `lease: agent-a (vazovski) holds ${symbol} until 03:15Z (changing its return type); a commit of yours that changes it is refused until then, so leave it alone or wait`,
+        "lease: agent-a (vazovski) holds src/pages/ProfilePage.tsx#ProfilePage until 03:15Z; a commit of yours that changes it is refused until then, so leave it alone or wait",
+      ]);
+      server.broadcast({ type: "lease", lease: leaseOf(agentA, symbol, { status: "released" }) });
+      await waitFor(() => log.filter((l) => l.startsWith("lease on")).length === 5);
+      expect((await safePoint()).notes).toEqual([`lease: ${symbol} is free again (agent-a (vazovski)'s lease released)`]);
+      expect((await safePoint()).notes).toEqual([]);
+    });
+
+    it("takes and releases a lease for the open intent, and answers the brain and a symbol's history from the server", async () => {
+      await start(fixtureMessages(), 122);
+      await waitFor(() => applier.lsns.length === 0 && log.some((l) => l.includes("is at #")));
+      await writeState(worktree, { appliedLsn: 122, intentId: "int_07" });
+      const taken = await api("POST", "/lease", { symbol: "src/pages/ProfilePage.tsx#ProfilePage", reason: "reshaping it" });
+      expect(taken).toMatchObject({ status: 200, body: { status: "held", renewed: false, lease: { holder: author, intentId: "int_07", reason: "reshaping it" } } });
+      expect((taken.body as { message: string }).message).toMatch(/^src\/pages\/ProfilePage\.tsx#ProfilePage is yours until \d\d:\d\dZ$/);
+      server.leases.set(symbol, leaseOf(agentA));
+      const refused = await api("POST", "/lease", { symbol });
+      expect(refused).toMatchObject({ status: 409, body: { status: "refused", lease: { holder: agentA } } });
+      expect((refused.body as { message: string }).message).toMatch(/is leased to agent-a \(vazovski\)/);
+      expect(await api("POST", "/lease", { symbol, release: true })).toMatchObject({ status: 409, body: { status: "refused" } });
+      expect(await api("POST", "/lease", { symbol: "src/pages/ProfilePage.tsx#ProfilePage", release: true })).toMatchObject({ status: 200, body: { status: "released" } });
+      expect((await api("POST", "/lease", { symbol: "no-hash" })).status).toBe(400);
+
+      server.setBrain({ version: 1, adrs: [adr] });
+      expect((await api("GET", "/brain")).body).toEqual({
+        version: 1,
+        lines: [
+          "Brain v1 of local/default: 1 accepted ADR, 1 live lease, 0 open intents.",
+          "ADR-1 Pages never touch the database: Pages read data through src/services. Rules: forbid_import src/pages/** -> src/db/**.",
+          `Lease: ${symbol} leased to agent-a (vazovski) until 03:15Z: changing its return type`,
+        ],
+      });
+      const history = await api("GET", `/history?symbol=${encodeURIComponent("src/pages/ProfilePage.tsx#ProfilePage")}`);
+      expect(history.body).toMatchObject({ symbol: "src/pages/ProfilePage.tsx#ProfilePage", history: [{ lsn: 122, intent: "Show last-seen time on ProfilePage", signature: false }], declaredBy: [] });
+      expect((await api("GET", "/history")).status).toBe(400);
+    });
   });
 
   it("is reachable through LocalClient and the CLI's safe-point command", async () => {

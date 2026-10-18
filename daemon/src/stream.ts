@@ -1,10 +1,11 @@
 import WebSocket from "ws";
-import { ServerMessage, type Changeset, type ClientMessage, type Intent } from "@pitstop/protocol";
+import { ServerMessage, type Changeset, type ClientMessage, type Intent, type Lease } from "@pitstop/protocol";
 import type { Applier, ApplyResult } from "./jj.js";
 import { describe } from "./messages.js";
 import { readState, withWorktreeLock, writeState } from "./state.js";
 
 export type Warning = Extract<ServerMessage, { type: "warning" }>;
+export type BrainChange = Extract<ServerMessage, { type: "brain" }>;
 
 export interface StreamOptions {
   /** The server's `/stream` endpoint, `ws://` or `wss://`. */
@@ -36,6 +37,10 @@ export interface StreamOptions {
   onPresence?: (message: Extract<ServerMessage, { type: "presence" }>) => void;
   /** A periodic heartbeat went out (presence.ts sends its keepalive along). */
   onHeartbeat?: () => void;
+  /** An ADR was proposed, accepted, superseded or rejected (design doc 9.2). */
+  onBrain?: (change: BrainChange) => void;
+  /** A lease was granted, renewed, released or expired (9.4). */
+  onLease?: (lease: Lease) => void;
   /** An apply failed, or the log keeps skipping the next LSN: the daemon has stopped and closed the connection. */
   onError?: (err: unknown) => void;
 }
@@ -162,6 +167,14 @@ export class StreamClient {
       case "intent":
         this.log(describe(message));
         this.opts.onIntent?.(message.intent);
+        break;
+      case "brain":
+        this.log(describe(message));
+        this.opts.onBrain?.(message);
+        break;
+      case "lease":
+        this.log(describe(message));
+        this.opts.onLease?.(message.lease);
         break;
     }
   }
