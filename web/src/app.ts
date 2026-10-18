@@ -1165,7 +1165,7 @@ async function invite(ev: SubmitEvent, repo: string): Promise<void> {
 // --- the prompt that sets up a developer's Claude ------------------------------------------------
 
 /** What the developer pastes into Claude Code: install, connect a checkout, wire the tools, start the daemon. */
-function promptText(repo: string, secret: string, empty: boolean): string {
+function promptText(repo: string, secret: string, empty: boolean, agent: string): string {
   const server = location.origin;
   const where = empty
     ? "This repository is empty, so it starts from code I already have. Ask me where my project is (a git checkout on the branch main), go to that folder, and run:"
@@ -1181,7 +1181,7 @@ function promptText(repo: string, secret: string, empty: boolean): string {
     "   - Linux: Node.js and git from the package manager; jj from https://github.com/jj-vcs/jj/releases",
     `2. Install the Pitstop client: npm install -g ${server}/pitstop-cli.tgz`,
     `3. ${where}`,
-    `   pitstop setup ${server} ${repo} --token ${secret}`,
+    `   ${setupCommand(repo, secret, agent)}`,
     "4. Read the CLAUDE.local.md that setup writes in the checkout and follow it from now on. Then tell me to open Claude Code in that checkout, so the pitstop tools load.",
     "",
     "The token is mine: keep it out of files you commit and out of anything you share.",
@@ -1191,9 +1191,54 @@ function promptText(repo: string, secret: string, empty: boolean): string {
 /**
  * The Set up Claude texts in full (what the Copy buttons copy) and the personal token in them. On
  * screen the token is masked unless the person asks to see it, so a screen recording or a shared
- * screen does not publish a working token.
+ * screen does not publish a working token. `repo`, `empty` and `shown` are what the texts are
+ * written again from when the agent name changes.
  */
-const setupText = { prompt: "", manual: "", secret: "", revealed: false };
+const setupText = { prompt: "", manual: "", secret: "", revealed: false, repo: "", empty: false, shown: false };
+
+/** The setup line; `--agent` names this checkout's agent on the Live tab and in other agents' warnings. */
+const setupCommand = (repo: string, secret: string, agent: string): string =>
+  `pitstop setup ${location.origin} ${repo} --token ${secret}${agent === "" ? "" : ` --agent ${agent}`}`;
+
+/**
+ * An agent name as setup takes it: lowercase letters, digits, dots, dashes and underscores (what
+ * setup's own default allows), so it is safe on any shell's command line.
+ */
+const agentSlug = (name: string): string =>
+  name
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 64);
+
+/**
+ * The agent name field. Without one, setup names the agent `<os user>-claude`, so two checkouts of
+ * one person share a name and each other's warnings. Setup tokens are named `claude <repo>
+ * <agent>`, so `taken` holds the names this person already gave this repository's checkouts, and
+ * the default is the first free one of `<login>-claude`, `<login>-claude-2`, … `auto` is true
+ * while the field holds that default rather than a name someone typed.
+ */
+const setupAgent = { taken: new Set<string>(), auto: true };
+const setupTokenName = (repo: string): string => `claude ${repo}`;
+
+function nextAgentName(): string {
+  const base = `${agentSlug(session.me?.login ?? "") || "dev"}-claude`;
+  for (let n = 1; ; n++) {
+    const name = n === 1 ? base : `${base}-${n}`;
+    if (!setupAgent.taken.has(name)) return name;
+  }
+}
+
+const agentName = (): string => agentSlug($<HTMLInputElement>("setup-agent").value);
+
+/** Writes the prompt (once there is one) and the commands again, with the agent name as it is now. */
+function writeSetupTexts(): void {
+  const agent = agentName();
+  if (setupText.shown) setupText.prompt = promptText(setupText.repo, setupText.secret || "<your personal token: sign in, then Account>", setupText.empty, agent);
+  setupText.manual = [`npm install -g ${location.origin}/pitstop-cli.tgz`, setupCommand(setupText.repo, setupText.secret || "<your personal token>", agent)].join("\n");
+  renderSetupText();
+}
 
 const masked = (text: string): string =>
   setupText.secret === "" || setupText.revealed ? text : text.split(setupText.secret).join(`${setupText.secret.slice(0, 8)}…`);
@@ -1208,33 +1253,39 @@ function renderSetupText(): void {
   }
 }
 
-/** The same setup for someone who prefers a terminal: install the client, then `pitstop setup`. */
-function renderManual(repo: string, secret?: string): void {
-  const server = location.origin;
-  setupText.manual = [`npm install -g ${server}/pitstop-cli.tgz`, `pitstop setup ${server} ${repo} --token ${secret ?? "<your personal token>"}`].join("\n");
-  renderSetupText();
-}
-
 async function renderSetup(repo: string): Promise<void> {
   $("setup-repo").textContent = repo;
   $("prompt-box").hidden = true;
   $("prompt-warning").hidden = true;
-  setupText.prompt = "";
-  setupText.secret = "";
-  setupText.revealed = false;
+  Object.assign(setupText, { prompt: "", secret: "", revealed: false, repo, empty: false, shown: false });
   say("setup-msg", "", true);
-  renderManual(repo);
+  // The agent name: this person's next free default, or empty (setup's own default) without an account.
+  const field = $<HTMLInputElement>("setup-agent");
+  setupAgent.taken = new Set();
+  setupAgent.auto = session.me !== undefined;
+  field.value = setupAgent.auto ? nextAgentName() : "";
+  writeSetupTexts(); // the commands, until there is a token
   const button = $<HTMLButtonElement>("make-prompt");
   button.textContent = "Create a token and write the prompt";
   $("setup-state").textContent = "";
-  const info = await call<Repo>("GET", `/repos/${repo}`);
+  const [info, tokens] = await Promise.all([
+    call<Repo>("GET", `/repos/${repo}`),
+    session.me === undefined ? Promise.resolve(undefined) : api<TokenRow[]>("/tokens"),
+  ]);
   if (!showing(repo, "setup")) return;
+  const prefix = `${setupTokenName(repo)} `;
+  for (const t of tokens ?? []) if (t.revokedAt === undefined && t.name.startsWith(prefix)) setupAgent.taken.add(t.name.slice(prefix.length));
+  if (setupAgent.auto) {
+    field.value = nextAgentName();
+    writeSetupTexts();
+  }
   if (info.status !== 200 || info.body === undefined) {
     button.hidden = true;
     say("setup-msg", messageOf(info.body, info.status === 401 ? "Sign in to set up this repository." : `the server answered ${info.status}`), false);
     return;
   }
   const empty = info.body.headLsn === 0;
+  setupText.empty = empty;
   $("setup-state").textContent = empty
     ? "This repository is empty: the first setup imports the code from your existing checkout as entry #1."
     : `This repository has ${plural(info.body.headLsn, "entry", "entries")}: setup builds a fresh checkout from them and keeps it in sync.`;
@@ -1243,32 +1294,36 @@ async function renderSetup(repo: string): Promise<void> {
 }
 
 async function makePrompt(repo: string, empty: boolean): Promise<void> {
+  setupText.empty = empty;
   if (session.me === undefined) {
     // The administrator's shared token must never travel in a prompt.
     setupText.secret = "";
     $("prompt-warning").hidden = true;
-    showPrompt(promptText(repo, "<your personal token: sign in, then Account>", empty));
+    showPrompt();
     say("setup-msg", "Sign in with GitHub to get a personal token for this prompt.", false);
     return;
   }
-  const made = await call<{ secret: string }>("POST", "/tokens", { name: `claude ${repo}`.slice(0, 80) });
+  // Another token is for another checkout: a default name already given moves on to the next one.
+  if (setupAgent.auto && setupAgent.taken.has(agentName())) $<HTMLInputElement>("setup-agent").value = nextAgentName();
+  const agent = agentName();
+  const made = await call<{ secret: string }>("POST", "/tokens", { name: `${setupTokenName(repo)}${agent === "" ? "" : ` ${agent}`}`.slice(0, 80) });
   if (made.status !== 201 || made.body === undefined) {
     toast(messageOf(made.body, `the server answered ${made.status}`), "error");
     return;
   }
+  if (agent !== "") setupAgent.taken.add(agent);
   setupText.secret = made.body.secret;
   setupText.revealed = false;
-  showPrompt(promptText(repo, made.body.secret, empty));
-  renderManual(repo, made.body.secret);
+  showPrompt();
   $("prompt-warning").hidden = false;
   say("setup-msg", "", true);
   $("make-prompt").textContent = "Create another token";
   toast("A personal token was made and the prompt is ready. Copy it into Claude Code.", "ok");
 }
 
-function showPrompt(text: string): void {
-  setupText.prompt = text;
-  renderSetupText();
+function showPrompt(): void {
+  setupText.shown = true;
+  writeSetupTexts();
   $("prompt-box").hidden = false;
 }
 
@@ -1841,6 +1896,11 @@ function setup(): void {
   $("skip-link").addEventListener("click", (ev) => {
     ev.preventDefault();
     $("content").focus();
+  });
+  // A name typed in the field is kept (no default replaces it) and goes into both texts at once.
+  $("setup-agent").addEventListener("input", () => {
+    setupAgent.auto = false;
+    writeSetupTexts();
   });
   // Copy takes the full text; the screen shows the token masked (setupText).
   $("copy-prompt").addEventListener("click", () => void copy(setupText.prompt, "Prompt", "Paste it into Claude Code."));

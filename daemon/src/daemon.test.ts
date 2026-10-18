@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, onTestFailed } from "vitest";
 import { type Adr, type Author, type Lease, type ServerMessage } from "@pitstop/protocol";
+import { withServerIdentity } from "./config.js";
 import { Daemon, NO_INTENT_FOR_LEASE, readDaemonInfo, type SafePointResult, type Status } from "./daemon.js";
 import { startFakeServer, type FakeServer } from "./fake-server.js";
 import { LocalClient, NoDaemon } from "./local-client.js";
@@ -143,7 +144,7 @@ describe("daemon with its local API", () => {
     expect(answer.body).toEqual({
       status: "rejected",
       reason: "escalated",
-      message: "commit rejected (escalated): write skew: #121 changed src/auth/session.ts#getCurrentUser (signature). Re-read at head #122 and commit again",
+      message: "write skew: #121 changed src/auth/session.ts#getCurrentUser (signature). Re-read at head #122 and commit again",
       conflictsWith: [121],
     });
     expect(applier.lsns).toEqual([]);
@@ -349,6 +350,28 @@ describe("daemon with its local API", () => {
       runningOut();
       await daemon.renewLeases();
       expect(server.leases.get(mine)?.expiresAt).toBe(soon);
+    });
+
+    it("with a personal token, is the login the server records: it knows its own lease and renews it", async () => {
+      server = await startFakeServer({ messages: fixtureMessages(), users: { pst_vaz: "vazovski37" } });
+      await writeState(worktree, { appliedLsn: 122, intentId: "int_07" });
+      // Its own word is the OS user name; the server writes the token's owner on the lease.
+      const config = await withServerIdentity({ serverUrl: server.url, token: "pst_vaz", worktree, author: { developer: "nikol", agent: "agent-a" } });
+      daemon = new Daemon({ serverUrl: server.url, token: "pst_vaz", worktree, applier, author: config.author, log: (l) => log.push(l), reconnectMs: 0, heartbeatMs: 0, attachMs: 60_000, leaseRenewMs: 0 });
+      port = await daemon.start();
+      await waitFor(() => log.some((l) => l.includes("is at #")));
+      await safePoint();
+      const mine = "src/pages/ProfilePage.tsx#ProfilePage";
+      applier.files = [{ path: "src/pages/ProfilePage.tsx", op: "modify", content: "x" }];
+      const taken = await api("POST", "/lease", { symbol: mine, reason: "reshaping it", ttlSeconds: 120 });
+      expect(taken.body).toMatchObject({ status: "held", lease: { holder: { developer: "vazovski37", agent: "agent-a" }, intentId: "int_07" } });
+      await waitFor(() => log.some((l) => l.startsWith("lease on")));
+      // Not "agent-a (vazovski37) holds …; leave it alone": it is this agent's.
+      expect((await safePoint()).notes).toEqual([]);
+      expect(((await api("GET", "/brain")).body as { lines: string[] }).lines.at(-1)).toMatch(/^Lease: src\/pages\/ProfilePage\.tsx#ProfilePage leased to agent-a \(vazovski37\) until .* \(yours\)$/);
+      server.leases.set(mine, { ...(server.leases.get(mine) as Lease), expiresAt: new Date(Date.now() + 20_000).toISOString() });
+      await daemon.renewLeases();
+      expect(Date.parse(server.leases.get(mine)?.expiresAt ?? "")).toBeGreaterThan(Date.now() + 100_000);
     });
 
     it("tells the agent when its own lease ended without its asking, or its intent went stale", async () => {

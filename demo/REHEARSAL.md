@@ -33,16 +33,13 @@ would stay empty.
    GitHub`, and that is all. Until then an invite stays `invited` and cannot be made resolver.
 2. **Tools on each laptop:** Node.js 22+, git, jj (`winget install jj-vcs.jj`, then a new
    terminal so it is on PATH), Claude Code. jj needs a name and email; setup copies them from git,
-   or stops with the two `jj config set --user …` commands to run.
-3. **The developer name, for the lease step.** The server knows each laptop by its GitHub login,
-   the daemon by the OS user name, and today the lease code compares the two. Set it once per laptop
-   so they agree, capitals included (the login exactly as the Members tab shows it): `setx PITSTOP_DEVELOPER <your GitHub login>` on Windows (new terminals pick it
-   up), or `export PITSTOP_DEVELOPER=<your GitHub login>` in the shell profile elsewhere. Without
-   it, a lease still blocks the other agent, but its holder is told the lease is someone else's and
-   the daemon does not renew it (it expires after its minutes).
-4. **Browsers.** The owner's browser is on the projector, signed in as the owner. The teammate uses
+   or stops with the two `jj config set --user …` commands to run. A client installed before this
+   sheet's fixes reached the server needs reinstalling: `pitstop version` must say `0.1.6` or later
+   (`npm install -g $S/pitstop-cli.tgz`; the setup prompt does it too). With 0.1.6 the daemon
+   asks the server who its token belongs to, so the lease step needs no `PITSTOP_DEVELOPER`.
+3. **Browsers.** The owner's browser is on the projector, signed in as the owner. The teammate uses
    their own browser (on one laptop: a second browser profile or a private window).
-5. **Run the whole sheet once, a day before.** A used repository cannot be reset or deleted (the log
+4. **Run the whole sheet once, a day before.** A used repository cannot be reset or deleted (the log
    is append-only), so each take gets its own name: `teamdb-take1`, `teamdb-take2`, … under the
    owner's login.
 
@@ -66,10 +63,11 @@ runs in.
 1. Home page, New repository: Name `teamdb-take1`, `Create repository`. Toast:
    `<owner>/teamdb-take1 is ready. Next: set up Claude.`, and the page opens the Set up Claude tab.
 2. The state line says `This repository is empty: the first setup imports the code from your
-   existing checkout as entry #1.` Press `Create a token and write the prompt`, then `Copy prompt`.
-3. In a terminal, start `claude` anywhere and paste the prompt, plus one line of your own:
-   `Use --agent agent-a on the pitstop setup line.` When Claude asks where the project is, answer
-   `C:\code\teamdb`. Approve its commands as it installs the client and runs setup.
+   existing checkout as entry #1.` In `Agent name` (it starts as `<owner>-claude`) type `agent-a`.
+   Press `Create a token and write the prompt`, then `Copy prompt`. Its setup line ends
+   `--token pst_ab12… --agent agent-a`.
+3. In a terminal, start `claude` anywhere and paste the prompt. When Claude asks where the project
+   is, answer `C:\code\teamdb`. Approve its commands as it installs the client and runs setup.
 4. Setup's last lines:
    ```
    [pitstop] imported teamdb as #1
@@ -93,9 +91,9 @@ runs in.
 1. The teammate signs in, opens the repository card on their home page, `Set up Claude` tab. Reload
    the tab if it still says the repository is empty: it must say `This repository has 1 entry: setup
    builds a fresh checkout from them and keeps it in sync.`
-2. `Create a token and write the prompt`, `Copy prompt`. In a terminal on B, `claude` in `C:\code`,
-   paste the prompt plus `Use --agent agent-b on the pitstop setup line. Then run npm ci in the
-   checkout.` Answer `C:\code` when it asks where the checkout should go.
+2. `Agent name` `agent-b`, then `Create a token and write the prompt`, `Copy prompt`. In a
+   terminal on B, `claude` in `C:\code`, paste the prompt plus `Then run npm ci in the checkout.`
+   Answer `C:\code` when it asks where the checkout should go.
 3. Setup clones: `applied #1 of 1`, then `ready: C:\code\teamdb-take1 is a checkout of
    <owner>/teamdb-take1 at #1; the agent there commits as "agent-b"`. `npm ci` installs the slice's
    tools (without it `npx tsc` fetches an unrelated package).
@@ -194,8 +192,9 @@ When A's checks pass (or type `Commit it with the pitstop commit tool.`):
 
 Type on B: `Commit now with the pitstop commit tool.`
 
-- **B's screen,** the tool result (the server's message after the tool's prefix):
-  `write skew: #2 changed src/auth/session.ts#getCurrentUser (signature). This repository's resolver (<owner>) decides on it: your commit waits as pk_… at $S/#/r/<owner>/teamdb-take1/conflicts. Do not commit this change again; at a later safe point you will be told whether it landed or what to change.`
+- **B's screen,** the tool result, the server's message with the tool's prefix once and nothing
+  added but the entry it conflicts with:
+  `Commit rejected (escalated): write skew: #2 changed src/auth/session.ts#getCurrentUser (signature). This repository's resolver (<owner>) decides on it: your commit waits as pk_… at $S/#/r/<owner>/teamdb-take1/conflicts. Do not commit this change again; at a later safe point you will be told whether it landed or what to change. Conflicts with #2.`
   To Claude Code the refusal is a failed tool, and it runs no PostToolUse hook after a failed tool, so nothing is applied yet. At B's next tool call (the agent usually re-reads a file at once; if B is idle, type on B: `Check the pitstop status tool.`) the hook applies #2 and adds, in this order: `Pitstop applied #2 to this worktree.`,
   `warning: "Show last-seen on the profile page" by <teammate> waits for <owner>: write skew, #2 changed src/auth/session.ts#getCurrentUser (signature) (pk_…)`,
   and `#2 "Fix the expired-session bug in auth" changed src/auth/session.ts#getCurrentUser (signature), which your change reads`.
@@ -206,10 +205,7 @@ Type on B: `Commit now with the pitstop commit tool.`
   page. Pitstop held it, and a person on the team decides."
 - **If it fails:** see "The commit is not held".
 
-Known today: the tool shows the prefix twice (`Commit rejected (escalated): commit rejected
-(escalated): …`) and ends with its generic advice to adapt and commit again, which contradicts the
-server's "Do not commit this change again". If B's agent commits again while it waits, the tool answers `Commit rejected (constraint_failed): commit rejected (constraint_failed): your commit "Show last-seen on the profile page" (pk_…) is waiting for this repository's resolver; you will be told at a safe point whether it landed or what to change Those entries have been applied to your worktree where possible; re-read the files named above, adapt your change, and commit again.` (no period before `Those`): this refusal also ends by telling it to commit again, so it may keep trying. Type on B: `Wait:
-the resolver decides. Do not commit until Pitstop tells you.`
+If B's agent commits again while it waits, the tool answers `Commit rejected (constraint_failed): your commit "Show last-seen on the profile page" (pk_…) is waiting for this repository's resolver; you will be told at a safe point whether it landed or what to change.` and nothing more. Should it keep trying anyway, type on B: `Wait: the resolver decides. Do not commit until Pitstop tells you.`
 
 ### 5:00 The owner decides on the Conflicts tab
 
@@ -349,14 +345,18 @@ the plain escalation, adapts and commits again. Narrate it mirrored rather than 
 **The note never arrives on B.** Notes and warnings reach an agent only at its next tool call. Type
 anything on B that makes it call a tool (`Check the pitstop status tool.`).
 
-**Both agents have the same name** (`<os user>-claude`): setup ran without `--agent`. Run setup
-again in the checkout with `--agent agent-b` (it needs the token again: `--token` or
-`PITSTOP_TOKEN`); it restarts the daemon (`stopped the daemon (pid N) to start it with the new
-settings`). With the same name, each agent also receives the other's warnings.
+**Both agents have the same name**: both prompts carried the same `Agent name`, or one was copied
+before the field existed (then setup's default, `<os user>-claude`). Run setup again in the
+checkout with `--agent agent-b` (it needs the token again: `--token` or `PITSTOP_TOKEN`); it
+restarts the daemon (`stopped the daemon (pid N) to start it with the new settings`). With the
+same name, each agent also receives the other's warnings.
 
 **The lease holder is told its own lease is another agent's** (`lease: agent-a (<owner>) holds …;
-a commit of yours that changes it is refused until then`): `PITSTOP_DEVELOPER` is not the GitHub
-login on that laptop (see "Before the day"). The lease still blocks B; it is just not renewed.
+a commit of yours that changes it is refused until then`): that laptop's client is older than
+0.1.6 (`pitstop version`), which compared leases with the OS user name. Reinstall it
+(`npm install -g $S/pitstop-cli.tgz`), then `pitstop stop` and `pitstop start` in the checkout;
+`.pitstop/daemon.log` then says `as agent-a (<owner>)`. The lease still blocks B meanwhile; it is
+just not renewed.
 
 **Setup refuses laptop A's folder** (`… has changes that are not committed to main …`, then the files): something changed after `reset.sh`. Run
 `reset.sh` again. Setup also refuses a folder already set up for another repository: use a fresh
@@ -411,14 +411,6 @@ agent (the plain escalation); nothing waits on a Conflicts tab.
 
 ## Known issues, worth fixing before the day
 
-- The commit tool shows refusals with the prefix twice (`Commit rejected (X): commit rejected (X):`)
-  and appends advice that does not fit every refusal: "adapt and commit again" after a held commit
-  that says "Do not commit this change again", and "Those entries have been applied to your
-  worktree" after an ADR or lease refusal (`mcp/src/tools.ts`, `daemon/src/commit.ts`).
-- The daemon compares lease holders with the OS user name while the server records the GitHub login,
-  so with a personal token a holder does not recognise or renew its own lease unless
-  `PITSTOP_DEVELOPER` is the login (`daemon/src/daemon.ts`, `config.ts`).
-- The setup prompt on the website has no `--agent`, so two checkouts of one OS user share a name.
 - ADR and lease refusals reach only the committer; the Live tab shows write skew but not those.
 - After `Let it through`, B's Who's here row keeps its old intent until B declares or commits again.
 - The import's intent is `import <folder name>`; setup takes no message for it.

@@ -169,6 +169,25 @@ describe("pitstop setup against a fake server", { timeout: 30_000 }, () => {
     expect(starts.at(-1)?.env).toMatchObject({ PITSTOP_TOKEN: "t2", PITSTOP_AGENT: "laptop-b" });
   });
 
+  it.skipIf(!hasGit)("records the login the server knows a personal token by, and only with that token", async () => {
+    server = await startFakeServer({ messages: oneEntry, repos: ["team/app"], token: "shared", users: { pst_carol: "carol" } });
+    base = await tempDir();
+    const hooks: Partial<SetupHooks> = {
+      ...noCheck,
+      clone: { prepare: async (d) => void (await run(bin.git, ["init", "-q", "-b", "main", d], { cwd: base })), applierFor: () => new FakeApplier() },
+      start: async (dir) => fakeStarted(dir),
+      stop: async () => undefined,
+    };
+    const opts = { serverUrl: server.url, repo: "team/app", cwd: base, env: { PITSTOP_DEVELOPER: "nikol" }, platform: "linux" as const, hooks };
+    const dir = join(base, "app");
+    await setup({ ...opts, token: "pst_carol" });
+    expect(await readFileConfig(dir)).toMatchObject({ token: "pst_carol", developer: "carol" });
+    await setup({ ...opts, token: "shared" }); // the administrator's token names nobody
+    const file = await readFileConfig(dir);
+    expect(file.token).toBe("shared");
+    expect(file.developer).toBeUndefined();
+  });
+
   it.skipIf(!hasGit)("will not import into a checkout that applied entries of a log the server no longer has", async () => {
     server = await startFakeServer({ messages: empty, repos: ["team/app"] });
     base = await tempDir();

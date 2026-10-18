@@ -51,9 +51,11 @@ export async function init(opts: InitOptions): Promise<InitResult> {
       );
     }
   }
-  // What else the file holds (the agent's name from setup) stays.
+  // What else the file holds (the agent's name from setup) stays; the login setup learned for
+  // another token does not (config.ts, `developer`).
+  const { developer: _otherLogin, ...kept } = current;
   await writeFileConfig(opts.worktree, {
-    ...current,
+    ...(opts.token === undefined || opts.token === current.token ? current : kept),
     serverUrl,
     ...(opts.token === undefined ? {} : { token: opts.token }),
     ...(opts.repo === undefined ? {} : { repo: opts.repo }),

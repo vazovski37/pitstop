@@ -4,6 +4,11 @@ import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+// The real daemon, for the commit tool's end-to-end test (mcp has no runtime dependency on it).
+import { Daemon } from "../../daemon/src/daemon.js";
+import { startFakeServer, type FakeServer, type Rejection } from "../../daemon/src/fake-server.js";
+import { writeState } from "../../daemon/src/state.js";
+import { FakeApplier, fixtureCommitFiles, fixtureMessages } from "../../daemon/src/test-support.js";
 import { DaemonClient } from "./client.js";
 import { safePointHook } from "./hook.js";
 import { setupWorktree } from "./setup.js";
@@ -82,17 +87,17 @@ describe("MCP tools against a fake daemon", () => {
     expect(await tools.commit("Show last-seen time")).toEqual({ text: 'Committed as #123 "Show last-seen time" (2 files); main moved to it. The server repaired it: null check.' });
     await close();
 
-    const rejecting = await fakeDaemon(worktree, {
+    // A daemon started by a client before 0.1.6 still sends its CLI line: the prefix shows once.
+    const older = await fakeDaemon(worktree, {
       "POST /commit": {
         status: 409,
-        body: { status: "rejected", reason: "escalated", message: "write skew: #121 changed getCurrentUser (signature). Re-read at head #122", conflictsWith: [121] },
+        body: { status: "rejected", reason: "constraint_failed", message: "commit rejected (constraint_failed): changed since #122 by #121: src/a.ts. Rebase onto #122 and retry", conflictsWith: [121] },
       },
     });
-    close = rejecting.close;
-    expect(await tools.commit("x")).toEqual({
-      text: "Commit rejected (escalated): write skew: #121 changed getCurrentUser (signature). Re-read at head #122 Conflicts with #121. Re-read what changed, adapt your change to it, and commit again.",
-      isError: true,
-    });
+    close = older.close;
+    const { text } = await tools.commit("x");
+    expect(text.match(/commit rejected/gi)).toHaveLength(1);
+    expect(text).toMatch(/^Commit rejected \(constraint_failed\): changed since #122 by #121: src\/a\.ts\. Rebase onto #122 and retry\. Conflicts with #121\. /);
   });
 
   it("declare_intent passes the brain on; brain, lease, history and callers render short text", async () => {
@@ -180,6 +185,71 @@ describe("MCP tools against a fake daemon", () => {
   it("says so when no daemon runs", async () => {
     const tools = makeTools(new DaemonClient(worktree));
     expect(await tools.status()).toEqual({ text: `No daemon is running in ${worktree}: run \`pitstop start\` there.`, isError: true });
+  });
+});
+
+describe("the commit tool against the real daemon", () => {
+  // The daemon's own process and local API (daemon/src), in front of its fake server scripted with
+  // the server's refusals as server/src words them: what the agent reads, end to end.
+  let worktree: string;
+  let server: FakeServer;
+  let daemon: Daemon;
+  const applier = new FakeApplier();
+  beforeEach(async () => {
+    worktree = await mkdtemp(join(tmpdir(), "pitstop-mcp-"));
+    server = await startFakeServer({ messages: fixtureMessages() });
+    await writeState(worktree, { appliedLsn: 122 });
+    applier.files = fixtureCommitFiles();
+    daemon = new Daemon({ serverUrl: server.url, worktree, applier, author: { developer: "teammate", agent: "agent-b" }, reconnectMs: 0, heartbeatMs: 0, leaseRenewMs: 0 });
+    await daemon.start();
+  });
+  afterEach(async () => {
+    await daemon.close();
+    await server.close();
+    await rm(worktree, { recursive: true, force: true, maxRetries: 5 });
+  });
+
+  const refused = async (rejection: Rejection) => {
+    server.rejectNextCommit(rejection);
+    const answer = await makeTools(new DaemonClient(worktree)).commit("Show last-seen on the profile page");
+    expect(answer.isError).toBe(true);
+    expect(answer.text.match(/commit rejected/gi)).toHaveLength(1);
+    return answer.text;
+  };
+
+  it("a held write skew: the server's word only, never 'commit again'", async () => {
+    const message =
+      "write skew: #2 changed src/auth/session.ts#getCurrentUser (signature). This repository's resolver (vazovski37) decides on it: your commit waits as pk_1 at https://pitstop.example/#/r/vazovski37/teamdb/conflicts. Do not commit this change again; at a later safe point you will be told whether it landed or what to change.";
+    expect(await refused({ reason: "escalated", message, conflictsWith: [2] })).toBe(`Commit rejected (escalated): ${message} Conflicts with #2.`);
+  });
+
+  it("a write skew sent back to the agent: the server's own instructions", async () => {
+    const message =
+      'write skew: #2 changed src/auth/session.ts#getCurrentUser (signature). Changed by: #2 "Fix the expired-session bug" (src/auth/session.ts). Re-read those files at head #2, adapt your change to them, and commit again with baseLsn 2.';
+    expect(await refused({ reason: "escalated", message, conflictsWith: [2] })).toBe(`Commit rejected (escalated): ${message} Conflicts with #2.`);
+  });
+
+  it("a commit waiting for the resolver: no 'applied to your worktree', no 'commit again'", async () => {
+    const message = `your commit "Show last-seen on the profile page" (pk_1) is waiting for this repository's resolver; you will be told at a safe point whether it landed or what to change`;
+    expect(await refused({ reason: "constraint_failed", message })).toBe(`Commit rejected (constraint_failed): ${message}.`);
+  });
+
+  it("ADR and lease refusals: verbatim", async () => {
+    const adr = [
+      "refused by this repository's architecture decisions (brain v1):",
+      'ADR-1 "Pages never import models": src/pages/HomePage.ts:2 imports src/models/user.ts, which the rule forbid_import src/pages/** -> src/models/** forbids. Do instead: Pages get their data through the session layer or a service, never by importing src/models.',
+      "Change those lines to follow the decision and commit again.",
+    ].join("\n");
+    expect(await refused({ reason: "constraint_failed", message: adr })).toBe(`Commit rejected (constraint_failed): ${adr}`);
+    const lease =
+      'src/auth/session.ts#getCurrentUser is leased to agent-a (vazovski37) for intent int_1 "Make sessions expire" until 2026-10-18T09:15:00.000Z: changing session expiry. Another agent holds this symbol for a short while: leave it alone and commit the rest, or wait until the lease is released (at its holder\'s commit) or expires, then commit again.';
+    expect(await refused({ reason: "constraint_failed", message: lease })).toBe(`Commit rejected (constraint_failed): ${lease}`);
+  });
+
+  it("a write-write conflict: Pitstop applies the entries, the agent adapts", async () => {
+    expect(await refused({ reason: "constraint_failed", message: "changed since #122 by #121: src/a.ts. Rebase onto #122 and retry", conflictsWith: [121] })).toBe(
+      "Commit rejected (constraint_failed): changed since #122 by #121: src/a.ts. Rebase onto #122 and retry. Conflicts with #121. Pitstop applies those entries to your worktree by your next tool call (do not rebase or merge yourself); then re-read the files named above, adapt your change, and commit again.",
+    );
   });
 });
 

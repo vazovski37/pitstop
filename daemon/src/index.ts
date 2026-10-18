@@ -27,7 +27,7 @@ import { brainBrief, brainLines, fetchBrain, releaseLease, takeLease } from "./b
 import { BUNDLED, VERSION } from "./build-info.js";
 import { cloneRepository } from "./clone.js";
 import { commit, CommitRejected, importWorktree } from "./commit.js";
-import { configFromEnv, daemonEnv, findWorktree, loadConfig, readFileConfig, type Config } from "./config.js";
+import { configFromEnv, daemonEnv, findWorktree, loadConfig, readFileConfig, withServerIdentity, type Config } from "./config.js";
 import { Daemon } from "./daemon.js";
 import { init } from "./init.js";
 import { declareIntent } from "./intents.js";
@@ -40,7 +40,7 @@ import { readState } from "./state.js";
 export { describe } from "./messages.js";
 export { cloneRepository } from "./clone.js";
 export { commit, CommitRejected, importWorktree } from "./commit.js";
-export { configFrom, configFromEnv, daemonEnv, findWorktree, loadConfig, readFileConfig, streamUrl, writeFileConfig, type Config } from "./config.js";
+export { configFrom, configFromEnv, daemonEnv, findWorktree, loadConfig, readFileConfig, serverLogin, streamUrl, withServerIdentity, writeFileConfig, type Config } from "./config.js";
 export { Daemon, readDaemonInfo, type SafePointResult, type Status } from "./daemon.js";
 export { init } from "./init.js";
 export { declareIntent } from "./intents.js";
@@ -137,7 +137,10 @@ export async function main(argv: string[], config?: Config): Promise<number> {
     console.error(`[pitstop] ${process.cwd()} is not inside a Pitstop checkout (no .pitstop/config.json here or above); run \`pitstop setup <server-url> <owner/name>\` (or \`pitstop init\`) first`);
     return 1;
   }
-  const cfg = config ?? (await loadConfig(process.env, located ?? process.cwd()));
+  const loaded = config ?? (await loadConfig(process.env, located ?? process.cwd()));
+  // Where leases and intents are compared with their holders, be who the server records: a
+  // personal token's owner, whatever PITSTOP_DEVELOPER or the OS user name says.
+  const cfg = command === "daemon" || command === "intent" || command === "brain" || command === "lease" ? await withServerIdentity(loaded) : loaded;
   const applier = new JjWorktree(cfg.worktree, binariesFromEnv());
   const shared = {
     serverUrl: cfg.serverUrl,
@@ -230,7 +233,7 @@ export async function main(argv: string[], config?: Config): Promise<number> {
       throw err;
     }
     const where = cfg.repo === undefined ? cfg.serverUrl : `${cfg.serverUrl} (${cfg.repo})`;
-    log(`watching ${cfg.worktree} from #${daemon.stream.appliedLsn} on ${where}; local API on 127.0.0.1:${port}; ctrl-c to stop`);
+    log(`watching ${cfg.worktree} from #${daemon.stream.appliedLsn} on ${where} as ${cfg.author.agent} (${cfg.author.developer}); local API on 127.0.0.1:${port}; ctrl-c to stop`);
     await new Promise<void>((done) => {
       const stop = () => void daemon.close().finally(done);
       process.once("SIGINT", stop);

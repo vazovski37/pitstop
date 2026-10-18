@@ -13,6 +13,11 @@
  * The brain and the query API (server/src/brain.ts) in miniature: `GET /repos/:o/:n/brain` from
  * `setBrain`, leases with one holder per symbol, a symbol's history and callers, and why a path
  * is so, all from the entries it holds. `broadcast` pushes a `brain` or `lease` message.
+ *
+ * Accounts in miniature (server/src/auth.ts): `users` are personal tokens; `GET /me` answers their
+ * login, and the server writes that login as the developer on commits, intents and leases,
+ * whatever the request says. The shared `token` is the administrator, whose requests name the
+ * developer themselves.
  */
 import { readFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
@@ -55,6 +60,8 @@ export interface FakeServerOptions {
   token?: string;
   /** Repositories that exist from the start (the default one always does). */
   repos?: string[];
+  /** Personal tokens and their owners' logins: accepted like `token`, and their login is the developer. */
+  users?: Record<string, string>;
 }
 
 export interface FakeServer {
@@ -110,11 +117,21 @@ export async function startFakeServer(opts: FakeServerOptions = {}): Promise<Fak
   let brain: { version: number; adrs: Adr[] } = { version: 0, adrs: [] };
   const leases = new Map<string, Lease>();
 
-  const authorized = (req: IncomingMessage): boolean => {
-    if (opts.token === undefined) return true;
+  const users = new Map(Object.entries(opts.users ?? {}));
+  const tokenOf = (req: IncomingMessage): string | undefined => {
     const header = req.headers.authorization;
-    const query = new URL(req.url ?? "/", "http://fake").searchParams.get("token");
-    return header === `Bearer ${opts.token}` || query === opts.token;
+    if (header?.startsWith("Bearer ")) return header.slice("Bearer ".length);
+    return new URL(req.url ?? "/", "http://fake").searchParams.get("token") ?? undefined;
+  };
+  /** The login behind a personal token; undefined for the shared token or none. */
+  const loginOf = (req: IncomingMessage): string | undefined => {
+    const token = tokenOf(req);
+    return token === undefined ? undefined : users.get(token);
+  };
+  const authorized = (req: IncomingMessage): boolean => {
+    if (opts.token === undefined && users.size === 0) return true;
+    const token = tokenOf(req);
+    return token !== undefined && (token === opts.token || users.has(token));
   };
 
   const sendTo = (socket: WebSocket, message: ServerMessage) => {
@@ -172,7 +189,7 @@ export async function startFakeServer(opts: FakeServerOptions = {}): Promise<Fak
     if (what === "leases" && req.method === "POST") {
       const body = (await readJson(req)) as { symbol: string; agent: string; developer?: string; reason?: string; ttlSeconds?: number; intentId?: string };
       const held = leases.get(body.symbol);
-      const holder = { developer: body.developer ?? "fake", agent: body.agent };
+      const holder = { developer: loginOf(req) ?? body.developer ?? "fake", agent: body.agent };
       // As the server: a lease tied to an intent is held by that intent.
       const holds = (l: Lease) => l.holder.agent === holder.agent && l.holder.developer === holder.developer && (l.intentId === undefined || l.intentId === body.intentId);
       if (held !== undefined && !holds(held)) {
@@ -202,7 +219,7 @@ export async function startFakeServer(opts: FakeServerOptions = {}): Promise<Fak
         return true;
       }
       const agent = url.searchParams.get("agent");
-      const developer = url.searchParams.get("developer");
+      const developer = loginOf(req) ?? url.searchParams.get("developer");
       if (agent !== null && (agent !== held.holder.agent || developer !== held.holder.developer)) {
         json(res, 403, { error: "forbidden", message: `${symbol} is held by ${held.holder.agent} (${held.holder.developer}); only its holder or an owner releases it` });
         return true;
@@ -273,7 +290,8 @@ export async function startFakeServer(opts: FakeServerOptions = {}): Promise<Fak
         };
         return json(res, 400, body);
       }
-      const r = parsed.data;
+      const login = loginOf(req);
+      const r = login === undefined ? parsed.data : { ...parsed.data, author: { ...parsed.data.author, developer: login } };
       if (rejectNext !== undefined) {
         const body: CommitResponse = { status: "rejected", conflictsWith: [], ...rejectNext };
         rejectNext = undefined;
@@ -305,7 +323,7 @@ export async function startFakeServer(opts: FakeServerOptions = {}): Promise<Fak
       const intent: Intent = {
         id: `int_${(intents.length + 1).toString().padStart(2, "0")}`,
         repo: parsed.data.repo ?? DEFAULT_REPO,
-        author: parsed.data.author,
+        author: { ...parsed.data.author, developer: loginOf(req) ?? parsed.data.author.developer },
         baseLsn: parsed.data.baseLsn,
         text: parsed.data.text,
         declaredSymbols: parsed.data.declaredSymbols,
@@ -336,6 +354,11 @@ export async function startFakeServer(opts: FakeServerOptions = {}): Promise<Fak
       const fromLsn = Number(query.get("fromLsn") ?? 0);
       const limit = Number(query.get("limit") ?? 100);
       return json(res, 200, entries.filter((e) => e.lsn > fromLsn).slice(0, limit));
+    }
+    if (req.method === "GET" && req.url === "/me") {
+      const login = loginOf(req);
+      if (login === undefined) return json(res, 401, { error: "unauthorized", message: "sign in at /auth/github or send a personal token" });
+      return json(res, 200, { id: `u_${login}`, githubId: 1, login, createdAt: startedAt });
     }
     if (req.method === "GET" && req.url === "/healthz") {
       return json(res, 200, { ok: true, version: serverVersion, db: true });

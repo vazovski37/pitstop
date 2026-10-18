@@ -46,7 +46,7 @@ What it does, and where it stops to tell you what to run:
    - **The directory is already a checkout of it** (you ran setup before): it is reused, nothing is imported or cloned.
    - **The directory is a checkout of another repository, or of the same name on another server:** setup stops; run it from a directory outside that checkout.
 3. Wires Claude Code in that checkout, by command name, so the files hold no path of your laptop: `.mcp.json` (the `pitstop` server; `cmd /c pitstop-mcp` on Windows), `.claude/settings.local.json` (your own settings file: the `PostToolUse` hook, `pitstop-hook`, the server enabled, and its tools allowed with `mcp__pitstop` in `permissions.allow`, so Claude does not ask before each pitstop call), and `CLAUDE.local.md` (the house rules for the agent, below). Whatever those files already hold is kept, other hooks included. Those three go into `.git/info/exclude`, so they never end up in a commit; the rest of `.claude/` (the team's `settings.json`, commands, agents, skills) is committed like any other file. A wiring file your repository already tracks is the team's and is left alone: when that is `.mcp.json`, setup ends with the one line that registers the server for you only, `claude mcp add --scope local pitstop -- pitstop-mcp` (`-- cmd /c pitstop-mcp` on Windows).
-4. Records the agent's name in `.pitstop/config.json` (`--agent alice-claude`; default `<your user>-claude`, or what an earlier setup recorded) and starts the daemon in the background, its output in `.pitstop/daemon.log`.
+4. Records the agent's name in `.pitstop/config.json` (`--agent alice-claude`; default `<your user>-claude`, or what an earlier setup recorded; give each checkout its own, or two agents share each other's warnings), with the GitHub login the server knows your token by, and starts the daemon in the background, its output in `.pitstop/daemon.log`.
 
 It ends with where the checkout is. Open Claude Code there (`cd my-repo && claude`); the `pitstop` tools are loaded and the agent knows the rules. Run setup again whenever something looks off: it re-checks, re-wires, starts the daemon if none runs, and restarts it when the agent name, token or server changed.
 
@@ -120,7 +120,7 @@ pitstop daemon
 | `PITSTOP_SERVER` | the server | `.pitstop/config.json`, else `http://localhost:8080` |
 | `PITSTOP_TOKEN` | your token; only for a server `PITSTOP_SERVER` names, or a checkout whose `.pitstop/config.json` has none | `.pitstop/config.json` |
 | `PITSTOP_REPO` | the repository, `owner/name` | `.pitstop/config.json` |
-| `PITSTOP_DEVELOPER` | who you are on commits (with a personal token, your login wins) | your OS user name |
+| `PITSTOP_DEVELOPER` | who you are on commits under a shared token; with a personal token the server records your GitHub login, and the daemon asks the server for it (`GET /me`) | your OS user name |
 | `PITSTOP_AGENT` | which agent this checkout is; make it distinct per laptop | the `agent` in `.pitstop/config.json` (`pitstop setup --agent`), else `claude-code` |
 | `PITSTOP_WORKTREE` | the checkout the MCP server and the hook act on | the nearest directory with `.pitstop/config.json` at or above Claude Code's |
 | `PITSTOP_DAEMON_PORT` | the daemon's local API port | a free one |
@@ -134,7 +134,7 @@ The server's owner chooses: `PITSTOP_VALIDATE` is `warn` by default (a commit wi
 
 ## What a refusal means
 
-- **`constraint_failed`**: a file or symbol you changed was also changed by an entry that landed first. The daemon has applied that entry to your checkout; re-read the named files, adapt, and commit again.
+- **`constraint_failed`**: a file or symbol you changed was also changed by an entry that landed first. The daemon applies that entry to your checkout (an agent's by its next tool call) and rebases your work onto it; do not rebase or merge yourself. Then re-read the named files, adapt, and commit again.
 - **`escalated`** (or `repair_failed`): write skew. You read something, for example a function's signature, that another entry changed after you read it. The message names the entries and the symbols. Re-read them at the current head, adapt your change, and commit again. From then on your reads are checked from the entry you were told about, so the adapted commit is not refused for the same reason.
 - **`escalated` that says a resolver decides**: on a repository with members, write skew waits for the member marked resolver (or the owners) on the website. Do not commit the change again (the server refuses it while it waits); at a later safe point the note says whether it landed as it is or was sent back, and with what to change.
 - **`constraint_failed` that names an ADR**: your change breaks an architecture decision. The message gives each offending line and the rule, then what the decision says to do instead, for example `ADR-1 "Pages never touch the database": src/pages/Profile.tsx:3 imports src/db/client.ts, which the rule forbid_import src/pages/** -> src/db/** forbids. Do instead: Pages read data through src/services.` Change those lines and commit again; there is no way around it short of an owner superseding the ADR. Only what your change brings is refused: a violation the file already had is noted ("pre-existing, on the re-check queue") and does not stop your edit.
@@ -143,7 +143,7 @@ The server's owner chooses: `PITSTOP_VALIDATE` is `warn` by default (a commit wi
 
 ## What lives where
 
-- `.pitstop/` in each checkout: `config.json` (server, token, repository, agent), `state.json` (the last entry applied, the open intent), `daemon.json` (the running daemon's pid and local port), `daemon.log` (the background daemon's output), a lock. It ignores itself; never commit it.
+- `.pitstop/` in each checkout: `config.json` (server, token, repository, agent, and the login the server knows the token by), `state.json` (the last entry applied, the open intent), `daemon.json` (the running daemon's pid and local port), `daemon.log` (the background daemon's output), a lock. It ignores itself; never commit it.
 - `.mcp.json`, `.claude/settings.local.json` and `CLAUDE.local.md`, when `pitstop setup` wrote them: listed in `.git/info/exclude`, so neither git nor jj ever commits them. One your repository already tracks is left as it is (setup says so). Everything else in `.claude/` is part of the repository.
 - `main` in git and jj is always the last entry applied. Your unfinished work is jj's working copy `@` on top of it. Everything the daemon does to `main` is a plain git commit with the entry's author and timestamp, so every `pitstop clone` of a repository has identical history, entry for entry, with the same commit ids. The checkout that ran `init` keeps its older git history underneath #1, so its ids differ from the clones' (and from the mirror's) even though the trees are the same; a clone has no history before the import.
 - Nothing is pushed to GitHub by the daemon. The server can mirror a repository to GitHub as an export (`PUT /repos/:owner/:name/mirror`); the log stays the source of truth.
