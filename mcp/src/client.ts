@@ -4,6 +4,7 @@
  */
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
+import type { PresenceEntry } from "@pitstop/protocol";
 
 export class NoDaemon extends Error {
   constructor(worktree: string) {
@@ -54,6 +55,16 @@ export interface Ref {
   files: string[];
 }
 
+/** A live presence entry as the daemon's `GET /presence` answers it: the protocol's entry plus its age. */
+export type PresenceRow = PresenceEntry & { ageMs: number };
+
+export interface PresenceAnswer {
+  /** This worktree's replica, to tell it apart from the others. */
+  replica: string | null;
+  ttlMs: number;
+  entries: PresenceRow[];
+}
+
 export class DaemonClient {
   constructor(
     readonly worktree: string,
@@ -82,6 +93,11 @@ export class DaemonClient {
 
   callers(symbol: string): Promise<{ readers: Ref[]; writers: Ref[] }> {
     return this.call("GET", `/callers?symbol=${encodeURIComponent(symbol)}`) as Promise<{ readers: Ref[]; writers: Ref[] }>;
+  }
+
+  /** Who is working in the repository right now (daemon/src/presence.ts, `PresenceView`). */
+  presence(): Promise<PresenceAnswer> {
+    return this.call("GET", "/presence") as Promise<PresenceAnswer>;
   }
 
   private async call(method: string, path: string, body?: unknown): Promise<unknown> {

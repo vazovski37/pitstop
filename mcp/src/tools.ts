@@ -20,7 +20,8 @@ export interface ToolOptions {
   ensureDaemon?: () => Promise<boolean>;
 }
 
-const guard =
+/** Runs a tool: a missing daemon is started once (when `ensureDaemon` is given), any failure becomes the tool's error text. */
+export const guard =
   (opts: ToolOptions) =>
   async (fn: () => Promise<ToolResult>): Promise<ToolResult> => {
     try {
