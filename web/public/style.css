@@ -67,6 +67,25 @@ ol, ul { list-style: none; margin: 0; padding: 0; }
 #events .repair, #events .skew { color: var(--repair); }
 #events .entry { color: var(--text); }
 #events .intent { color: var(--dim); }
+#events .presence { color: var(--accent); }
+
+/* who's here: presence (design doc 9.5) */
+#presence li { display: grid; gap: 5px; padding: 9px 0; border-top: 1px solid var(--line); transition: opacity 0.6s ease; }
+#presence li:first-child { border-top: 0; }
+#presence .who { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+#presence .dot { width: 9px; height: 9px; border-radius: 50%; flex: none; }
+#presence .dot.working { animation: pulse 1.8s ease-in-out infinite; }
+@keyframes pulse { 0%, 100% { box-shadow: 0 0 0 0 rgba(255, 255, 255, 0.35); } 50% { box-shadow: 0 0 0 4px rgba(255, 255, 255, 0); } }
+#presence .agent { font-weight: bold; }
+#presence .state { font-size: 11px; border: 1px solid var(--line); border-radius: 4px; padding: 0 6px; color: var(--dim); }
+#presence .state.working { border-color: var(--ok); color: var(--ok); }
+#presence .applied { margin-left: auto; font-size: 12px; color: var(--dim); }
+#presence .applied.behind { color: var(--bad); }
+#presence .task { padding-left: 17px; overflow-wrap: anywhere; }
+#presence .chips, #presence .symbols { padding-left: 17px; }
+.chips { display: flex; flex-wrap: wrap; gap: 4px; }
+.chip { font-size: 11px; border: 1px solid var(--line); border-radius: 999px; padding: 1px 8px; color: var(--dim); overflow-wrap: anywhere; }
+.chip.hot { border-color: var(--warn); color: var(--warn); background: #3a2a10; }
 
 /* the detail of one entry */
 #detail h2 { justify-content: space-between; text-transform: none; letter-spacing: 0; color: var(--text); font-size: 14px; }

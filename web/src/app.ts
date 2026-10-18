@@ -6,7 +6,7 @@
  * the whole log replays and then stays live. Only types come from @pitstop/protocol: nothing from
  * node_modules reaches the browser.
  */
-import type { Changeset, ClientMessage, Intent, Repo, ServerMessage } from "@pitstop/protocol";
+import type { Changeset, ClientMessage, Intent, PresenceDoc, PresenceEntry, Repo, ServerMessage } from "@pitstop/protocol";
 
 /** `DEFAULT_REPO` in the protocol; a value import would pull zod into the page. */
 const DEFAULT_REPO = "local/default";
@@ -15,6 +15,10 @@ const RECONNECT_MS = 2_000;
 /** How often the worktrees are re-read while the stream is up; every entry re-reads them too. */
 const WORKTREES_MS = 3_000;
 const MAX_EVENTS = 200;
+/** Presence entries older than this are hidden (daemons refresh theirs with every heartbeat); the server's PRESENCE_TTL_MS. */
+const PRESENCE_TTL_MS = 2 * 60_000;
+/** How often "Who's here" is redrawn without news, so ages move on and old entries fade out. */
+const PRESENCE_REDRAW_MS = 2_000;
 
 /**
  * One connected worktree, from `GET /repos/:owner/:name/worktrees` (`WorktreesResponse` in
@@ -27,7 +31,7 @@ interface Worktree {
   agent?: string;
 }
 
-type EventKind = "entry" | "repair" | "skew" | "intent" | "warning" | "info";
+type EventKind = "entry" | "repair" | "skew" | "intent" | "warning" | "presence" | "info";
 interface Event {
   at: Date;
   kind: EventKind;
@@ -41,6 +45,8 @@ const state = {
   entries: new Map<number, Changeset>(),
   intents: new Map<string, Intent>(),
   worktrees: [] as Worktree[],
+  /** The repository's presence document, merged here like on every daemon and the server. */
+  presence: {} as PresenceDoc,
   events: [] as Event[],
   selected: null as number | null,
   /** Entries that landed while the page was watching: they get the landing animation. */
@@ -224,7 +230,114 @@ function handle(message: ServerMessage): void {
         if (message.kind === "dependency_changed") void countConflicts(state.repo);
       }
       break;
+    case "presence":
+      if (message.repo === state.repo) onPresence(message.entries);
+      break;
   }
+}
+
+// --- presence: who is here (design doc 9.5) ------------------------------------------------------
+
+/**
+ * The presence CRDT's merge, `applyPresence` from packages/protocol/src/presence.ts, copied: the
+ * page cannot import runtime code from the protocol package (no bundler, and a value import would
+ * pull zod into the browser), so these few lines live here too and must stay the same. Per
+ * replica, the entry with the greater stamp wins; stamps are `<wall>.<counter>.<replica>` with
+ * fixed-width numbers, so string order is clock order. Any order of updates, duplicates
+ * included, ends in the same document.
+ */
+function applyPresence(doc: PresenceDoc, entry: PresenceEntry): PresenceDoc {
+  const current = doc[entry.replica];
+  if (current !== undefined && !(entry.stamp > current.stamp)) return doc;
+  return { ...doc, [entry.replica]: entry };
+}
+
+/** The wall-clock milliseconds a stamp carries. */
+const wallOf = (entry: PresenceEntry): number => Number(entry.stamp.split(".")[0]);
+
+/**
+ * "Now" for ages: this browser's clock, or the newest stamp seen when that is ahead (a clock
+ * behind the daemons' would otherwise show every entry as written in the future).
+ */
+const presenceNow = (): number => Math.max(Date.now(), ...Object.values(state.presence).map(wallOf));
+
+/** The entries to show: not departed, written within the TTL; by agent, then replica. */
+function livePresence(): PresenceEntry[] {
+  const now = presenceNow();
+  return Object.values(state.presence)
+    .filter((e) => e.state !== "gone" && now - wallOf(e) <= PRESENCE_TTL_MS)
+    .sort((a, b) => a.author.agent.localeCompare(b.author.agent) || a.replica.localeCompare(b.replica));
+}
+
+function onPresence(entries: PresenceEntry[]): void {
+  for (const entry of entries) {
+    if (entry.repo !== state.repo) continue;
+    const before = state.presence[entry.replica];
+    state.presence = applyPresence(state.presence, entry);
+    if (state.presence[entry.replica] !== entry) continue; // stale or a duplicate: nothing new
+    const who = `${entry.author.agent} (${entry.author.developer})`;
+    const wasHere = before !== undefined && before.state !== "gone";
+    if (entry.state === "gone" && wasHere) addEvent("presence", `${who} left`);
+    else if (entry.state !== "gone" && !wasHere && Date.now() - wallOf(entry) <= PRESENCE_TTL_MS) {
+      addEvent("presence", `${who} is here${entry.intent === undefined ? "" : `, working on "${entry.intent}"`}`);
+    }
+  }
+  renderPresence();
+}
+
+/**
+ * One colour per agent name, the same on every screen: FNV-1a, then the golden angle, so names
+ * that differ in one letter (agent-a, agent-b) still land far apart on the colour wheel.
+ */
+function agentColour(agent: string): string {
+  let hash = 2_166_136_261;
+  for (const ch of agent) hash = Math.imul(hash ^ ch.charCodeAt(0), 16_777_619) >>> 0;
+  return `hsl(${Math.round((hash * 137.508) % 360)} 75% 68%)`;
+}
+
+const ageText = (ms: number): string => (ms < 5_000 ? "just now" : ms < 60_000 ? `${Math.round(ms / 1000)}s ago` : `${Math.round(ms / 60_000)}m ago`);
+
+/**
+ * "Who's here": one line per live worktree, the agent in its colour, its developer, working or
+ * idle, its intent, the files it has unfinished edits in (a file two worktrees are both in is
+ * highlighted), and how far it has applied the log. Older entries fade as they near the TTL.
+ */
+function renderPresence(): void {
+  const live = livePresence();
+  const now = presenceNow();
+  const head = state.head ?? 0;
+  const inFile = new Map<string, string[]>();
+  for (const e of live) for (const f of e.files) inFile.set(f, [...(inFile.get(f) ?? []), e.author.agent]);
+  $("presence-count").textContent = live.length === 0 ? "" : String(live.length);
+  $("no-presence").hidden = live.length > 0;
+  $("presence").replaceChildren(
+    ...live.map((e) => {
+      const age = Math.max(0, now - wallOf(e));
+      const behind = Math.max(0, head - e.appliedLsn);
+      const colour = agentColour(e.author.agent);
+      const chips = e.files.map((f) => {
+        const others = (inFile.get(f) ?? []).filter((a) => a !== e.author.agent);
+        const shared = (inFile.get(f)?.length ?? 0) > 1;
+        return el("span", { class: shared ? "chip hot" : "chip", title: shared ? `also here: ${others.join(", ") || "another worktree"}` : f }, f);
+      });
+      return el(
+        "li",
+        { class: e.state, style: `opacity: ${(1 - 0.6 * Math.min(1, age / PRESENCE_TTL_MS)).toFixed(2)}`, title: `${e.replica} · ${ageText(age)}` },
+        el(
+          "div",
+          { class: "who" },
+          el("span", { class: `dot ${e.state}`, style: `background: ${colour}` }),
+          el("span", { class: "agent", style: `color: ${colour}` }, e.author.agent),
+          el("span", { class: "dim" }, e.author.developer),
+          el("span", { class: `state ${e.state}` }, e.state),
+          el("span", { class: `applied ${behind > 0 ? "behind" : ""}`, title: behind > 0 ? `${plural(behind, "entry", "entries")} behind the head` : "at the head" }, `applied #${e.appliedLsn} of #${head}`),
+        ),
+        e.intent === undefined ? null : el("div", { class: "task" }, e.intent),
+        chips.length === 0 ? null : el("div", { class: "chips" }, ...chips),
+        e.symbols.length === 0 ? null : el("div", { class: "symbols" }, e.symbols.join(", ")),
+      );
+    }),
+  );
 }
 
 /** The validator's note on an entry that landed with write skew (PITSTOP_VALIDATE=warn), if any. */
@@ -248,6 +361,7 @@ function onEntry(cs: Changeset): void {
   }
   renderHead();
   renderLog();
+  renderPresence();
   // The head moved, so every worktree is behind until its daemon applies: show who has caught up.
   // A replay is hundreds of entries at once; the `head` message already read the worktrees for it.
   if (!replay) void pollWorktrees();
@@ -431,12 +545,14 @@ function reset(): void {
   state.entries.clear();
   state.intents.clear();
   state.worktrees = [];
+  state.presence = {};
   state.events = [];
   state.selected = null;
   state.live.clear();
   renderHead();
   renderLog();
   renderDetail();
+  renderPresence();
   renderIntents();
   renderWorktrees();
   renderEvents();
@@ -897,6 +1013,7 @@ function setup(): void {
   $("close").addEventListener("click", () => select(null));
   window.addEventListener("hashchange", () => show(parseRoute(location.hash)));
   window.setInterval(renderIntents, 5_000);
+  window.setInterval(renderPresence, PRESENCE_REDRAW_MS);
   window.setInterval(() => void pollWorktrees(), WORKTREES_MS);
   void start();
 }
