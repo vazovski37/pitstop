@@ -272,12 +272,13 @@ export async function main(argv: string[], config?: Config): Promise<number> {
     log(`${intent.id} ${intent.status}`);
     // The brain in brief, as the agent gets it through the declare_intent tool.
     const brain = await fetchBrain(shared).catch(() => undefined);
-    if (brain !== undefined) for (const line of brainBrief(brain, intent.declaredSymbols, cfg.author)) console.log(line);
+    if (brain !== undefined) for (const line of brainBrief(brain, intent.declaredSymbols, cfg.author, intent.id)) console.log(line);
     return 0;
   }
 
   if (command === "brain") {
-    for (const line of brainLines(await fetchBrain(shared), cfg.author)) console.log(line);
+    const { intentId } = await readState(cfg.worktree);
+    for (const line of brainLines(await fetchBrain(shared), cfg.author, intentId)) console.log(line);
     return 0;
   }
 
@@ -289,11 +290,14 @@ export async function main(argv: string[], config?: Config): Promise<number> {
     }
     const reason = flag(rest, "-r");
     const { intentId } = await readState(cfg.worktree);
+    // A lease lives and ends with an intent: the daemon renews it while the intent is open, the commit releases it.
     const answer = rest.includes("--release")
-      ? await releaseLease(shared, symbol, cfg.author)
-      : await takeLease(shared, { symbol, holder: cfg.author, ...(reason === undefined ? {} : { reason }), ...(intentId === undefined ? {} : { intentId }) });
+      ? await releaseLease(shared, symbol, cfg.author, intentId)
+      : intentId === undefined
+        ? ({ status: "invalid", message: "declare your intent first (pitstop intent -m ...), then take the lease; it lives and ends with that intent" } as const)
+        : await takeLease(shared, { symbol, holder: cfg.author, ...(reason === undefined ? {} : { reason }), intentId });
     log(answer.message);
-    return answer.status === "refused" ? 1 : 0;
+    return answer.status === "held" || answer.status === "released" ? 0 : 1;
   }
 
   if (command === "safe-point" || command === "status") {

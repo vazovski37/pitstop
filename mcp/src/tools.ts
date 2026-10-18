@@ -48,7 +48,7 @@ export const DESCRIPTIONS = {
   brain:
     "The repository's brain: its version, the accepted architecture decisions (ADRs) with the rules every commit is checked against, the live leases on symbols, and the open intents.",
   lease:
-    "Take a short lease on one hot symbol (path#name) before a risky change to it, with a reason: while you hold it, another agent's commit that writes it is refused. It lasts while your intent is open (your heartbeats renew it) and is released when you commit; release it early with release: true. Refused when another agent holds it.",
+    "Take a short lease on one hot symbol (path#name) before a risky change to it, with a reason: while you hold it, another agent's commit that writes it is refused. Declare your intent first: the lease lasts while that intent is open (your daemon renews it) and is released when you commit; release it early with release: true. Refused when another agent holds it.",
   history: "Every change to a symbol (path#name), newest first: who, which intent, whether its signature changed, and who has it declared or leased now.",
 } as const;
 
@@ -118,9 +118,14 @@ export function makeTools(client: DaemonClient, opts: ToolOptions = {}) {
           ...(opts.minutes === undefined ? {} : { ttlSeconds: Math.round(opts.minutes * 60) }),
           ...(opts.release === true ? { release: true } : {}),
         });
-        if (answer.status === "refused") return fail(`Lease refused: ${answer.message}. Leave that symbol alone (a commit writing it is refused) or wait until the lease ends.`);
+        if (answer.status === "leased") return fail(`Lease refused: ${answer.message}. Leave that symbol alone (a commit writing it is refused) or wait until the lease ends.`);
+        if (answer.status === "not_held") return ok(`You hold no lease on ${symbol} (it expired or was released); nothing to release.`);
+        if (answer.status === "invalid") {
+          const closed = /not open/.test(answer.message) ? " Your intent is closed or stale: call declare_intent again, then take the lease." : "";
+          return fail(`Lease not taken: ${answer.message.replace(/\.$/, "")}.${closed}`);
+        }
         if (answer.status === "released") return ok(`Released the lease on ${symbol}.`);
-        return ok(`Lease taken: ${answer.message}. Other agents' commits that write it are refused until you commit (which releases it) or it expires; your heartbeats renew it while your intent is open.`);
+        return ok(`Lease taken: ${answer.message}. Other agents' commits that write it are refused until you commit (which releases it) or it expires; your daemon renews it while your intent is open.`);
       }),
 
     history: (symbol: string) =>

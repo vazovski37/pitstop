@@ -165,11 +165,17 @@ export async function startFakeServer(opts: FakeServerOptions = {}): Promise<Fak
       json(res, 200, { repo, version: brain.version, adrs: brain.adrs, leases: [...leases.values()], intents: intents.filter((i) => i.status === "open") });
       return true;
     }
+    if (what === "leases" && req.method === "GET") {
+      json(res, 200, [...leases.values()]);
+      return true;
+    }
     if (what === "leases" && req.method === "POST") {
       const body = (await readJson(req)) as { symbol: string; agent: string; developer?: string; reason?: string; ttlSeconds?: number; intentId?: string };
       const held = leases.get(body.symbol);
       const holder = { developer: body.developer ?? "fake", agent: body.agent };
-      if (held !== undefined && (held.holder.agent !== holder.agent || held.holder.developer !== holder.developer)) {
+      // As the server: a lease tied to an intent is held by that intent.
+      const holds = (l: Lease) => l.holder.agent === holder.agent && l.holder.developer === holder.developer && (l.intentId === undefined || l.intentId === body.intentId);
+      if (held !== undefined && !holds(held)) {
         json(res, 409, { error: "leased", message: `${body.symbol} is leased to ${held.holder.agent} (${held.holder.developer}) until ${held.expiresAt}${held.reason ? `: ${held.reason}` : ""}`, lease: held });
         return true;
       }
@@ -196,7 +202,8 @@ export async function startFakeServer(opts: FakeServerOptions = {}): Promise<Fak
         return true;
       }
       const agent = url.searchParams.get("agent");
-      if (agent !== null && agent !== held.holder.agent) {
+      const developer = url.searchParams.get("developer");
+      if (agent !== null && (agent !== held.holder.agent || developer !== held.holder.developer)) {
         json(res, 403, { error: "forbidden", message: `${symbol} is held by ${held.holder.agent} (${held.holder.developer}); only its holder or an owner releases it` });
         return true;
       }

@@ -68,8 +68,12 @@ export interface CallersAnswer {
   note?: string;
 }
 
+/**
+ * `leased`: another agent holds it. `not_held`: a release found no lease of yours. `invalid`: the
+ * request cannot be served as asked (daemon/src/brain.ts).
+ */
 export interface LeaseAnswer {
-  status: "held" | "refused" | "released";
+  status: "held" | "leased" | "released" | "not_held" | "invalid";
   message: string;
   lease?: { symbol: string; expiresAt: string; holder: { developer: string; agent: string } };
 }
