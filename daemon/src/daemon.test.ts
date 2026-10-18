@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, onTestFailed } from "vitest";
 import { type Adr, type Author, type Lease, type ServerMessage } from "@pitstop/protocol";
-import { Daemon, readDaemonInfo, type SafePointResult, type Status } from "./daemon.js";
+import { Daemon, NO_INTENT_FOR_LEASE, readDaemonInfo, type SafePointResult, type Status } from "./daemon.js";
 import { startFakeServer, type FakeServer } from "./fake-server.js";
 import { LocalClient, NoDaemon } from "./local-client.js";
 import { readState, writeState } from "./state.js";
@@ -297,16 +297,19 @@ describe("daemon with its local API", () => {
     it("takes and releases a lease for the open intent, and answers the brain and a symbol's history from the server", async () => {
       await start(fixtureMessages(), 122);
       await waitFor(() => applier.lsns.length === 0 && log.some((l) => l.includes("is at #")));
+      // No open intent: no lease (it would outlive the task, unrenewed and unreleased).
+      expect(await api("POST", "/lease", { symbol: "src/pages/ProfilePage.tsx#ProfilePage" })).toMatchObject({ status: 200, body: { status: "invalid", message: NO_INTENT_FOR_LEASE } });
       await writeState(worktree, { appliedLsn: 122, intentId: "int_07" });
       const taken = await api("POST", "/lease", { symbol: "src/pages/ProfilePage.tsx#ProfilePage", reason: "reshaping it" });
       expect(taken).toMatchObject({ status: 200, body: { status: "held", renewed: false, lease: { holder: author, intentId: "int_07", reason: "reshaping it" } } });
       expect((taken.body as { message: string }).message).toMatch(/^src\/pages\/ProfilePage\.tsx#ProfilePage is yours until \d\d:\d\dZ$/);
       server.leases.set(symbol, leaseOf(agentA));
       const refused = await api("POST", "/lease", { symbol });
-      expect(refused).toMatchObject({ status: 409, body: { status: "refused", lease: { holder: agentA } } });
+      expect(refused).toMatchObject({ status: 409, body: { status: "leased", lease: { holder: agentA } } });
       expect((refused.body as { message: string }).message).toMatch(/is leased to agent-a \(vazovski\)/);
-      expect(await api("POST", "/lease", { symbol, release: true })).toMatchObject({ status: 409, body: { status: "refused" } });
+      expect(await api("POST", "/lease", { symbol, release: true })).toMatchObject({ status: 409, body: { status: "leased" } });
       expect(await api("POST", "/lease", { symbol: "src/pages/ProfilePage.tsx#ProfilePage", release: true })).toMatchObject({ status: 200, body: { status: "released" } });
+      expect(await api("POST", "/lease", { symbol: "src/pages/ProfilePage.tsx#ProfilePage", release: true })).toMatchObject({ status: 200, body: { status: "not_held" } });
       expect((await api("POST", "/lease", { symbol: "no-hash" })).status).toBe(400);
 
       server.setBrain({ version: 1, adrs: [adr] });
@@ -321,6 +324,51 @@ describe("daemon with its local API", () => {
       const history = await api("GET", `/history?symbol=${encodeURIComponent("src/pages/ProfilePage.tsx#ProfilePage")}`);
       expect(history.body).toMatchObject({ symbol: "src/pages/ProfilePage.tsx#ProfilePage", history: [{ lsn: 122, intent: "Show last-seen time on ProfilePage", signature: false }], declaredBy: [] });
       expect((await api("GET", "/history")).status).toBe(400);
+    });
+
+    it("renews its own leases by asking the server again once half their time is gone, and only while their intent is open", async () => {
+      await start(fixtureMessages(), 122);
+      await waitFor(() => log.some((l) => l.includes("is at #")));
+      await writeState(worktree, { appliedLsn: 122, intentId: "int_07" });
+      const mine = "src/pages/ProfilePage.tsx#ProfilePage";
+      await api("POST", "/lease", { symbol: mine, ttlSeconds: 120 });
+      const first = server.leases.get(mine)?.expiresAt ?? "";
+      const soon = new Date(Date.now() + 20_000).toISOString();
+      server.leases.set(symbol, leaseOf(agentA, symbol, { expiresAt: soon }));
+      await daemon.renewLeases(); // more than half its time left: nothing to do
+      expect(server.leases.get(mine)?.expiresAt).toBe(first);
+      const runningOut = () => server.leases.set(mine, { ...(server.leases.get(mine) as Lease), expiresAt: soon });
+      runningOut(); // 20 s left of 120
+      await daemon.renewLeases();
+      expect(Date.parse(server.leases.get(mine)?.expiresAt ?? "")).toBeGreaterThan(Date.now() + 100_000);
+      expect(server.leases.get(mine)).toMatchObject({ intentId: "int_07", holder: author });
+      expect(server.leases.get(symbol)).toMatchObject({ holder: agentA, expiresAt: soon }); // another's lease is never touched
+      await writeState(worktree, { appliedLsn: 122 }); // the intent closed
+      runningOut();
+      await daemon.renewLeases();
+      expect(server.leases.get(mine)?.expiresAt).toBe(soon);
+    });
+
+    it("tells the agent when its own lease ended without its asking, or its intent went stale", async () => {
+      await start(fixtureMessages(), 122);
+      await waitFor(() => log.some((l) => l.includes("is at #")));
+      await writeState(worktree, { appliedLsn: 122, intentId: "int_07" });
+      await safePoint();
+      const mine = (sym: string, status: Lease["status"]) => leaseOf(author, sym, { intentId: "int_07", status });
+      server.broadcast({ type: "lease", lease: mine("src/a.ts#a", "expired") });
+      server.broadcast({ type: "lease", lease: mine("src/b.ts#b", "released") }); // an owner released it; the intent is still open
+      server.broadcast({ type: "lease", lease: { ...mine("src/c.ts#c", "released"), intentId: "int_old" } }); // a commit's release: no news
+      await waitFor(() => log.filter((l) => l.startsWith("lease on")).length >= 3);
+      expect((await safePoint()).notes).toEqual([
+        "your lease on src/a.ts#a ended (expired); another agent may take it. Take it again with lease if you still need it",
+        "your lease on src/b.ts#b ended (released); another agent may take it. Take it again with lease if you still need it",
+      ]);
+      server.broadcast({ type: "intent", intent: { id: "int_07", repo: "local/default", author, baseLsn: 122, text: "t", declaredSymbols: [], status: "stale", heartbeatAt: "2026-10-18T03:00:00.000Z" } });
+      server.broadcast({ type: "lease", lease: mine("src/d.ts#d", "released") });
+      await waitFor(() => log.filter((l) => l.startsWith("lease on")).length >= 4);
+      expect((await safePoint()).notes).toEqual([
+        "your intent int_07 was marked stale (no heartbeat for 5 minutes) and its leases were released; declare_intent again before you take a lease",
+      ]);
     });
   });
 

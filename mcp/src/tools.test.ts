@@ -109,7 +109,7 @@ describe("MCP tools against a fake daemon", () => {
         },
       },
       "GET /brain": { body: { version: 1, lines: ["Brain v1 of acme/app: 1 accepted ADR, 0 live leases, 0 open intents.", "ADR-1 Pages never touch the database: Pages read through services."] } },
-      "POST /lease": { status: 409, body: { status: "refused", message: `${symbol} is leased to agent-a (alice) until 03:15Z: changing its return type` } },
+      "POST /lease": { status: 409, body: { status: "leased", message: `${symbol} is leased to agent-a (alice) until 03:15Z: changing its return type` } },
       "GET /history": {
         body: {
           symbol,
@@ -158,6 +158,23 @@ describe("MCP tools against a fake daemon", () => {
     close = releasing.close;
     expect((await tools.lease(symbol, { release: true })).text).toBe(`Released the lease on ${symbol}.`);
     expect(releasing.requests[0]?.body).toEqual({ symbol, release: true });
+    await close();
+
+    // Nothing to release, a stale intent, no intent: never "leave that symbol alone".
+    const gone = await fakeDaemon(worktree, { "POST /lease": { body: { status: "not_held", message: `nobody holds a lease on ${symbol}` } } });
+    close = gone.close;
+    expect(await tools.lease(symbol, { release: true })).toEqual({ text: `You hold no lease on ${symbol} (it expired or was released); nothing to release.` });
+    await close();
+    const stale = await fakeDaemon(worktree, { "POST /lease": { body: { status: "invalid", message: "intent int_03 is stale, not open" } } });
+    close = stale.close;
+    expect(await tools.lease(symbol)).toEqual({
+      text: "Lease not taken: intent int_03 is stale, not open. Your intent is closed or stale: call declare_intent again, then take the lease.",
+      isError: true,
+    });
+    await close();
+    const none = await fakeDaemon(worktree, { "POST /lease": { body: { status: "invalid", message: "Declare your intent first (declare_intent), then take the lease; it lives and ends with that intent." } } });
+    close = none.close;
+    expect((await tools.lease(symbol)).text).toBe("Lease not taken: Declare your intent first (declare_intent), then take the lease; it lives and ends with that intent.");
   });
 
   it("says so when no daemon runs", async () => {

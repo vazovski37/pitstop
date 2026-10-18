@@ -9,7 +9,8 @@
  *   POST /commit {intent}              commit @; 200 accepted, 409 with the server's rejection verbatim
  *   GET  /brain                        the repository's brain: version, ADRs, leases, open intents (one line each)
  *   POST /lease {symbol, reason?, ttlSeconds?, release?}
- *                                      take (or release) a lease on one symbol for the open intent; 409 when held
+ *                                      take (or release) a lease on one symbol for the open intent; 409 when another
+ *                                      agent holds it, 200 with the status otherwise (held, released, not_held, invalid)
  *   GET  /history?symbol=              every change to a symbol, with intents (the server's query API)
  *   GET  /why?path=                    the entries that touched a file, latest first (the server's query API)
  *   GET  /callers?symbol=              the entries that read a symbol, and those that changed it (the server's query API)
@@ -30,6 +31,9 @@ import {
   brainLines,
   clock,
   fetchBrain,
+  fetchLeases,
+  holdsLease,
+  LEASE_TTL_SECONDS,
   releaseLease,
   symbolCallers,
   symbolHistory,
@@ -85,6 +89,11 @@ export interface DaemonOptions {
   attachMs?: number;
   reconnectMs?: number;
   heartbeatMs?: number;
+  /**
+   * How often this agent's leases are looked at and, when past half their time, renewed by asking
+   * the server again (only a holder's request renews a lease); default 20 s, 0 never.
+   */
+  leaseRenewMs?: number;
   fetch?: typeof fetch;
   onError?: (err: unknown) => void;
 }
@@ -122,6 +131,15 @@ const LeaseBody = z.object({
 /** An intent as `POST /intents` answers it: the server's, with the brain in brief for the agent. */
 export type DeclaredIntent = Intent & { brief: string[] };
 
+/** What a lease asked for with no open intent is told: a lease lives and ends with an intent. */
+export const NO_INTENT_FOR_LEASE = "Declare your intent first (declare_intent), then take the lease; it lives and ends with that intent.";
+
+/** Events kept for the next safe point; a daemon no agent attaches to keeps no more than these. */
+const KEPT_EVENTS = 100;
+const keepLast = <T>(list: T[]): void => {
+  if (list.length > KEPT_EVENTS) list.splice(0, list.length - KEPT_EVENTS);
+};
+
 export class Daemon {
   readonly stream: StreamClient;
   private http: Server | undefined;
@@ -130,8 +148,19 @@ export class Daemon {
   /** Brain changes and lease events since the last safe point, for its notes. */
   private brainChanges: BrainChange[] = [];
   private leaseEvents: Lease[] = [];
+  /** Intents the server marked stale since the last safe point (one may be this agent's). */
+  private staleIntents: string[] = [];
   private readonly intents = new Map<string, Intent>();
   private declared: Intent | undefined;
+  /** Leases this agent took through the daemon: the time to live it asked for, so a renewal asks the same. */
+  private readonly leaseTtl = new Map<SymbolId, number>();
+  /** Symbols this agent released itself: their `released` event is no news to it. */
+  private readonly selfReleased = new Set<SymbolId>();
+  /** Whether this agent may hold a lease, so the renewal timer asks the server. */
+  private mayHoldLeases = false;
+  /** Intents this daemon has seen as its own (declared here, or open in the state file). */
+  private readonly ownIntents = new Set<string>();
+  private renewTimer: NodeJS.Timeout | undefined;
   port = 0;
 
   constructor(private readonly opts: DaemonOptions) {
@@ -147,16 +176,24 @@ export class Daemon {
       hold: () => this.attached,
       onWarning: (w) => {
         this.warnings.push(w);
+        keepLast(this.warnings);
       },
       onIntent: (i) => {
         if (i.status === "open") this.intents.set(i.id, i);
         else this.intents.delete(i.id);
+        if (i.status === "stale") {
+          this.staleIntents.push(i.id);
+          keepLast(this.staleIntents);
+        }
       },
       onBrain: (change) => {
         this.brainChanges.push(change);
+        keepLast(this.brainChanges);
       },
       onLease: (lease) => {
         this.leaseEvents.push(lease);
+        keepLast(this.leaseEvents);
+        if (lease.status === "held" && lease.holder.developer === opts.author.developer && lease.holder.agent === opts.author.agent) this.mayHoldLeases = true;
       },
       ...(opts.onError === undefined ? {} : { onError: opts.onError }),
     });
@@ -179,10 +216,18 @@ export class Daemon {
     const info: DaemonInfo = { port: this.port, pid: process.pid, startedAt: new Date().toISOString() };
     await stateDir(this.opts.worktree); // a fresh worktree has no .pitstop/ yet
     await writeFile(daemonInfoPath(this.opts.worktree), `${JSON.stringify(info, null, 2)}\n`);
+    const renewEvery = this.opts.leaseRenewMs ?? 20_000;
+    if (renewEvery > 0) {
+      this.renewTimer = setInterval(() => {
+        this.renewLeases().catch((err: unknown) => this.opts.log?.(`lease renewal failed: ${err instanceof Error ? err.message : String(err)}`));
+      }, renewEvery);
+      this.renewTimer.unref();
+    }
     return this.port;
   }
 
   async close(): Promise<void> {
+    if (this.renewTimer !== undefined) clearInterval(this.renewTimer);
     this.stream.close();
     await new Promise<void>((resolve) => (this.http ? this.http.close(() => resolve()) : resolve()));
     await rm(daemonInfoPath(this.opts.worktree), { force: true });
@@ -233,7 +278,7 @@ export class Daemon {
     const intent = await this.open(text, symbols);
     let brief: string[] = [];
     try {
-      brief = brainBrief(await fetchBrain(this.server), intent.declaredSymbols, this.opts.author);
+      brief = brainBrief(await fetchBrain(this.server), intent.declaredSymbols, this.opts.author, intent.id);
     } catch (err) {
       this.opts.log?.(`brain unavailable: ${err instanceof Error ? err.message : String(err)}`);
     }
@@ -253,6 +298,8 @@ export class Daemon {
       ...(this.opts.log === undefined ? {} : { log: this.opts.log }),
     });
     this.declared = intent;
+    this.ownIntents.add(intent.id);
+    if (this.ownIntents.size > KEPT_EVENTS) this.ownIntents.delete(this.ownIntents.values().next().value as string);
     return intent;
   }
 
@@ -332,21 +379,60 @@ export class Daemon {
 
   /** The repository's brain, one line per ADR, lease and open intent. */
   async brain(): Promise<{ version: number; lines: string[] }> {
-    const brain = await fetchBrain(this.server);
-    return { version: brain.version, lines: brainLines(brain, this.opts.author) };
+    const [brain, { intentId }] = await Promise.all([fetchBrain(this.server), readState(this.opts.worktree)]);
+    return { version: brain.version, lines: brainLines(brain, this.opts.author, intentId) };
   }
 
-  /** Takes (or renews) a lease for this agent's open intent, or releases its own. */
+  /**
+   * Takes a lease for this agent's open intent, or releases its own. A lease lives and ends with an
+   * intent (the daemon renews it while that intent is open, the commit releases it), so with no
+   * open intent the answer is `invalid` and says to declare one first.
+   */
   async lease(symbol: SymbolId, opts: { reason?: string | undefined; ttlSeconds?: number | undefined; release?: boolean | undefined } = {}): Promise<LeaseAnswer> {
-    if (opts.release === true) return releaseLease(this.server, symbol, this.opts.author);
     const { intentId } = await readState(this.opts.worktree);
-    return takeLease(this.server, {
+    if (opts.release === true) {
+      const answer = await releaseLease(this.server, symbol, this.opts.author, intentId);
+      if (answer.status === "released") {
+        this.selfReleased.add(symbol);
+        this.leaseTtl.delete(symbol);
+      }
+      return answer;
+    }
+    if (intentId === undefined) return { status: "invalid", message: NO_INTENT_FOR_LEASE };
+    const answer = await takeLease(this.server, {
       symbol,
       holder: this.opts.author,
       ...(opts.reason === undefined ? {} : { reason: opts.reason }),
       ...(opts.ttlSeconds === undefined ? {} : { ttlSeconds: opts.ttlSeconds }),
-      ...(intentId === undefined ? {} : { intentId }),
+      intentId,
     });
+    if (answer.status === "held") {
+      this.leaseTtl.set(symbol, opts.ttlSeconds ?? LEASE_TTL_SECONDS);
+      this.mayHoldLeases = true;
+    }
+    return answer;
+  }
+
+  /**
+   * Renews this agent's leases on its open intent once half their time is gone, by asking the
+   * server again: only a holder's own request renews a lease (a heartbeat on the stream, which any
+   * reader may send, does not). A crashed daemon renews nothing, so its leases run out (9.3).
+   */
+  async renewLeases(now = Date.now()): Promise<void> {
+    if (!this.mayHoldLeases) return;
+    const { intentId } = await readState(this.opts.worktree);
+    const me = this.opts.author;
+    const mine = intentId === undefined ? [] : (await fetchLeases(this.server)).filter((l) => l.intentId === intentId && holdsLease(l, me, intentId));
+    if (mine.length === 0) {
+      this.mayHoldLeases = false;
+      return;
+    }
+    for (const lease of mine) {
+      const ttl = this.leaseTtl.get(lease.symbol) ?? LEASE_TTL_SECONDS;
+      if (Date.parse(lease.expiresAt) - now > (ttl * 1000) / 2) continue;
+      const answer = await takeLease(this.server, { symbol: lease.symbol, holder: me, reason: lease.reason, ttlSeconds: ttl, intentId });
+      if (answer.status !== "held") this.opts.log?.(`could not renew the lease on ${lease.symbol}: ${answer.message}`);
+    }
   }
 
   /** One line per thing the agent should know after a safe point. */
@@ -355,6 +441,12 @@ export class Daemon {
     const mine = this.warnings.filter((w) => w.agent === this.opts.author.agent);
     this.warnings = [];
     for (const w of mine) notes.push(`warning: ${w.message}`);
+    // This agent's own task, ended by the server: it went quiet too long (its leases went with it).
+    const { intentId: open } = await readState(this.opts.worktree);
+    const ownStale = this.staleIntents.splice(0).filter((id) => id === open || id === this.declared?.id);
+    for (const id of new Set(ownStale)) {
+      notes.push(`your intent ${id} was marked stale (no heartbeat for 5 minutes) and its leases were released; declare_intent again before you take a lease`);
+    }
     // The brain changed: a rule the next commit answers to, or one that no longer applies.
     for (const { version, adr } of this.brainChanges.splice(0)) {
       if (adr.status === "accepted") notes.push(`brain v${version}: ADR-${adr.number} accepted: ${adrLine(adr).slice(`ADR-${adr.number} `.length)}`);
@@ -362,7 +454,7 @@ export class Daemon {
     }
     let editing: Set<string> | undefined;
     const editingNow = async (): Promise<Set<string>> => (editing ??= new Set((await this.opts.applier.diffAgainstMain()).map((f) => f.path)));
-    notes.push(...(await this.leaseNotes(editingNow)));
+    notes.push(...(await this.leaseNotes(editingNow, open, new Set(ownStale))));
     if (applied.length === 0) return notes;
 
     const editingFiles = await editingNow();
@@ -398,19 +490,36 @@ export class Daemon {
 
   /**
    * Leases other agents took or gave up since the last safe point, on symbols this agent declared
-   * or in files it is editing; the last event per symbol.
+   * or in files it is editing; the last event per symbol. And this agent's own leases that ended
+   * without its asking: expired, or released (by an owner) while its intent is still open. Its
+   * commit's releases, its own releases and a stale intent's (noted already) are no news.
    */
-  private async leaseNotes(editing: () => Promise<Set<string>>): Promise<string[]> {
+  private async leaseNotes(editing: () => Promise<Set<string>>, open: string | undefined, stale: Set<string>): Promise<string[]> {
     const me = this.opts.author;
+    if (open !== undefined) this.ownIntents.add(open);
+    // Ours: our author and one of our intents (the same person's other checkout counts as another agent).
+    const ours = (l: Lease) => l.holder.developer === me.developer && l.holder.agent === me.agent && (l.intentId === undefined || this.ownIntents.has(l.intentId));
     const latest = new Map<string, Lease>();
+    const own = new Map<string, Lease>();
     for (const lease of this.leaseEvents.splice(0)) {
-      if (lease.holder.developer === me.developer && lease.holder.agent === me.agent) continue;
-      latest.set(lease.symbol, lease);
+      if (ours(lease)) own.set(lease.symbol, lease);
+      else latest.set(lease.symbol, lease);
     }
-    if (latest.size === 0) return [];
+    const notes: string[] = [];
+    for (const lease of own.values()) {
+      if (lease.status === "held") {
+        this.selfReleased.delete(lease.symbol);
+        continue;
+      }
+      if (this.selfReleased.delete(lease.symbol)) continue;
+      if (lease.intentId !== undefined && stale.has(lease.intentId)) continue;
+      if (lease.status === "released" && (lease.intentId === undefined || lease.intentId !== open)) continue;
+      this.leaseTtl.delete(lease.symbol);
+      notes.push(`your lease on ${lease.symbol} ended (${lease.status}); another agent may take it. Take it again with lease if you still need it`);
+    }
+    if (latest.size === 0) return notes;
     const declared = new Set(this.declared?.declaredSymbols ?? []);
     const files = await editing();
-    const notes: string[] = [];
     for (const lease of latest.values()) {
       const file = lease.symbol.slice(0, lease.symbol.indexOf("#"));
       if (!declared.has(lease.symbol) && !files.has(file)) continue;
@@ -461,7 +570,7 @@ export class Daemon {
         if (!body.success) return json(res, 400, { error: "expected {symbol: path#name, reason?, ttlSeconds?, release?}" });
         const { symbol, ...rest } = body.data;
         const answer = await this.lease(symbol, rest);
-        return json(res, answer.status === "refused" ? 409 : 200, answer);
+        return json(res, answer.status === "leased" ? 409 : 200, answer);
       }
       return json(res, 404, { error: "not_found" });
     } catch (err) {
