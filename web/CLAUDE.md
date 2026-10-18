@@ -3,7 +3,8 @@
 Owner: **Vazovski** (since 18 October 2026, every folder is).
 
 ## Pages (hash routes)
-- `#/` home: signed out, the pitch and "Sign in with GitHub"; signed in, your repositories (`GET /repos`) and "New repository" under your login (`POST /repos`).
+- `#/` home: signed out, the landing (what Pitstop is, the problem with git and many agents, an inline SVG of the model, three features) and "Sign in with GitHub"; signed in, your repositories as cards (`GET /repos`, then each one's members and parked commits for your role, the member count and what waits) and "New repository" under your login (`POST /repos`).
+- A repository's header holds its name, head, the stream's status and the tabs. On the Live tab an onboarding checklist (set up Claude, invite a teammate, mark the resolver) shows until the repository has entries and more than one member. The Conflicts tab re-reads the parked commits every 5 s while open, and leaves the page alone (and any note being typed) when nothing changed.
 - `#/r/<owner>/<name>` a repository: tabs **Live** (below), **Conflicts** (`/repos/:o/:n/parked`: commits waiting for the resolver, their write skew and files; a resolver lets one through or sends it back with a note), **Members** (`/repos/:o/:n/members`: roles, the resolver flag, invites by GitHub login that turn into membership at first sign-in, remove, leave) and **Set up Claude** (makes a personal token with `POST /tokens` and writes the prompt a developer pastes into Claude Code: install Node, git and jj, `npm install -g <server>/pitstop-cli.tgz`, `pitstop setup <server> <repo> --token …`). The administrator's shared token never goes into a prompt.
 - `#/account` personal tokens (make, list, revoke) and sign out.
 - On a server without accounts the header takes the shared token instead (kept in `localStorage`).
@@ -21,6 +22,12 @@ No framework and no bundler: `public/index.html` + `public/style.css`, and `src/
 
 Data: `GET /version`, `GET /me`, `GET /repos`, then one WebSocket to `/stream` subscribed from LSN 0, which replays the whole log and then stays live (`head`, `entry`, `intent`, `warning`, `presence`). Presence is a CRDT (`packages/protocol/src/presence.ts`): after subscribe the server sends the whole document, then each update, and the page merges them into its own copy with `applyPresence`, which `src/app.ts` repeats in a few lines because the page cannot import runtime code from the protocol (no bundler; a value import would pull zod in). Keep the two the same. Ages count from this browser's clock, or from the newest stamp seen when that is ahead. Switching repositories reconnects; a dropped socket reconnects from the last LSN seen. The worktrees are not on the stream: the page reads `GET /repos/:owner/:name/worktrees` (`WorktreesResponse` in `server/src/app.ts`, a server query rather than a protocol message) on `head`, after every live entry and every 3 s while the socket is up. The Dockerfile builds this workspace into the server image.
 
+## Design system
+`public/style.css` starts with the tokens on `:root` (colour: one dark theme, deep neutrals, raised surfaces, one accent, `--ok`/`--warn`/`--bad`/`--repair`; spacing `--s-*`; radius `--r-*`; `--font-sans` for the interface, `--font-mono` only for code, ids, LSNs and paths), then the components: `.btn` (`-primary`, `-secondary`, `-ghost`, `-danger`, `-ok`, sizes `-sm`/`-lg`), `.input`/`.select`/`textarea` with `.field`/`.field-label`, `.switch`, `.card`, `.badge` (`ok`, `warn`, `bad`, `repair`, `accent`), `.pill`, `.avatar`, `.agent` chips, `.tabs`, `.empty-state`, `.skeleton`/`.spinner`/`.loading`, `.codeblock`, `.callout`, `.toast`, `.modal`. Use them before adding new styles. It is responsive down to phone width without horizontal scroll and honours `prefers-reduced-motion`.
+- An agent's colour comes from its name (`hueOf` in `app.ts`, set as `--h`). The live view's render functions stay as they are: a `MutationObserver` on `#pane-live` paints every `.agent` they add.
+- Results of actions (created, invited, copied, landed) are toasts in `#toasts`, an `aria-live` region; a page's state (no access, a failed load) stays inline in its `.msg` line. Removing a member, leaving, withdrawing an invite and revoking a token ask first through `#confirm-dialog`.
+- The Live tab's markup (`#pane-live` and its ids) is restyled from CSS only; other builds add panels inside it.
+
 ## Rules
 - It writes only through the API, as the signed-in user (repositories, members, tokens); the session cookie authenticates it, so no token sits in the page except a shared one pasted on a server without accounts.
 - Message shapes come from `@pitstop/protocol` (type imports only).
@@ -29,4 +36,5 @@ Data: `GET /version`, `GET /me`, `GET /repos`, then one WebSocket to `/stream` s
 
 ## Not yet
 - A worktree's name while it has no open intent: the heartbeat carries only `appliedLsn` and `intentId`, so naming it needs a field in `@pitstop/protocol` (both owners).
+- An intent closed by a commit stays under Open intents until the page reloads: the server marks it committed (`Store.append`) but broadcasts `intent` only when one opens.
 - A daemon that connects already at the head shows up only after its first heartbeat (after an apply, or the 30 s interval in `daemon/src/stream.ts`).
