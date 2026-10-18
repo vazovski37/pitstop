@@ -30,8 +30,22 @@ import {
   type AuthConfig,
   type OAuthProvider,
 } from "./auth.js";
-import { checkedFiles, checkFiles } from "./adr-rules.js";
-import { afterCommit, brainSweep, enforceBrain, loadCommitBrain, registerBrainRoutes, STALE_AFTER_MS, SWEEP_MS, withBrain, type BrainContext } from "./brain.js";
+import { globProblem } from "./adr-rules.js";
+import {
+  afterCommit,
+  brainSweep,
+  checkCommit,
+  enforceBrain,
+  loadCommitBrain,
+  recheckFiles,
+  registerBrainRoutes,
+  STALE_AFTER_MS,
+  SWEEP_MS,
+  withBrain,
+  type BrainContext,
+  type CommitBrain,
+  type RuleCheck,
+} from "./brain.js";
 import { typecheckGate } from "./checks.js";
 import type { GitHubClient } from "./github.js";
 import { MirrorWorker } from "./mirror.js";
@@ -169,7 +183,9 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
         },
       }
     : false;
-  const app = Fastify({ logger, bodyLimit: 32 * 1024 * 1024 });
+  // Symbol ids are path parameters of the query API (`/symbols/:id/history`), and a monorepo's
+  // `packages/web/src/…/InvoiceTable.tsx#InvoiceTable.handleSort` is well past the default 100.
+  const app = Fastify({ logger, bodyLimit: 32 * 1024 * 1024, routerOptions: { maxParamLength: 2_048 } });
   await app.register(websocket);
   await app.register(cookie, deps.sessionSecret === undefined ? {} : { secret: deps.sessionSecret });
   const stream = new Stream(deps.store, deps.version, app.log);
@@ -439,16 +455,27 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     // the committer is the only one who could decide, it bounces back as before.
     const deciders = repair === "agent" ? await decidersOf(repo) : [];
     const parks = deciders.length > 0 && !(user !== undefined && deciders.every((d) => d.userId === user.id));
-    // The brain (9.1, 9.4): the accepted ADRs, the version and the live leases, read before the
-    // append; the advisory ai_review rules asked of a model here too, outside the lock.
-    const brainNow = await loadCommitBrain(deps.store, repo, now());
-    const advisory = await runReviews(deps.reviewer, checkFiles(brainNow.adrs, checkedFiles(request.files)).reviews, request.intent);
+    // The brain (9.1): the accepted ADRs and their version, and the commit's files against their
+    // mechanical rules, before the append and outside the lock. The advisory ai_review rules are
+    // asked of a model only when those rules hold, so a refused commit costs no model call.
+    let brainNow: CommitBrain;
+    let ruleCheck: RuleCheck;
+    try {
+      brainNow = await loadCommitBrain(deps.store, repo, request);
+      ruleCheck = await checkCommit(deps.store, repo, brainNow, request);
+    } catch (err) {
+      if (err instanceof InvalidCommit) return rejected(reply, "invalid_request", err.message);
+      throw err;
+    }
+    const advisory = ruleCheck.introduced.length > 0 ? [] : await runReviews(deps.reviewer, ruleCheck.report.reviews, request.intent);
     let escalated: SkewVerdict | undefined;
     try {
       let skew: SkewVerdict | undefined;
-      const changeset = await deps.store.append(request, async (gap, head): Promise<Decision> => {
-        // A lease another agent holds, or a broken ADR rule, refuses the commit before anything else.
-        const brainCheck = enforceBrain(brainNow, request, request.files);
+      const changeset = await deps.store.append(request, async (gap, head, reads): Promise<Decision> => {
+        // A lease another agent holds (read here, under the lock a grant also takes, 9.4), or a
+        // rule the commit breaks, refuses it before anything else.
+        const leases = await reads.leases(now());
+        const brainCheck = enforceBrain(brainNow, leases, request, ruleCheck);
         const decided = async (): Promise<Decision> => {
           // With a resolver, the validator only reports skew; what happens to it is decided here.
           const outcome = decideCommit(request, gap, head, repair === "off" ? mode : "warn");
@@ -474,7 +501,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
             decision = await repairCommit(input, deps.repairer);
             escalated = undefined;
             // A repair rewrote the files: they answer to the same rules.
-            if (decision.files !== undefined) enforceBrain(brainNow, request, decision.files);
+            if (decision.files !== undefined) enforceBrain(brainNow, leases, request, recheckFiles(brainNow, decision.files, ruleCheck.base));
           } else {
             skew = outcome.skew;
           }
@@ -493,7 +520,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
       stream.notify(repo);
       mirrors?.kick(repo);
       // The intent it closed: every worktree hears it, and its leases go.
-      await afterCommit(brain, repo, request.intentId);
+      await afterCommit(brain, repo, request.intentId, request.author);
       if (skew) {
         // Without a resolver the skew lands as is; the daemon and the live view hear about it.
         stream.broadcast(repo, {
@@ -569,10 +596,11 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     if (decided === undefined) return reply;
     const { parked, login } = decided;
     try {
-      const brainNow = await loadCommitBrain(deps.store, repo, now());
-      const changeset = await deps.store.append(parked.request, (gap, head) => {
+      const brainNow = await loadCommitBrain(deps.store, repo, parked.request);
+      const ruleCheck = await checkCommit(deps.store, repo, brainNow, parked.request);
+      const changeset = await deps.store.append(parked.request, async (gap, head, reads) => {
         // The brain still holds: an ADR accepted, or a lease taken, while it waited.
-        const brainCheck = enforceBrain(brainNow, parked.request, parked.request.files);
+        const brainCheck = enforceBrain(brainNow, await reads.leases(now()), parked.request, ruleCheck);
         // Writes are still checked: a file someone changed since cannot be overwritten blind.
         const outcome = decideCommit(parked.request, gap, head, "warn");
         const found = outcome.skew === undefined ? parked.skew : describeSkew(outcome.skew);
@@ -586,7 +614,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
       await deps.store.decideParked(repo, parked.id, { status: "accepted", decidedBy: login, landedLsn: changeset.lsn });
       stream.notify(repo);
       mirrors?.kick(repo);
-      await afterCommit(brain, repo, parked.request.intentId);
+      await afterCommit(brain, repo, parked.request.intentId, parked.request.author);
       stream.broadcast(repo, {
         type: "warning",
         repo,
@@ -791,10 +819,12 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     if (!(await access(req, reply, repo.data, "reader"))) return reply;
     const limit = Math.min(Math.max(Math.trunc(Number(req.query.limit)) || LOG_PAGE, 1), LOG_PAGE_MAX);
     const touches = req.query.touches;
+    const problem = touches === undefined || touches === "" ? undefined : globProblem(touches);
+    if (problem !== undefined) return reply.code(400).send({ error: "invalid_request", message: `touches: ${problem}` });
     const entries: Changeset[] =
       touches === undefined || touches === ""
         ? await deps.store.entriesAfter(repo.data, fromLsn.data, limit)
-        : await deps.store.findEntries(repo.data, { touches, since: fromLsn.data, limit });
+        : await deps.store.findEntries(repo.data, { touches, since: fromLsn.data, limit, contents: true });
     return entries;
   });
 

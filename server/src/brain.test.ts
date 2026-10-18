@@ -132,9 +132,11 @@ describe("the brain", () => {
     expect(proposed.body).toMatchObject({ number: 1, status: "proposed", version: 0, createdBy: "admin", rules: pagesAdr.rules });
     expect(await inbox.take(isBrain)).toMatchObject({ version: 0, adr: { number: 1, status: "proposed" } });
 
-    const bad = await call("POST", `/repos/${REPO}/adrs`, { title: "t", decision: "d", rules: [{ kind: "forbid_pattern", files: "**", pattern: "(a+)+" }] });
+    const bad = await call("POST", `/repos/${REPO}/adrs`, { title: "t", decision: "d", rules: [{ kind: "forbid_pattern", files: "**", pattern: "(a)\\1" }] });
     expect(bad).toMatchObject({ status: 400, body: { error: "invalid_request" } });
-    expect(bad.body.message).toMatch(/nested quantifiers/);
+    expect(bad.body.message).toMatch(/linear time/);
+    const badGlob = await call("POST", `/repos/${REPO}/adrs`, { title: "t", decision: "d", rules: [{ kind: "forbid_import", files: "src/{pages", target: "src/db/**" }] });
+    expect(badGlob.body.message).toMatch(/files: unbalanced/);
     expect((await call("POST", `/repos/${REPO}/adrs`, { title: "no decision" })).status).toBe(400);
 
     expect(await call("POST", `/repos/${REPO}/adrs/1/accept`)).toMatchObject({ status: 200, body: { version: 1, adr: { status: "accepted", version: 1, decidedBy: "admin" } } });
@@ -234,10 +236,38 @@ describe("the brain", () => {
       repo: REPO,
       head: 2,
       version: 1,
-      checkedFiles: 4,
+      checkedFiles: 1, // only the files a rule covers are read
       violations: [{ adr: 1, title: "Pages never touch the database", rule: "forbid_import src/pages/** -> src/db/**", file: "src/pages/Old.tsx", line: 1, detail: "imports src/db/client.ts" }],
       queue: [{ lsn: 2, intent: "the old page", brainVersion: 0, files: ["src/pages/Old.tsx"], adrs: [1] }],
     });
+    expect((await call("GET", `/repos/${REPO}/brain/recheck`)).body).toEqual(recheck.body); // remembered per head and version
+  });
+
+  it("does not block an edit to a file for a violation it already had: the old one is noted for the re-check queue", async () => {
+    const { call, commit } = await start();
+    const legacy = 'import { db } from "../db/client.js";\nexport const Legacy = 1;\n';
+    accepted(await commit({ baseLsn: 1, intent: "legacy page", files: [{ path: "src/pages/Legacy.tsx", op: "add", content: legacy }] }));
+    await call("POST", `/repos/${REPO}/adrs`, pagesAdr);
+    await call("POST", `/repos/${REPO}/adrs/1/accept`);
+    const typo = accepted(await commit({ baseLsn: 2, intent: "fix a typo", files: [{ path: "src/pages/Legacy.tsx", op: "modify", content: legacy.replace("= 1", "= 2") }] }));
+    expect(typo.checks.adr).toBe("pass");
+    expect(typo.checks.details).toContain("pre-existing, on the re-check queue: ADR-1 src/pages/Legacy.tsx:1 imports src/db/client.ts");
+    const worse = refusal(await commit({ baseLsn: 3, intent: "query here too", files: [{ path: "src/pages/Legacy.tsx", op: "modify", content: `${legacy}export const rows = () => db.query("x");\n` }] }));
+    expect(worse.message).toContain("src/pages/Legacy.tsx:3 calls db.query()");
+    expect(worse.message).not.toContain("Legacy.tsx:1 imports");
+    expect(worse.message).toMatch(/1 older violation was already in these files before your change/);
+    // A rename carries its content when it lands where a rule looks.
+    const blind = await commit({ baseLsn: 3, intent: "move", files: [{ path: "src/pages/Db.tsx", op: "rename", fromPath: "src/db/client.ts" }] });
+    expect(blind).toMatchObject({ status: 400, body: { reason: "invalid_request" } });
+  });
+
+  it("reads forbid_import's aliases from the project's tsconfig.json", async () => {
+    const { call, commit } = await start();
+    accepted(await commit({ baseLsn: 1, intent: "tsconfig", files: [{ path: "tsconfig.json", op: "add", content: '{ "compilerOptions": { "paths": { "#db/*": ["./src/db/*"] } } }\n' }] }));
+    await call("POST", `/repos/${REPO}/adrs`, pagesAdr);
+    await call("POST", `/repos/${REPO}/adrs/1/accept`);
+    const aliased = refusal(await commit({ baseLsn: 2, files: [{ path: "src/pages/A.tsx", op: "add", content: 'import { db } from "#db/client";\n' }] }));
+    expect(aliased.message).toContain("src/pages/A.tsx:1 imports src/db/client.ts");
   });
 
   it("leases a symbol to one agent: a second is refused, so is its commit writing it, and the holder's commit releases it", async () => {
@@ -276,8 +306,11 @@ describe("the brain", () => {
     const symbol = "src/a.ts#a";
     await call("POST", `/repos/${REPO}/leases`, { symbol, agent: "agent-a", developer: "alice" });
     const url = (extra: string) => `/repos/${REPO}/leases?symbol=${encodeURIComponent(symbol)}${extra}`;
-    expect(await call("DELETE", url("&agent=agent-b"))).toMatchObject({ status: 403 });
-    expect(await call("DELETE", url("&agent=agent-a"))).toMatchObject({ status: 200, body: { status: "released", holder: alice } });
+    expect(await call("DELETE", url("&agent=agent-b&developer=bob"))).toMatchObject({ status: 403 });
+    // Every daemon's agent may be named the same: the developer must match too.
+    expect(await call("DELETE", url("&agent=agent-a&developer=bob"))).toMatchObject({ status: 403 });
+    expect(await call("DELETE", url("&agent=agent-a"))).toMatchObject({ status: 403 });
+    expect(await call("DELETE", url("&agent=agent-a&developer=alice"))).toMatchObject({ status: 200, body: { status: "released", holder: alice } });
     expect(await call("DELETE", url(""))).toMatchObject({ status: 404 });
     await call("POST", `/repos/${REPO}/leases`, { symbol, agent: "agent-a", developer: "alice" });
     expect(await call("DELETE", url(""))).toMatchObject({ status: 200 }); // the administrator
@@ -304,20 +337,71 @@ describe("the brain", () => {
     expect((await call("GET", `/repos/${REPO}/brain`)).body).toMatchObject({ leases: [], intents: [] });
   });
 
-  it("renews an intent's leases when its heartbeat arrives on the stream", async () => {
+  it("renews a lease only when its holder asks again: a heartbeat, which any reader may send, renews nothing", async () => {
     const { call, inbox, shift } = await start();
     const intent = (await call("POST", "/intents", { repo: REPO, author: alice, baseLsn: 1, text: "busy", declaredSymbols: [] })).body as unknown as Intent;
     shift(-50_000); // taken 50 s ago, for 60 s: 10 s left
     const taken = (await call("POST", `/repos/${REPO}/leases`, { symbol: "src/a.ts#a", agent: "agent-a", developer: "alice", intentId: intent.id, ttlSeconds: 60 })).body as unknown as { lease: Lease };
     shift(0);
     inbox.socket.send(JSON.stringify({ type: "heartbeat", intentId: intent.id, appliedLsn: 1 }));
-    let lease: Lease | undefined;
-    for (let i = 0; i < 100; i++) {
-      [lease] = (await call("GET", `/repos/${REPO}/leases`)).body as unknown as Lease[];
-      if (lease !== undefined && lease.expiresAt !== taken.lease.expiresAt) break;
-      await new Promise((wake) => setTimeout(wake, 10));
-    }
-    expect(Date.parse(lease?.expiresAt ?? "")).toBeGreaterThan(Date.parse(taken.lease.expiresAt) + 40_000);
+    await new Promise((wake) => setTimeout(wake, 100));
+    expect(((await call("GET", `/repos/${REPO}/leases`)).body as unknown as Lease[])[0]?.expiresAt).toBe(taken.lease.expiresAt);
+    const renewed = await call("POST", `/repos/${REPO}/leases`, { symbol: "src/a.ts#a", agent: "agent-a", developer: "alice", intentId: intent.id, ttlSeconds: 60 });
+    expect(renewed).toMatchObject({ status: 200, body: { renewed: true } });
+    expect(Date.parse((renewed.body as unknown as { lease: Lease }).lease.expiresAt)).toBeGreaterThan(Date.parse(taken.lease.expiresAt) + 40_000);
+  });
+
+  it("checks leases under the append's lock: one granted while a commit waited on a model review still refuses it", async () => {
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    let asked = false;
+    const reviewer: Reviewer = {
+      review: async () => {
+        asked = true;
+        await gate;
+        return "fine";
+      },
+    };
+    const { app, call } = await start({ reviewer });
+    const symbol = "src/services/users.ts#getUser";
+    await call("POST", `/repos/${REPO}/adrs`, { title: "Services are reviewed", decision: "d", rules: [{ kind: "ai_review", files: "src/services/**", question: "ok?" }] });
+    await call("POST", `/repos/${REPO}/adrs/1/accept`);
+    const pending = app.inject({ method: "POST", url: "/commit", payload: commitBody({ baseLsn: 1, author: bob, files: [{ path: "src/services/users.ts", op: "modify", content: "export const getUser = () => 2;\n" }], writeSet: [symbol] }) });
+    while (!asked) await new Promise((wake) => setTimeout(wake, 5));
+    expect((await call("POST", `/repos/${REPO}/leases`, { symbol, agent: "agent-a", developer: "alice", reason: "reshaping it" })).status).toBe(201);
+    release();
+    const answer = CommitResponse.parse((await pending).json());
+    expect(answer).toMatchObject({ status: "rejected", reason: "constraint_failed" });
+    expect(answer.status === "rejected" && answer.message).toContain(`${symbol} is leased to agent-a (alice)`);
+  });
+
+  it("holds a lease for the intent that took it, so the same person's other checkout is refused too", async () => {
+    const { call, commit } = await start();
+    const symbol = "src/auth/session.ts#getCurrentUser";
+    const mine = (await call("POST", "/intents", { repo: REPO, author: alice, baseLsn: 1, text: "fix auth", declaredSymbols: [symbol] })).body as unknown as Intent;
+    const other = (await call("POST", "/intents", { repo: REPO, author: alice, baseLsn: 1, text: "other checkout", declaredSymbols: [] })).body as unknown as Intent;
+    expect((await call("POST", `/repos/${REPO}/leases`, { symbol, agent: "agent-a", developer: "alice", intentId: mine.id })).status).toBe(201);
+    expect(await call("POST", `/repos/${REPO}/leases`, { symbol, agent: "agent-a", developer: "alice", intentId: other.id })).toMatchObject({ status: 409 });
+    const write = { baseLsn: 1, files: [{ path: "src/auth/session.ts", op: "modify" as const, content: "export function getCurrentUser() { return 1; }\n" }], writeSet: [symbol] };
+    expect(refusal(await commit({ ...write, intentId: other.id })).message).toContain(`${symbol} is leased to agent-a (alice) for intent ${mine.id}`);
+    accepted(await commit({ ...write, intentId: mine.id }));
+  });
+
+  it("holds a leased symbol's whole file against a commit without symbol sets", async () => {
+    const { call, commit } = await start();
+    const symbol = "src/auth/session.ts#getCurrentUser";
+    await call("POST", `/repos/${REPO}/leases`, { symbol, agent: "agent-a", developer: "alice" });
+    const js = refusal(await commit({ baseLsn: 1, author: bob, files: [{ path: "src/auth/session.ts", op: "modify", content: "export function getCurrentUser() { return 2; }\n" }] }));
+    expect(js.message).toContain("your commit has no symbol sets, so a lease holds its whole file, src/auth/session.ts");
+    accepted(await commit({ baseLsn: 1, author: bob, files: [{ path: "src/other.ts", op: "add", content: "x\n" }] }));
+  });
+
+  it("answers the query API for a symbol id longer than 100 characters", async () => {
+    const { call } = await start();
+    const symbol = "packages/web/src/features/billing/components/InvoiceTable/InvoiceTable.tsx#InvoiceTable.handleSortByDueDateDescending";
+    expect(symbol.length).toBeGreaterThan(110);
+    expect((await call("GET", `/repos/${REPO}/symbols/${encodeURIComponent(symbol)}/history`)).status).toBe(200);
+    expect((await call("GET", `/repos/${REPO}/symbols/${encodeURIComponent(symbol)}/callers`)).status).toBe(200);
   });
 
   it("broadcasts a plain escalation as a warning, as a parked one is", async () => {
@@ -357,7 +441,9 @@ describe("the brain", () => {
 
     const why = await call("GET", `/repos/${REPO}/why?path=src/auth/session.ts`);
     expect((why.body.entries as unknown as { lsn: number; op: string }[]).map((e) => [e.lsn, e.op])).toEqual([[2, "modify"], [1, "add"]]);
+    expect(((await call("GET", `/repos/${REPO}/why?path=src/auth/session.ts&limit=1&before=2`)).body.entries as unknown as { lsn: number }[]).map((e) => e.lsn)).toEqual([1]);
     expect((await call("GET", `/repos/${REPO}/why`)).status).toBe(400);
+    expect((await call("GET", `/log?repo=${REPO}&touches=${encodeURIComponent("src/{a")}`)).status).toBe(400);
 
     const log = await call("GET", `/log?repo=${REPO}&touches=${encodeURIComponent("src/pages/**")}&since=1`);
     expect((log.body as unknown as { lsn: number }[]).map((e) => e.lsn)).toEqual([3]);
@@ -378,8 +464,13 @@ describe("the brain with accounts", () => {
     const owner = await tokenOf("alice", 1);
     const writer = await tokenOf("bob", 2);
     const stranger = await tokenOf("eve", 3);
+    const reader = await tokenOf("rita", 4);
     expect((await app.inject({ method: "POST", url: "/repos", payload: { id: "alice/app" }, headers: owner.headers })).statusCode).toBe(201);
     await store.setMember("alice/app", writer.user.id, "writer");
+    await store.setMember("alice/app", reader.user.id, "reader");
+    // The re-check reads file contents and runs every rule: writers only.
+    expect((await app.inject({ method: "GET", url: "/repos/alice/app/brain/recheck", headers: reader.headers })).statusCode).toBe(403);
+    expect((await app.inject({ method: "GET", url: "/repos/alice/app/brain/recheck", headers: writer.headers })).statusCode).toBe(200);
 
     const proposed = await app.inject({ method: "POST", url: "/repos/alice/app/adrs", headers: writer.headers, payload: { title: "t", decision: "d", by: "mallory" } });
     expect(proposed.statusCode).toBe(201);
