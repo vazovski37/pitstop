@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * The Pitstop MCP server for coding agents (Claude Code for the hackathon), over stdio.
- * Tools: declare_intent, commit, why, callers, status. Each talks to the worktree's daemon
+ * Tools: declare_intent, commit, why, callers, status, who (who.ts). Each talks to the worktree's daemon
  * (its port in .pitstop/daemon.json), never to the server. `similar` waits for the server's
  * semantic endpoint.
  *
@@ -20,6 +20,7 @@ import { ensureDaemon, findWorktree, type EnsureResult } from "./autostart.js";
 import { BUNDLED } from "./build-info.js";
 import { DaemonClient } from "./client.js";
 import { DESCRIPTIONS, makeTools, type ToolResult } from "./tools.js";
+import { makeWho, WHO_DESCRIPTION } from "./who.js";
 
 export { DaemonClient, NoDaemon } from "./client.js";
 export { DESCRIPTIONS, makeTools } from "./tools.js";
@@ -99,6 +100,9 @@ export function buildServer(worktree: string, opts: ServerOptions = {}): McpServ
     { title: "Pitstop status", description: DESCRIPTIONS.status, inputSchema: {} },
     async () => asContent(await tools.status()),
   );
+
+  const who = makeWho(new DaemonClient(worktree), opts.ensureDaemon === undefined ? {} : { ensureDaemon: opts.ensureDaemon });
+  server.registerTool("who", { title: "Who else is working here", description: WHO_DESCRIPTION, inputSchema: {} }, async () => asContent(await who()));
 
   return server;
 }

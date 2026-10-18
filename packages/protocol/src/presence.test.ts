@@ -6,6 +6,7 @@ import {
   mergePresence,
   parseStamp,
   presenceOverlaps,
+  PresenceStamp,
   stampOf,
   type PresenceDoc,
   type PresenceEntry,
@@ -119,6 +120,23 @@ describe("HybridClock", () => {
     const ahead = stampOf(9_000, 4, "a");
     behind.observe(ahead);
     expect(behind.tick() > ahead).toBe(true);
+  });
+
+  it("carries a full counter into the next millisecond, so every stamp still fits the schema and orders after", () => {
+    const seen = stampOf(1_050_000, 999_999, "w_peer");
+    const clock = new HybridClock("w_me", () => 1_000_000);
+    clock.observe(seen);
+    const next = clock.tick();
+    expect(PresenceStamp.safeParse(next).success).toBe(true);
+    expect(next > seen).toBe(true);
+    expect(parseStamp(next)).toMatchObject({ wall: 1_050_001 });
+
+    // The same through tick alone: a stuck wall clock and a million writes in one millisecond.
+    const stuck = new HybridClock("w_me", () => 7);
+    let last = stuck.tick();
+    for (let i = 0; i < 1_000_001; i++) last = stuck.tick();
+    expect(PresenceStamp.safeParse(last).success).toBe(true);
+    expect(parseStamp(last)).toEqual({ wall: 8, counter: 1, replica: "w_me" });
   });
 });
 

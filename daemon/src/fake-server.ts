@@ -6,6 +6,9 @@
  * Behaviour copied from server/src/stream.ts: `hello` on connect, then after `subscribe` a
  * `head` for the repository, every entry above `fromLsn` in order, then entries appended by
  * commits as they happen. One repository only (`DEFAULT_REPO` unless the request names one).
+ * Presence is relayed as the server does it: merged with the protocol's `applyPresence`, passed
+ * on to every subscriber when it changed the document, and the whole document after `head`
+ * (no tombstone for a socket that closes: the daemon writes its own).
  */
 import { readFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
@@ -13,6 +16,7 @@ import type { AddressInfo } from "node:net";
 import { pathToFileURL } from "node:url";
 import { WebSocketServer, type WebSocket } from "ws";
 import {
+  applyPresence,
   ClientMessage,
   CommitRequest,
   DEFAULT_REPO,
@@ -22,6 +26,8 @@ import {
   type Changeset,
   type CommitResponse,
   type Intent,
+  type PresenceDoc,
+  type PresenceEntry,
   type Repo,
 } from "@pitstop/protocol";
 
@@ -61,6 +67,10 @@ export interface FakeServer {
   append(changeset: Changeset): void;
   /** Makes the next `POST /commit` answer `rejected` with this, like the validator or repair would. */
   rejectNextCommit(rejection: Rejection): void;
+  /** The presence document merged from every `presence` message so far. */
+  presence(): PresenceDoc;
+  /** Merges a presence entry as if another worktree had sent it, and passes it on when it changed the document. */
+  putPresence(entry: PresenceEntry): void;
   close(): Promise<void>;
 }
 
@@ -114,6 +124,16 @@ export async function startFakeServer(opts: FakeServerOptions = {}): Promise<Fak
   const append = (changeset: Changeset) => {
     entries.push(changeset);
     for (const socket of subscribers.keys()) deliver(socket);
+  };
+
+  let presence: PresenceDoc = {};
+  const putPresence = (entry: PresenceEntry) => {
+    const before = presence;
+    presence = applyPresence(presence, entry);
+    if (presence === before) return;
+    for (const [socket, sub] of subscribers) {
+      if (sub.lastSentLsn !== null) sendTo(socket, { type: "presence", repo: entry.repo, entries: [entry] });
+    }
   };
 
   const handle = async (req: IncomingMessage, res: ServerResponse) => {
@@ -216,9 +236,13 @@ export async function startFakeServer(opts: FakeServerOptions = {}): Promise<Fak
       received.push(parsed.data);
       if (parsed.data.type === "subscribe") {
         subscribers.set(socket, { lastSentLsn: parsed.data.fromLsn });
-        sendTo(socket, { type: "head", repo: parsed.data.repo ?? DEFAULT_REPO, headLsn: headLsn() });
+        const repo = parsed.data.repo ?? DEFAULT_REPO;
+        sendTo(socket, { type: "head", repo, headLsn: headLsn() });
+        const present = Object.values(presence);
+        if (present.length > 0) sendTo(socket, { type: "presence", repo, entries: present });
         deliver(socket);
       }
+      if (parsed.data.type === "presence" && subscribers.get(socket)?.lastSentLsn !== null) putPresence(parsed.data.entry);
     });
   });
 
@@ -236,6 +260,8 @@ export async function startFakeServer(opts: FakeServerOptions = {}): Promise<Fak
     rejectNextCommit: (rejection) => {
       rejectNext = rejection;
     },
+    presence: () => presence,
+    putPresence,
     close: () =>
       new Promise<void>((resolve, reject) => {
         for (const socket of subscribers.keys()) socket.terminate();

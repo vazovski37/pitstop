@@ -62,7 +62,7 @@ With accounts on, a teammate needs to be a writer of the repository first: after
 
 ## What Claude Code gets
 
-Five tools:
+Six tools:
 
 | Tool | What it does |
 | --- | --- |
@@ -71,8 +71,11 @@ Five tools:
 | `why` | which entries touched a file, latest first, with their intents and repairs |
 | `callers` | which entries read a symbol and which changed it |
 | `status` | where this checkout stands: applied and head entry, pending entries, open intents |
+| `who` | who else is working in the repository right now: each agent, its developer, working or idle, its intent, the files and symbols it is in, how fresh that is, and which of those files you are in too |
 
-After every tool call the hook tells the daemon the agent is between tools. Entries that arrived meanwhile are applied then, and the agent is told what they touched: a symbol its change reads, a file it is editing, a conflict left in a file, a warning from the server. Without an agent attached, the daemon applies entries as they arrive.
+After every tool call the hook tells the daemon the agent is between tools. Entries that arrived meanwhile are applied then, and the agent is told what they touched: a symbol its change reads, a file it is editing, a conflict left in a file, a warning from the server, and another agent working in the same files or symbols right now (once, while it lasts). Without an agent attached, the daemon applies entries as they arrive.
+
+**Presence.** Each checkout's daemon tells the server, every heartbeat, what its agent is doing: working or idle, the open intent, the files with unfinished edits, the declared symbols. The server merges these into one live document per repository (a CRDT, so every copy agrees whatever order updates arrive in) and passes it to every checkout and to the website's Live tab. It is only ever a heads-up: nothing is refused because of it. A stopped daemon leaves at once; one that vanishes (a laptop that sleeps) fades out after two minutes. The daemon's own id for the checkout is in `.pitstop/replica`; if you copy a checkout folder, delete that file in the copy (the daemon's log says so when two checkouts share one).
 
 The same loop by hand, from a terminal in the checkout: `pitstop intent -m "…" -s path#name`, `pitstop commit -m "…"`, `pitstop status`, `pitstop safe-point`.
 

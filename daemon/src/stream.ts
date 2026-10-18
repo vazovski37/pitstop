@@ -30,6 +30,12 @@ export interface StreamOptions {
   onGap?: (expected: number, got: number) => void;
   onWarning?: (warning: Warning) => void;
   onIntent?: (intent: Intent) => void;
+  /** The server answered `subscribe` with `head`: messages about the repository now reach it (presence.ts publishes then). */
+  onSubscribed?: () => void;
+  /** Presence entries to merge (design doc 9.5): after subscribe the whole document, then each update. */
+  onPresence?: (message: Extract<ServerMessage, { type: "presence" }>) => void;
+  /** A periodic heartbeat went out (presence.ts sends its keepalive along). */
+  onHeartbeat?: () => void;
   /** An apply failed, or the log keeps skipping the next LSN: the daemon has stopped and closed the connection. */
   onError?: (err: unknown) => void;
 }
@@ -138,6 +144,11 @@ export class StreamClient {
         if (message.headLsn < this.applied) {
           this.log(`this worktree is at #${this.applied}, ahead of the log; was the state file copied?`);
         }
+        this.opts.onSubscribed?.();
+        break;
+      case "presence":
+        // Not logged here: keepalives arrive every heartbeat; presence.ts logs arrivals and departures.
+        this.opts.onPresence?.(message);
         break;
       case "entry":
         this.head = Math.max(this.head ?? 0, message.changeset.lsn);
@@ -164,9 +175,17 @@ export class StreamClient {
     if (this.socket?.readyState === WebSocket.OPEN) this.socket.send(JSON.stringify(message));
   }
 
+  /** Sends a message that is not part of the log's flow (presence); false when the socket is not open. */
+  publish(message: ClientMessage): boolean {
+    if (this.socket?.readyState !== WebSocket.OPEN) return false;
+    this.socket.send(JSON.stringify(message));
+    return true;
+  }
+
   private async sendHeartbeat(): Promise<void> {
     const { intentId } = await readState(this.opts.worktree).catch(() => ({ intentId: undefined }));
     this.send({ type: "heartbeat", appliedLsn: this.applied, ...(intentId === undefined ? {} : { intentId }) });
+    this.opts.onHeartbeat?.();
   }
 
   private drain(force = false, applied?: Applied[]): Promise<void> {

@@ -158,6 +158,8 @@ describe.skipIf(!available)("JjWorktree against a real colocated repo", { timeou
     expect(a).toMatchObject({ content: "a1\na2-local\na3\n", blob: blobHash("a1\na2-local\na3\n") });
     expect(files.find((f) => f.path === "b.txt")?.content).toBeUndefined();
     expect(files.some((f) => f.path.startsWith(".pitstop"))).toBe(false);
+    // The same paths without the contents, for presence.
+    expect((await wt.changedPaths()).sort()).toEqual(files.map((f) => f.path).sort());
   });
 
   it("reports nothing when @ is empty", async () => {

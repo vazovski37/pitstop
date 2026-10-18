@@ -1,10 +1,13 @@
 import type { FastifyBaseLogger } from "fastify";
 import type { RawData, WebSocket } from "ws";
-import { ClientMessage, DEFAULT_REPO, type Lsn, type RepoId, type ServerMessage } from "@pitstop/protocol";
+import { ClientMessage, DEFAULT_REPO, type Lsn, type PresenceEntry, type RepoId, type ServerMessage } from "@pitstop/protocol";
+import { nextStamp, PresenceDocs } from "./presence.js";
 import type { Store } from "./store.js";
 
 /** Entries read from the store per delivery round. */
 const PAGE = 200;
+/** The replicas one socket may write presence for: a daemon writes one, its worktree's. */
+export const PRESENCE_REPLICAS_PER_SOCKET = 4;
 
 interface Subscriber {
   socket: WebSocket;
@@ -20,6 +23,31 @@ interface Subscriber {
   sending: Promise<void>;
   /** Asked again before every delivery: a member removed, a repository made private or a token revoked cuts the socket off. */
   canRead: (repo: RepoId) => Promise<boolean>;
+  /** Messages from the socket are handled one at a time, in order: a `presence` right after `subscribe` finds the repository set. */
+  handling: Promise<void>;
+  /** The signed-in user's login, when the socket stands for one: the `author.developer` of its presence. */
+  developer: string | undefined;
+  /** Whether the socket may write presence to a repository (writer access); asked for every `presence` it sends. */
+  canWrite: (repo: RepoId) => Promise<boolean>;
+  /** The replicas this socket wrote presence for, with the repository and the stamp of its last write: tombstoned when it closes. */
+  published: Map<string, { repo: RepoId; stamp: string }>;
+  /** A refused `presence` from this socket was logged already: one line per socket, not one per keepalive. */
+  refusalLogged: boolean;
+}
+
+/** What `connect` knows about the caller besides what it may read. */
+export interface ConnectOptions {
+  /**
+   * The login of the user the socket stands for (a personal token or a session): presence from
+   * it is written as that developer, whatever the entry says, as commits are (app.ts).
+   */
+  developer?: string | undefined;
+  /**
+   * Whether the socket may write presence to a repository: writer access, as for intents, because
+   * what presence says (an intent's text, files) reaches the members' coding agents as notes.
+   * Absent, the socket writes no presence at all; reading a repository is never enough.
+   */
+  canWrite?: (repo: RepoId) => Promise<boolean>;
 }
 
 /**
@@ -49,18 +77,42 @@ export class Stream {
     private readonly store: Store,
     private readonly version: string,
     private readonly log?: FastifyBaseLogger,
+    /** Each repository's presence document (presence.ts), in this process like the subscribers. */
+    readonly presence: PresenceDocs = new PresenceDocs(),
   ) {}
 
   /**
    * Wires a new connection: `hello` first (with the default repository's head), then whatever the
-   * daemon asks for. `canRead` decides which repositories this socket may follow (auth.ts).
+   * daemon asks for. `canRead` decides which repositories this socket may follow (auth.ts);
+   * `options.developer` names the signed-in user behind it, if any, and `options.canWrite` says
+   * where it may write presence (nowhere when absent).
    */
-  connect(socket: WebSocket, canRead: (repo: RepoId) => Promise<boolean> = async () => true): void {
-    const sub: Subscriber = { socket, repo: null, lastSentLsn: null, appliedLsn: null, intentId: null, sending: Promise.resolve(), canRead };
+  connect(socket: WebSocket, canRead: (repo: RepoId) => Promise<boolean> = async () => true, options: ConnectOptions = {}): void {
+    const sub: Subscriber = {
+      socket,
+      repo: null,
+      lastSentLsn: null,
+      appliedLsn: null,
+      intentId: null,
+      sending: Promise.resolve(),
+      canRead,
+      handling: Promise.resolve(),
+      developer: options.developer,
+      canWrite: options.canWrite ?? (async () => false),
+      published: new Map(),
+      refusalLogged: false,
+    };
     this.subs.add(sub);
-    socket.on("close", () => this.subs.delete(sub));
+    socket.on("close", () => {
+      this.subs.delete(sub);
+      // After whatever the socket sent before it closed: a presence still being handled lands
+      // first, and its tombstone follows it instead of coming before it.
+      sub.handling = sub.handling.then(() => this.leave(sub)).catch((err) => this.log?.warn({ err }, "presence leave failed"));
+    });
     socket.on("error", (err) => this.log?.warn({ err }, "stream socket error"));
-    socket.on("message", (raw) => void this.onMessage(sub, raw, canRead));
+    socket.on("message", (raw) => {
+      sub.handling = sub.handling.then(() => this.onMessage(sub, raw, canRead)).catch((err) => this.log?.warn({ err }, "stream message failed"));
+    });
     // hello carries the default repository's head only for a socket that may read it; the head
     // that matters comes with `head` after subscribe.
     sub.sending = canRead(DEFAULT_REPO)
@@ -129,6 +181,9 @@ export class Stream {
           .then(async () => {
             this.send(sub, { type: "head", repo, headLsn: await this.store.headLsn(repo) });
             for (const intent of await this.store.openIntents(repo)) this.send(sub, { type: "intent", intent });
+            // Then the whole presence document, tombstones included, for the subscriber to merge.
+            const present = this.presence.entries(repo);
+            if (present.length > 0) this.send(sub, { type: "presence", repo, entries: present });
           })
           .catch((err) => this.fail(sub, err));
         sub.lastSentLsn = message.fromLsn;
@@ -143,6 +198,57 @@ export class Stream {
         // Only for the repository this socket follows: an id from elsewhere refreshes nothing.
         if (message.intentId !== undefined && sub.repo !== null) await this.store.heartbeat(sub.repo, message.intentId);
         break;
+      case "presence":
+        await this.onPresence(sub, message.entry);
+        break;
+    }
+  }
+
+  /**
+   * A worktree's presence (design doc 9.5): merged into its repository's document and, when that
+   * changed the document, passed on to every socket following the repository, the sender
+   * included. Only for the repository this socket follows, only with write access to it (what
+   * presence says reaches other members' agents), and for at most PRESENCE_REPLICAS_PER_SOCKET
+   * replicas; a signed-in user's entries carry their login as the developer, and a replica
+   * another user holds while it is live is theirs (presence.ts). A stale or duplicate entry
+   * changes nothing and goes nowhere.
+   */
+  private async onPresence(sub: Subscriber, sent: PresenceEntry): Promise<void> {
+    if (sub.repo === null || sent.repo !== sub.repo) return;
+    if (!(await sub.canWrite(sub.repo))) return this.refused(sub, sent, "no write access to the repository");
+    if (!sub.published.has(sent.replica) && sub.published.size >= PRESENCE_REPLICAS_PER_SOCKET) {
+      return this.refused(sub, sent, `more than ${PRESENCE_REPLICAS_PER_SOCKET} replicas from one socket`);
+    }
+    const entry = sub.developer === undefined ? sent : { ...sent, author: { ...sent.author, developer: sub.developer } };
+    const offered = this.presence.offer(entry, sub.developer ?? "shared");
+    if (!offered.changed) {
+      if (offered.refused !== undefined) this.refused(sub, entry, offered.refused);
+      return;
+    }
+    sub.published.set(entry.replica, { repo: entry.repo, stamp: entry.stamp });
+    this.broadcast(entry.repo, { type: "presence", repo: entry.repo, entries: [entry] });
+  }
+
+  /** A refused presence write: logged once per socket, so a refused keepalive every 30 s does not flood the log. */
+  private refused(sub: Subscriber, entry: PresenceEntry, reason: string): void {
+    if (sub.refusalLogged) return;
+    sub.refusalLogged = true;
+    this.log?.warn({ repo: sub.repo, replica: entry.replica, reason }, "presence refused (further refusals on this socket are not logged)");
+  }
+
+  /**
+   * A socket that wrote presence closed: each replica it wrote leaves at once, through a tombstone
+   * stamped just after that replica's last stamp, instead of fading out after the TTL. A replica
+   * someone wrote since (the same daemon, reconnected on a new socket) is not leaving and is left
+   * alone; a later write from the replica itself carries a newer clock and wins over the tombstone.
+   */
+  private leave(sub: Subscriber): void {
+    for (const [replica, { repo, stamp }] of sub.published) {
+      const current = this.presence.get(repo, replica);
+      if (current === undefined || current.stamp !== stamp || current.state === "gone") continue;
+      const { intent: _intent, intentId: _intentId, ...rest } = current;
+      const tombstone: PresenceEntry = { ...rest, state: "gone", files: [], symbols: [], stamp: nextStamp(current.stamp) };
+      if (this.presence.apply(tombstone)) this.broadcast(repo, { type: "presence", repo, entries: [tombstone] });
     }
   }
 

@@ -83,7 +83,9 @@ describe("daemon with its local API", () => {
 
   it("keeps the read base where the work began through a safe point; only a skew refusal moves it", async () => {
     await start();
-    await waitFor(() => applier.lsns.includes(122));
+    // The daemon writes the state file after the apply returns: wait for that write, or it lands
+    // after ours and drops the read base (seen under load).
+    await waitFor(async () => (await readState(worktree)).appliedLsn === 122);
     await writeState(worktree, { appliedLsn: 122, readBaseLsn: 120, intentId: "int_09" });
     await safePoint(); // attaches the agent, applies nothing
     server.append(entryAt(123));
