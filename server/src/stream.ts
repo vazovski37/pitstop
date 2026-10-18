@@ -166,12 +166,10 @@ export class Stream {
     switch (message.type) {
       case "subscribe": {
         const repo = message.repo ?? DEFAULT_REPO;
-        if ((await this.store.getRepo(repo)) === undefined) {
-          sub.socket.close(1008, `unknown repo ${repo}: POST /repos first`);
-          return;
-        }
-        if (!(await canRead(repo))) {
-          sub.socket.close(1008, `no read access to ${repo}`);
+        // One answer whether the repository is missing or private, as the HTTP API's 404: a socket
+        // must not learn which private names exist.
+        if ((await this.store.getRepo(repo)) === undefined || !(await canRead(repo))) {
+          sub.socket.close(1008, `unknown repo ${repo}, or no read access to it`);
           return;
         }
         sub.repo = repo;
