@@ -8,6 +8,7 @@
  *   POST /commit {intent}              commit @; 200 accepted, 409 with the server's rejection verbatim
  *   GET  /why?path=                    the entries that touched a file, latest first (from GET /log)
  *   GET  /callers?symbol=              the entries that read or changed a symbol (from GET /log)
+ *   GET  /presence                     who is working in the repository right now (presence.ts)
  *
  * The port is written to .pitstop/daemon.json so the tools find it. Safe points: once an agent has
  * posted one, entries wait for the next safe point instead of landing mid-tool; a daemon that has
@@ -18,11 +19,12 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import type { AddressInfo } from "node:net";
 import { join } from "node:path";
 import { z } from "zod";
-import { Changeset, type Author, type Intent, type SymbolId } from "@pitstop/protocol";
+import { Changeset, DEFAULT_REPO, type Author, type Intent, type SymbolId } from "@pitstop/protocol";
 import { commit, CommitRejected } from "./commit.js";
 import { serverHeaders, streamUrl } from "./config.js";
 import { declareIntent } from "./intents.js";
 import type { Applier } from "./jj.js";
+import { Presence, type PresenceIntent } from "./presence.js";
 import { readState, STATE_DIR, stateDir } from "./state.js";
 import { StreamClient, type Applied, type Warning } from "./stream.js";
 import { hasTsProject, symbolSets, type SymbolSets } from "./symbols.js";
@@ -65,6 +67,8 @@ export interface DaemonOptions {
   attachMs?: number;
   reconnectMs?: number;
   heartbeatMs?: number;
+  /** Minimum time between two diffs of the unfinished edits for presence at safe points (presence.ts). */
+  presenceFilesMs?: number;
   fetch?: typeof fetch;
   onError?: (err: unknown) => void;
 }
@@ -95,6 +99,8 @@ const CommitBody = z.object({ intent: z.string().min(1) });
 
 export class Daemon {
   readonly stream: StreamClient;
+  /** This worktree's presence and its copy of the repository's document (presence.ts). */
+  readonly presence: Presence;
   private http: Server | undefined;
   private attachedUntil = 0;
   private warnings: Warning[] = [];
@@ -120,8 +126,31 @@ export class Daemon {
         if (i.status === "open") this.intents.set(i.id, i);
         else this.intents.delete(i.id);
       },
+      onSubscribed: () => void this.presence.publish(true),
+      onPresence: (m) => this.presence.receive(m.repo, m.entries),
+      onHeartbeat: () => void this.presence.keepalive(),
+      onApplied: () => this.presence.bump(),
       ...(opts.onError === undefined ? {} : { onError: opts.onError }),
     });
+    this.presence = new Presence({
+      worktree: opts.worktree,
+      repo: opts.repo ?? DEFAULT_REPO,
+      author: opts.author,
+      applier: opts.applier,
+      send: (message) => this.stream.publish(message),
+      appliedLsn: () => this.stream.appliedLsn,
+      intent: () => this.openIntent(),
+      ...(opts.presenceFilesMs === undefined ? {} : { filesMs: opts.presenceFilesMs }),
+      ...(opts.log === undefined ? {} : { log: opts.log }),
+    });
+  }
+
+  /** The worktree's open intent for presence: its id from the state file, its text and symbols from the server. */
+  private async openIntent(): Promise<PresenceIntent | undefined> {
+    const { intentId } = await readState(this.opts.worktree);
+    if (intentId === undefined) return undefined;
+    const known = this.declared?.id === intentId ? this.declared : this.intents.get(intentId);
+    return { id: intentId, text: known?.text ?? "", symbols: known?.declaredSymbols ?? [] };
   }
 
   /** True while a coding agent is posting safe points. */
@@ -130,6 +159,7 @@ export class Daemon {
   }
 
   async start(): Promise<number> {
+    await this.presence.start();
     await this.stream.start();
     const http = createServer((req, res) => void this.handle(req, res));
     this.http = http;
@@ -145,6 +175,7 @@ export class Daemon {
   }
 
   async close(): Promise<void> {
+    this.presence.leave(); // the tombstone goes out before the socket closes
     this.stream.close();
     await new Promise<void>((resolve) => (this.http ? this.http.close(() => resolve()) : resolve()));
     await rm(daemonInfoPath(this.opts.worktree), { force: true });
@@ -155,6 +186,9 @@ export class Daemon {
     this.attachedUntil = Date.now() + (this.opts.attachMs ?? 10 * 60_000);
     const applied = await this.stream.applyPending();
     const notes = await this.notes(applied);
+    // Presence: this worktree's files now, and the other agents working in the same ones (once each).
+    await this.presence.publish();
+    notes.push(...this.presence.overlapNotes());
     // The read base stays where the work began: the notes see the agent's edits, not what it read
     // before editing, and that read-before-edit is the skew the server checks for. Only a skew
     // refusal moves it (commit.ts), once the server has named what to re-read.
@@ -193,6 +227,7 @@ export class Daemon {
       ...(this.opts.log === undefined ? {} : { log: this.opts.log }),
     });
     this.declared = intent;
+    await this.presence.publish(true);
     return intent;
   }
 
@@ -211,6 +246,7 @@ export class Daemon {
         ...(this.opts.log === undefined ? {} : { log: this.opts.log }),
       });
       this.declared = undefined;
+      await this.presence.publish(true);
       return { status: "accepted", changeset };
     } catch (err) {
       if (err instanceof CommitRejected) {
@@ -323,6 +359,7 @@ export class Daemon {
         if (!symbol) return json(res, 400, { error: "expected ?symbol=" });
         return json(res, 200, await this.callers(symbol));
       }
+      if (req.method === "GET" && url.pathname === "/presence") return json(res, 200, this.presence.view());
       return json(res, 404, { error: "not_found" });
     } catch (err) {
       const message = err instanceof Error ? (err.stack ?? err.message) : String(err);
