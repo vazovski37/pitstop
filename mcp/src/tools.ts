@@ -52,6 +52,27 @@ export const DESCRIPTIONS = {
   history: "Every change to a symbol (path#name), newest first: who, which intent, whether its signature changed, and who has it declared or leased now.",
 } as const;
 
+/**
+ * A refused commit as the agent reads it: the prefix once, the server's message, the entries it
+ * conflicts with, and advice only where the server gives none. A held (parked) or bounced-back
+ * write skew, a commit waiting for the resolver, and ADR and lease refusals say what to do
+ * themselves; a generic "commit again" would contradict the first two.
+ */
+export function refusal(answer: { reason: string; message: string; conflictsWith: number[] }): string {
+  // A daemon started before 0.1.6 sends its own `commit rejected (<reason>): ` line.
+  const message = answer.message.replace(/^commit rejected \([^)]*\): /, "").trimEnd();
+  const stop = /[.!?]$/.test(message) ? "" : ".";
+  const conflicts = answer.conflictsWith.length > 0 ? ` Conflicts with #${answer.conflictsWith.join(", #")}.` : "";
+  let advice = "";
+  if (answer.reason === "constraint_failed" && answer.conflictsWith.length > 0) {
+    // Write-write: the server says "rebase and retry", which the daemon does at a safe point.
+    advice = " Pitstop applies those entries to your worktree by your next tool call (do not rebase or merge yourself); then re-read the files named above, adapt your change, and commit again.";
+  } else if (answer.reason === "constraint_failed" && message.startsWith("type check failed")) {
+    advice = " Fix those errors in your change and commit again.";
+  }
+  return `Commit rejected (${answer.reason}): ${message}${stop}${conflicts}${advice}`;
+}
+
 export function makeTools(client: DaemonClient, opts: ToolOptions = {}) {
   const guarded = guard(opts);
   return {
@@ -71,14 +92,7 @@ export function makeTools(client: DaemonClient, opts: ToolOptions = {}) {
           const repaired = cs.repairs.length > 0 ? ` The server repaired it: ${cs.repairs.map((r) => r.summary).join("; ")}.` : "";
           return ok(`Committed as #${cs.lsn} "${cs.intent}" (${cs.files.length} file${cs.files.length === 1 ? "" : "s"}); main moved to it.${repaired}`);
         }
-        const conflicts = answer.conflictsWith.length > 0 ? ` Conflicts with #${answer.conflictsWith.join(", #")}.` : "";
-        const advice =
-          answer.reason === "constraint_failed"
-            ? " Those entries have been applied to your worktree where possible; re-read the files named above, adapt your change, and commit again."
-            : answer.reason === "escalated" || answer.reason === "repair_failed"
-              ? " Re-read what changed, adapt your change to it, and commit again."
-              : "";
-        return fail(`Commit rejected (${answer.reason}): ${answer.message}${conflicts}${advice}`);
+        return fail(refusal(answer));
       }),
 
     why: (path: string) =>

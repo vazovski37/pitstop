@@ -19,7 +19,7 @@ import { userInfo } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { RepoId, Repo, type Author } from "@pitstop/protocol";
 import { cloneRepository, defaultHooks as defaultCloneHooks, type CloneHooks } from "./clone.js";
-import { findWorktree, readFileConfig, serverHeaders, writeFileConfig, type FileConfig } from "./config.js";
+import { findWorktree, readFileConfig, serverHeaders, serverLogin, writeFileConfig, type FileConfig } from "./config.js";
 import { run } from "./exec.js";
 import { init, OtherCheckout } from "./init.js";
 import { binariesFromEnv, eolConversionFor, JjWorktree, jjInitColocated, type Applier, type Binaries } from "./jj.js";
@@ -256,7 +256,10 @@ export async function setup(opts: SetupOptions): Promise<SetupResult> {
   }
   const previous = existing === undefined ? undefined : await readFileConfig(existing);
   const agent = opts.agent ?? previous?.agent ?? defaultAgent();
-  const author: Author = { developer: env.PITSTOP_DEVELOPER ?? userInfo().username, agent };
+  // Who the server records for this token (a personal token's owner), so the daemon compares
+  // leases with the same name; the shared token has none and keeps PITSTOP_DEVELOPER.
+  const login = await serverLogin(serverUrl, token, fetchImpl);
+  const author: Author = { developer: login ?? env.PITSTOP_DEVELOPER ?? userInfo().username, agent };
 
   /** A stop for a directory that is a Pitstop checkout of something else. */
   const otherCheckout = (dir: string, file: FileConfig) =>
@@ -387,8 +390,10 @@ export async function setup(opts: SetupOptions): Promise<SetupResult> {
 
   // c. Claude Code, by command name; the agent's name for the daemon. Files git tracks are the
   //    team's: looked at before anything is written, and left alone.
-  const file = await readFileConfig(dir);
-  await writeFileConfig(dir, { ...file, serverUrl, ...(token === undefined ? {} : { token }), repo: repo.id, agent });
+  //    The login goes with the token it was asked for; without a new token the file keeps both.
+  const { developer: fileLogin, ...file } = await readFileConfig(dir);
+  const developer = token === undefined ? fileLogin : login;
+  await writeFileConfig(dir, { ...file, serverUrl, ...(token === undefined ? {} : { token }), repo: repo.id, agent, ...(developer === undefined ? {} : { developer }) });
   const trackedHere = await trackedWiring(dir, bin, [...WIRING_FILES, SHARED_SETTINGS]);
   await excludeFromGit(dir, WIRING_EXCLUDES, bin);
   const wired = await wireClaudeCode(dir, { repo: repo.id, serverUrl, platform, tracked: trackedHere });

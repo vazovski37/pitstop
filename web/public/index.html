@@ -467,6 +467,11 @@
             <div class="step-body">
               <h3>Paste this prompt into Claude Code</h3>
               <p>It installs the Pitstop client, connects a checkout of this repository, wires the Pitstop tools into Claude Code and starts the background daemon.</p>
+              <div class="field setup-agent-field">
+                <label class="field-label" for="setup-agent">Agent name</label>
+                <input id="setup-agent" class="input mono" maxlength="64" autocomplete="off" spellcheck="false" placeholder="agent-a" />
+                <p class="field-hint">How this checkout's agent shows on the Live tab and in other agents' warnings. Give each checkout its own, like agent-a and agent-b.</p>
+              </div>
               <p><button id="make-prompt" type="button" class="btn btn-primary">Create a token and write the prompt</button></p>
               <p id="setup-msg" class="msg" role="status"></p>
               <div id="prompt-box" class="codeblock" hidden>

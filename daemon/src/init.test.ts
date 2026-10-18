@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { Author } from "@pitstop/protocol";
 import { commit } from "./commit.js";
-import { configFrom, daemonEnv, findWorktree, loadConfig, readFileConfig, writeFileConfig } from "./config.js";
+import { configFrom, daemonEnv, findWorktree, loadConfig, readFileConfig, serverLogin, withServerIdentity, writeFileConfig } from "./config.js";
 import { Daemon } from "./daemon.js";
 import { startFakeServer, type FakeServer } from "./fake-server.js";
 import { init, OtherCheckout } from "./init.js";
@@ -64,6 +64,28 @@ describe("configuration", () => {
 
   it("refuses a repository id that is not owner/name", () => {
     expect(() => configFrom({ repo: "Not/Valid" }, {}, "/w")).toThrow();
+  });
+
+  it("is, with a personal token, the login the server records, not PITSTOP_DEVELOPER", async () => {
+    // The login setup stored goes with the file's token, to the file's server only.
+    const file = { serverUrl: "https://a", token: "pst_x", developer: "vazovski37" };
+    expect(configFrom(file, { PITSTOP_DEVELOPER: "nikol" }, worktree).author.developer).toBe("vazovski37");
+    expect(configFrom(file, { PITSTOP_DEVELOPER: "nikol", PITSTOP_SERVER: "https://b", PITSTOP_TOKEN: "t" }, worktree).author.developer).toBe("nikol");
+
+    const server = await startFakeServer({ messages: [{ type: "hello", serverVersion: "x", headLsn: 0 }], token: "shared", users: { pst_vaz: "vazovski37" } });
+    try {
+      const mine = { serverUrl: server.url, worktree, author: { developer: "nikol", agent: "agent-a" } };
+      expect(await serverLogin(server.url, "pst_vaz")).toBe("vazovski37");
+      expect((await withServerIdentity({ ...mine, token: "pst_vaz" })).author).toEqual({ developer: "vazovski37", agent: "agent-a" });
+      // The shared token and no token name nobody: the daemon's own word stands.
+      expect(await serverLogin(server.url, "shared")).toBeUndefined();
+      expect((await withServerIdentity({ ...mine, token: "shared" })).author.developer).toBe("nikol");
+      expect((await withServerIdentity(mine)).author.developer).toBe("nikol");
+    } finally {
+      await server.close();
+    }
+    // No server to ask: as configured.
+    expect(await serverLogin("http://127.0.0.1:9", "pst_vaz")).toBeUndefined();
   });
 });
 

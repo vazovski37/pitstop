@@ -358,7 +358,7 @@ export class Daemon {
       return { status: "accepted", changeset };
     } catch (err) {
       if (err instanceof CommitRejected) {
-        return { status: "rejected", reason: err.reason, message: err.message, conflictsWith: err.conflictsWith };
+        return { status: "rejected", reason: err.reason, message: err.serverMessage, conflictsWith: err.conflictsWith };
       }
       throw err;
     }

@@ -602,6 +602,7 @@ textarea { height: auto; min-height: 76px; padding: 10px 12px; resize: vertical;
 .step-body h3 { font-size: var(--fs-lg); margin: 2px 0 var(--s-2); }
 .step-body > p { color: var(--text-2); }
 .step-body > p + p { margin-top: var(--s-3); }
+.setup-agent-field { max-width: 360px; margin: var(--s-3) 0; }
 .os-list { display: grid; grid-template-columns: 90px minmax(0, 1fr); gap: var(--s-2) var(--s-3); margin: var(--s-3) 0 0; font-size: var(--fs-sm); align-items: baseline; }
 .os-list dt { color: var(--text-3); font-weight: 600; }
 .os-list dd { margin: 0; color: var(--text-2); min-width: 0; overflow-wrap: anywhere; }

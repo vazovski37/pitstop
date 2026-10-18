@@ -32,13 +32,18 @@ export interface ImportOptions extends Omit<CommitOptions, "intent"> {
   from?: "main" | "@";
 }
 
+/**
+ * The server refused a commit. `message` is the CLI's line (`commit rejected (<reason>): …`);
+ * `serverMessage` is the server's text verbatim, which the local API relays to the commit tool, so
+ * the tool's own prefix is the only one the agent reads.
+ */
 export class CommitRejected extends Error {
   constructor(
     readonly reason: string,
-    message: string,
+    readonly serverMessage: string,
     readonly conflictsWith: number[],
   ) {
-    super(`commit rejected (${reason}): ${message}`);
+    super(`commit rejected (${reason}): ${serverMessage}`);
   }
 }
 
