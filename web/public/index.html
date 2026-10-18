@@ -175,6 +175,16 @@
           </article>
           <article class="feature">
             <span class="feature-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24"><path d="M12 3 4 6.5v5c0 4.6 3.4 8.4 8 9.5 4.6-1.1 8-4.9 8-9.5v-5L12 3Z" /><path d="m8.5 12 2.5 2.5 4.5-5" /></svg>
+            </span>
+            <h2>Your architecture, enforced</h2>
+            <p>
+              Write decisions once, like &ldquo;pages never import the database&rdquo;. Every agent reads them before it starts,
+              every commit is checked against them, and an agent can lease a hot function while it changes it.
+            </p>
+          </article>
+          <article class="feature">
+            <span class="feature-icon" aria-hidden="true">
               <svg viewBox="0 0 24 24"><rect x="2.5" y="4" width="19" height="16" rx="2.5" /><path d="m7 10 3 2.5L7 15" /><path d="M12.5 15H17" /></svg>
             </span>
             <h2>Works with Claude Code in one prompt</h2>
@@ -254,6 +264,7 @@
         <nav class="tabs" aria-label="Repository">
           <a id="tab-live">Live</a>
           <a id="tab-conflicts">Conflicts <span id="conflict-count" class="badge warn" hidden></span></a>
+          <a id="tab-brain">Brain <span id="brain-version" class="badge" hidden></span></a>
           <a id="tab-members">Members</a>
           <a id="tab-setup">Set up Claude</a>
         </nav>
@@ -343,6 +354,55 @@
           <p>When an agent's commit relies on code another change just altered, it stops here instead of merging silently.</p>
         </div>
         <ul id="conflicts" class="conflict-list"></ul>
+      </section>
+
+      <section id="pane-brain" class="pane" hidden>
+        <div class="pane-head">
+          <h2 class="pane-title">Brain <span id="brain-title-version" class="mono"></span></h2>
+          <p class="pane-sub">
+            The team&#39;s architecture decisions (ADRs). Every agent receives the accepted ones when it starts a task, and every
+            commit is checked against their rules: a violation is refused with the file and line. Accepting or superseding a
+            decision moves the brain version; each change records the version it passed, so older code can be re-checked.
+          </p>
+        </div>
+        <div class="brain-layout">
+          <div class="brain-main">
+            <div id="no-adrs" class="empty-state" hidden>
+              <h2>No decisions yet</h2>
+              <p>Propose one on the right, for example: pages never import from the database layer.</p>
+            </div>
+            <ul id="adrs" class="adr-list"></ul>
+          </div>
+          <div class="brain-side">
+            <section class="card" aria-labelledby="adr-form-title">
+              <h3 id="adr-form-title" class="card-title">Propose a decision</h3>
+              <form id="adr-form" class="adr-form">
+                <label class="field"><span class="field-label">Title</span><input id="adr-title" required maxlength="200" autocomplete="off" placeholder="Pages never touch the database" /></label>
+                <label class="field"><span class="field-label">Decision</span><textarea id="adr-decision" required placeholder="Code under src/pages reads data through src/services, never from src/db."></textarea></label>
+                <label class="field"><span class="field-label">Why</span><textarea id="adr-reason" placeholder="One place owns queries, caching and access checks."></textarea></label>
+                <div class="field">
+                  <span class="field-label">Rules every commit is checked against</span>
+                  <div id="adr-rules" class="rule-rows"></div>
+                  <button id="adr-add-rule" type="button" class="btn btn-ghost btn-sm">Add a rule</button>
+                  <span class="field-hint">Globs like <code>src/pages/**</code>. Model reviews only advise; they never refuse a commit.</span>
+                </div>
+                <button type="submit" class="btn btn-primary">Propose</button>
+              </form>
+            </section>
+            <section class="card" aria-labelledby="recheck-title">
+              <h3 id="recheck-title" class="card-title">Re-check the code</h3>
+              <p class="field-hint">Runs the accepted rules over the code at head, and lists changes that landed before a rule existed.</p>
+              <button id="recheck-btn" type="button" class="btn btn-secondary btn-sm">Re-check now</button>
+              <div id="recheck-result" class="recheck"></div>
+            </section>
+            <section class="card" aria-labelledby="leases-title">
+              <h3 id="leases-title" class="card-title">Leases</h3>
+              <p class="field-hint">Short locks an agent takes on a hot symbol. Another agent&#39;s commit that changes it is refused until the lease is released or expires.</p>
+              <ul id="leases" class="lease-list"></ul>
+              <p id="no-leases" class="field-hint">No symbol is leased.</p>
+            </section>
+          </div>
+        </div>
       </section>
 
       <section id="pane-members" class="pane" hidden>

@@ -391,7 +391,8 @@ textarea { height: auto; min-height: 76px; padding: 10px 12px; resize: vertical;
 .d-arrowhead-ok { fill: var(--ok); }
 .d-flow[marker-end] { marker-end: url(#d-arrow); }
 
-.features { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--s-4); margin-top: var(--s-8); scroll-margin-top: 90px; }
+.features { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: var(--s-4); margin-top: var(--s-8); scroll-margin-top: 90px; }
+@media (max-width: 1100px) { .features { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 .feature { padding: var(--s-5); border-radius: var(--r-lg); border: 1px solid var(--border); background: var(--surface); }
 .feature h2 { font-size: var(--fs-lg); margin: var(--s-4) 0 var(--s-2); }
 .feature p { color: var(--text-2); font-size: var(--fs-md); line-height: 1.6; }
@@ -515,6 +516,10 @@ textarea { height: auto; min-height: 76px; padding: 10px 12px; resize: vertical;
 #events li.repair::before, #events li.skew::before { background: var(--repair); }
 #events li.intent { color: var(--text-2); }
 #events li.intent::before { background: var(--ok); }
+#events li.brain { color: var(--text); }
+#events li.brain::before { background: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 25%, transparent); }
+#events li.lease { color: var(--text-2); }
+#events li.lease::before { background: var(--warn); }
 #events li.info { color: var(--text-3); }
 #events li[style*="pointer"]:hover { background: var(--surface-2); border-radius: var(--r-sm); }
 /* #events scrolls, so a focused row's ring is drawn inside it. */
@@ -710,3 +715,48 @@ textarea { height: auto; min-height: 76px; padding: 10px 12px; resize: vertical;
 #presence .chip { display: inline-block; font-size: 11px; font-family: var(--font-mono); border: 1px solid var(--border); border-radius: 999px; padding: 1px 8px; color: var(--text-3); background: none; overflow-wrap: anywhere; }
 #presence .chip.hot { border-color: var(--warn); color: var(--warn); background: var(--warn-soft); }
 @media (prefers-reduced-motion: reduce) { #presence .dot.working { animation: none; } }
+
+/* Brain: ADRs, the brain version, re-check, leases (design doc 9) */
+.brain-layout { display: grid; grid-template-columns: minmax(0, 1.55fr) minmax(300px, 1fr); gap: var(--s-5); align-items: start; }
+@media (max-width: 1000px) { .brain-layout { grid-template-columns: 1fr; } }
+.brain-side { display: grid; gap: var(--s-4); }
+.card-title { font-size: var(--fs-lg); margin: 0 0 var(--s-3); }
+.adr-list { display: grid; gap: var(--s-4); }
+.adr { background: var(--surface); border: 1px solid var(--border); border-radius: var(--r-lg); padding: var(--s-5); box-shadow: var(--shadow-1); }
+.adr.accepted { border-color: rgb(60 207 142 / 0.35); }
+.adr.proposed { border-color: rgb(242 184 75 / 0.35); }
+.adr.superseded, .adr.rejected { opacity: 0.72; }
+.adr-head { display: flex; gap: var(--s-3); align-items: baseline; flex-wrap: wrap; }
+.adr-number { font-family: var(--font-mono); color: var(--accent-text); font-size: var(--fs-sm); }
+.adr-title { font-size: var(--fs-lg); margin: 0; flex: 1 1 auto; }
+.adr-decision { margin: var(--s-3) 0 var(--s-2); color: var(--text); }
+.adr-reason { margin: 0 0 var(--s-3); color: var(--text-2); font-size: var(--fs-sm); }
+.adr-rules { display: grid; gap: 6px; margin: 0 0 var(--s-3); padding: 0; list-style: none; }
+.adr-rules li { display: flex; gap: var(--s-2); align-items: baseline; font-size: var(--fs-sm); color: var(--text-2); }
+.adr-rules .rule-kind { font-family: var(--font-mono); font-size: var(--fs-xs); color: var(--text-3); border: 1px solid var(--border); border-radius: 999px; padding: 0 8px; white-space: nowrap; }
+.adr-rules code { font-size: var(--fs-xs); }
+.adr-meta { display: flex; gap: var(--s-3); flex-wrap: wrap; font-size: var(--fs-xs); color: var(--text-3); }
+.adr-actions { display: flex; gap: var(--s-2); flex-wrap: wrap; margin-top: var(--s-3); }
+.adr-form { display: grid; gap: var(--s-3); }
+.adr-form textarea { min-height: 64px; }
+.rule-rows { display: grid; gap: var(--s-2); }
+/* One rule per box: its kind and remove on top, then the files it covers, then its target, call, pattern or question. */
+.rule-row {
+  display: grid; grid-template-columns: minmax(0, 1fr) auto; grid-template-areas: "kind remove" "files files" "value value";
+  gap: var(--s-2); align-items: center; padding: var(--s-2); border: 1px solid var(--border); border-radius: var(--r-md);
+}
+.rule-row > select { grid-area: kind; }
+.rule-row > input:nth-of-type(1) { grid-area: files; }
+.rule-row > input:nth-of-type(2) { grid-area: value; }
+.rule-row > button { grid-area: remove; }
+#adr-add-rule, .lease-list li > .btn { justify-self: start; }
+.recheck { margin-top: var(--s-3); display: grid; gap: var(--s-2); font-size: var(--fs-sm); }
+.recheck .violation { border-left: 3px solid var(--bad); padding: 4px 0 4px var(--s-3); }
+.recheck .violation .mono { color: var(--text); }
+.recheck .queued { border-left: 3px solid var(--warn); padding: 4px 0 4px var(--s-3); color: var(--text-2); }
+.recheck .clean { color: var(--ok); }
+.lease-list { display: grid; gap: var(--s-2); margin: var(--s-2) 0 0; padding: 0; list-style: none; }
+.lease-list li { display: grid; gap: 4px; padding: var(--s-2) 0; border-top: 1px solid var(--border); font-size: var(--fs-sm); }
+.lease-list li:first-child { border-top: 0; }
+.lease-list .mono { color: var(--text); overflow-wrap: anywhere; }
+#events .brain, #events .lease { color: var(--accent-text); }

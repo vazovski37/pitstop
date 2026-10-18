@@ -6,7 +6,7 @@
  * the whole log replays and then stays live. Only types come from @pitstop/protocol: nothing from
  * node_modules reaches the browser.
  */
-import type { Changeset, ClientMessage, Intent, PresenceDoc, PresenceEntry, Repo, ServerMessage } from "@pitstop/protocol";
+import type { Adr, AdrRule, Changeset, ClientMessage, Intent, Lease, PresenceDoc, PresenceEntry, Repo, ServerMessage } from "@pitstop/protocol";
 
 /** `DEFAULT_REPO` in the protocol; a value import would pull zod into the page. */
 const DEFAULT_REPO = "local/default";
@@ -33,7 +33,7 @@ interface Worktree {
   agent?: string;
 }
 
-type EventKind = "entry" | "repair" | "skew" | "intent" | "warning" | "presence" | "info";
+type EventKind = "entry" | "repair" | "skew" | "intent" | "warning" | "presence" | "brain" | "lease" | "info";
 interface Event {
   at: Date;
   kind: EventKind;
@@ -234,6 +234,20 @@ function handle(message: ServerMessage): void {
       break;
     case "presence":
       if (message.repo === state.repo) onPresence(message.entries);
+      break;
+    case "brain":
+      if (message.repo === state.repo) {
+        addEvent("brain", `ADR-${message.adr.number} ${message.adr.status}: ${message.adr.title} (brain v${message.version})`);
+        setBrainVersion(message.version);
+        if (showing(state.repo, "brain")) void renderBrain(state.repo);
+      }
+      break;
+    case "lease":
+      if (message.lease.repo === state.repo) {
+        const l = message.lease;
+        addEvent("lease", `${l.holder.agent} ${l.status === "held" ? "leased" : l.status === "released" ? "released" : "lost (expired)"} ${l.symbol}${l.status === "held" && l.reason ? `: ${l.reason}` : ""}`);
+        if (showing(state.repo, "brain")) void renderBrain(state.repo);
+      }
       break;
   }
 }
@@ -523,6 +537,8 @@ function renderDetail(): void {
       el("dd", {}, symbols(cs.readSet)),
       cs.repairs.length > 0 ? el("dt", {}, "repairs") : null,
       cs.repairs.length > 0 ? el("dd", {}, ...repairs) : null,
+      el("dt", {}, "brain"),
+      el("dd", {}, cs.brainVersion === 0 ? "v0 (no decision in force yet)" : `checked against brain v${cs.brainVersion}`),
       el("dt", {}, "checks"),
       el("dd", {}, checks, cs.checks.details === undefined ? null : el("pre", {}, cs.checks.details)),
     ),
@@ -775,7 +791,7 @@ const when = (iso: string): HTMLElement => el("time", { datetime: iso, title: ne
 
 // --- routes --------------------------------------------------------------------------------------
 
-type Tab = "live" | "conflicts" | "members" | "setup";
+type Tab = "live" | "conflicts" | "brain" | "members" | "setup";
 type Route = { view: "home" } | { view: "account" } | { view: "repo"; repo: string; tab: Tab };
 
 function parseRoute(hash: string): Route {
@@ -785,7 +801,7 @@ function parseRoute(hash: string): Route {
   // Before routes, the hash held only the repository: #owner/name.
   const parts = (raw.startsWith("/r/") ? raw.slice(3) : raw.replace(/^\//, "")).split("/");
   const [owner, name, tab] = parts;
-  if (owner && name) return { view: "repo", repo: `${owner}/${name}`, tab: tab === "members" || tab === "setup" || tab === "conflicts" ? tab : "live" };
+  if (owner && name) return { view: "repo", repo: `${owner}/${name}`, tab: tab === "members" || tab === "setup" || tab === "conflicts" || tab === "brain" ? tab : "live" };
   return { view: "home" };
 }
 
@@ -815,7 +831,7 @@ function show(route: Route): void {
     document.title = `${route.repo} · Pitstop`;
     $("view-repo").hidden = false;
     $("repo-title").textContent = route.repo;
-    for (const tab of ["live", "conflicts", "members", "setup"] as const) {
+    for (const tab of ["live", "conflicts", "brain", "members", "setup"] as const) {
       const link = $<HTMLAnchorElement>(`tab-${tab}`);
       link.href = repoHref(route.repo, tab);
       link.className = tab === route.tab ? "active" : "";
@@ -827,6 +843,7 @@ function show(route: Route): void {
     $<HTMLAnchorElement>("ob-resolver-link").href = repoHref(route.repo, "members");
     $("pane-live").hidden = route.tab !== "live";
     $("pane-conflicts").hidden = route.tab !== "conflicts";
+    $("pane-brain").hidden = route.tab !== "brain";
     $("pane-members").hidden = route.tab !== "members";
     $("pane-setup").hidden = route.tab !== "setup";
     follow(route.repo);
@@ -834,6 +851,8 @@ function show(route: Route): void {
     renderOnboarding();
     if (route.tab === "conflicts") void renderConflicts(route.repo);
     else void countConflicts(route.repo);
+    if (route.tab === "brain") void renderBrain(route.repo);
+    else void loadBrainVersion(route.repo);
     if (route.tab === "members") void renderMembers(route.repo);
     if (route.tab === "setup") void renderSetup(route.repo);
   }
@@ -1453,6 +1472,239 @@ async function decideOn(repo: string, p: ParkedRow, action: "accept" | "send-bac
   }
 }
 
+// --- brain: ADRs, the brain version, re-check, leases (design doc 9) ----------------------------
+
+interface BrainView {
+  version: number;
+  adrs: Adr[];
+  leases: Lease[];
+}
+
+interface RecheckView {
+  head: number;
+  version: number;
+  checkedFiles: number;
+  violations: { adr: number; title: string; rule: string; file: string; line: number; detail?: string }[];
+  queue: { lsn: number; intent: string; author: { developer: string; agent: string }; brainVersion: number; files: string[]; adrs: number[] }[];
+}
+
+/** A rule in a sentence, as the people reading the ADR say it. */
+function ruleText(rule: AdrRule): string {
+  switch (rule.kind) {
+    case "forbid_import":
+      return `${rule.files} may not import ${rule.target}`;
+    case "forbid_call":
+      return `${rule.files} may not call ${rule.call}()`;
+    case "forbid_pattern":
+      return `${rule.files} may not contain /${rule.pattern}/${rule.message ? `: ${rule.message}` : ""}`;
+    case "ai_review":
+      return `a model reviews ${rule.files} (advice only): ${rule.question}`;
+  }
+}
+
+const RULE_KINDS: { kind: AdrRule["kind"]; label: string; value: string }[] = [
+  { kind: "forbid_import", label: "Files may not import", value: "the module (glob), e.g. src/db/**" },
+  { kind: "forbid_call", label: "Files may not call", value: "the call, e.g. db.query" },
+  { kind: "forbid_pattern", label: "Files may not contain", value: "a regular expression, e.g. console\\.log\\(" },
+  { kind: "ai_review", label: "A model reviews files (advice)", value: "the question, e.g. Does this keep expired sessions out?" },
+];
+
+/** The brain version on the tab and in the pane's title. */
+function setBrainVersion(version: number): void {
+  $("brain-version").textContent = `v${version}`;
+  $("brain-version").hidden = false;
+  $("brain-title-version").textContent = `v${version}`;
+}
+
+async function loadBrainVersion(repo: string): Promise<void> {
+  const brain = await api<BrainView>(`/repos/${repo}/brain`);
+  if (brain !== undefined && showing(repo)) setBrainVersion(brain.version);
+}
+
+/** Owners decide on ADRs (and release anyone's lease); the administrator's token may too. */
+async function ownsRepo(repo: string): Promise<boolean> {
+  if (session.me === undefined) return token !== "";
+  const me = session.me.login.toLowerCase();
+  const members = (await api<MemberRow[]>(`/repos/${repo}/members`)) ?? [];
+  return members.some((m) => m.pending !== true && m.role === "owner" && m.login.toLowerCase() === me);
+}
+
+async function renderBrain(repo: string): Promise<void> {
+  const [brain, owner] = await Promise.all([api<BrainView>(`/repos/${repo}/brain`), ownsRepo(repo)]);
+  if (!showing(repo, "brain")) return;
+  if (brain === undefined) {
+    $("adrs").replaceChildren();
+    $("no-adrs").hidden = false;
+    return;
+  }
+  setBrainVersion(brain.version);
+  // Accepted first, then proposed, then the past; newest first within each.
+  const rank = { accepted: 0, proposed: 1, superseded: 2, rejected: 3 } as const;
+  const adrs = [...brain.adrs].sort((a, b) => rank[a.status] - rank[b.status] || b.number - a.number);
+  $("no-adrs").hidden = adrs.length > 0;
+  $("adrs").replaceChildren(...adrs.map((a) => adrCard(repo, a, owner)));
+  $("no-leases").hidden = brain.leases.length > 0;
+  $("leases").replaceChildren(...brain.leases.map((l) => leaseRow(repo, l, owner)));
+}
+
+function adrCard(repo: string, a: Adr, owner: boolean): HTMLElement {
+  const badgeClass = { accepted: "ok", proposed: "warn", superseded: "", rejected: "bad" }[a.status];
+  const actions = el("div", { class: "adr-actions" });
+  if (owner && a.status === "proposed") {
+    const accept = el("button", { type: "button", class: "btn btn-ok btn-sm" }, "Accept");
+    const reject = el("button", { type: "button", class: "btn btn-ghost btn-sm" }, "Reject");
+    accept.addEventListener("click", () => void decideAdr(repo, a, "accept"));
+    reject.addEventListener("click", () => void decideAdr(repo, a, "reject"));
+    actions.append(accept, reject);
+  }
+  if (owner && a.status === "accepted") {
+    const supersede = el("button", { type: "button", class: "btn btn-ghost btn-sm" }, "Supersede");
+    supersede.addEventListener("click", () => void decideAdr(repo, a, "supersede"));
+    actions.append(supersede);
+  }
+  return el(
+    "li",
+    { class: `adr ${a.status}` },
+    el("div", { class: "adr-head" }, el("span", { class: "adr-number" }, `ADR-${a.number}`), el("h3", { class: "adr-title" }, a.title), el("span", { class: `badge ${badgeClass}`.trim() }, a.status)),
+    el("p", { class: "adr-decision" }, a.decision),
+    a.reason === "" ? null : el("p", { class: "adr-reason" }, a.reason),
+    a.rules.length === 0
+      ? el("p", { class: "adr-reason" }, "Text only: agents read it, no rule is checked.")
+      : el("ul", { class: "adr-rules" }, ...a.rules.map((r) => el("li", {}, el("span", { class: "rule-kind" }, r.kind), el("span", {}, ruleText(r))))),
+    el(
+      "div",
+      { class: "adr-meta" },
+      el("span", {}, `proposed by ${a.createdBy}`),
+      when(a.createdAt),
+      a.decidedBy === undefined ? null : el("span", {}, `${a.status} by ${a.decidedBy}`),
+      a.version === 0 ? null : el("span", { class: "mono" }, `brain v${a.version}`),
+    ),
+    actions.childElementCount === 0 ? null : actions,
+  );
+}
+
+async function decideAdr(repo: string, a: Adr, action: "accept" | "reject" | "supersede"): Promise<void> {
+  if (action !== "accept") {
+    const ok = await confirmAction(
+      action === "reject" ? `Reject ADR-${a.number}?` : `Supersede ADR-${a.number}?`,
+      action === "reject" ? "It stays in the record as rejected; its rules are never checked." : "Its rules stop being checked from the next brain version on; changes that passed it keep the version they passed.",
+      action === "reject" ? "Reject" : "Supersede",
+    );
+    if (!ok) return;
+  }
+  const res = await call<{ version: number; adr: Adr }>("POST", `/repos/${repo}/adrs/${a.number}/${action}`);
+  if (res.status >= 300 || res.body === undefined) {
+    toast(messageOf(res.body, `the server answered ${res.status}`), "error");
+    return;
+  }
+  toast(`ADR-${a.number} ${res.body.adr.status}: brain v${res.body.version}`, "ok");
+  await renderBrain(repo);
+}
+
+function leaseRow(repo: string, l: Lease, owner: boolean): HTMLElement {
+  const mine = session.me !== undefined && l.holder.developer.toLowerCase() === session.me.login.toLowerCase();
+  const left = Math.max(0, Math.round((new Date(l.expiresAt).getTime() - Date.now()) / 60_000));
+  const row = el(
+    "li",
+    {},
+    el("span", { class: "mono" }, l.symbol),
+    el("span", {}, agentChip(l.holder.agent), ` ${l.holder.developer} · expires in ${left} min`),
+    l.reason === "" ? null : el("span", { class: "field-hint" }, l.reason),
+  );
+  if (owner || mine) {
+    const release = el("button", { type: "button", class: "btn btn-ghost btn-sm" }, "Release");
+    release.addEventListener("click", () => void releaseLease(repo, l.symbol));
+    row.append(release);
+  }
+  return row;
+}
+
+async function releaseLease(repo: string, symbol: string): Promise<void> {
+  const res = await call("DELETE", `/repos/${repo}/leases?symbol=${encodeURIComponent(symbol)}`);
+  if (res.status >= 300) toast(messageOf(res.body, `the server answered ${res.status}`), "error");
+  else toast(`${symbol} released`, "ok");
+  await renderBrain(repo);
+}
+
+/** One row of the rules builder: kind, the files it covers, and its target/call/pattern/question. */
+function ruleRow(kind: AdrRule["kind"] = "forbid_import"): HTMLElement {
+  const select = el("select", { class: "select input-sm", "aria-label": "Rule kind" }, ...RULE_KINDS.map((k) => el("option", k.kind === kind ? { value: k.kind, selected: "" } : { value: k.kind }, k.label)));
+  const files = el("input", { class: "input input-sm", "aria-label": "Files (glob)", placeholder: "the files it covers (glob), e.g. src/pages/**" });
+  const value = el("input", { class: "input input-sm", "aria-label": "Target", placeholder: RULE_KINDS[0]?.value ?? "" });
+  const remove = el("button", { type: "button", class: "btn btn-ghost btn-sm", "aria-label": "Remove this rule" }, "×");
+  const hint = (): void => {
+    value.placeholder = RULE_KINDS.find((k) => k.kind === select.value)?.value ?? "";
+  };
+  select.addEventListener("change", hint);
+  hint();
+  const row = el("div", { class: "rule-row" }, select, files, value, remove);
+  remove.addEventListener("click", () => row.remove());
+  return row;
+}
+
+function rulesFromForm(): AdrRule[] {
+  return [...$("adr-rules").querySelectorAll<HTMLElement>(".rule-row")].flatMap((row): AdrRule[] => {
+    const [select, files, value] = [row.querySelector("select"), ...row.querySelectorAll("input")] as [HTMLSelectElement, HTMLInputElement, HTMLInputElement];
+    const f = files.value.trim();
+    const v = value.value.trim();
+    if (f === "" || v === "") return [];
+    switch (select.value) {
+      case "forbid_import":
+        return [{ kind: "forbid_import", files: f, target: v }];
+      case "forbid_call":
+        return [{ kind: "forbid_call", files: f, call: v }];
+      case "forbid_pattern":
+        return [{ kind: "forbid_pattern", files: f, pattern: v }];
+      default:
+        return [{ kind: "ai_review", files: f, question: v }];
+    }
+  });
+}
+
+async function proposeAdr(ev: SubmitEvent, repo: string): Promise<void> {
+  ev.preventDefault();
+  const body = {
+    title: $<HTMLInputElement>("adr-title").value.trim(),
+    decision: $<HTMLTextAreaElement>("adr-decision").value.trim(),
+    reason: $<HTMLTextAreaElement>("adr-reason").value.trim(),
+    rules: rulesFromForm(),
+  };
+  const res = await call<Adr>("POST", `/repos/${repo}/adrs`, body);
+  if (res.status !== 201 || res.body === undefined) {
+    toast(messageOf(res.body, `the server answered ${res.status}`), "error");
+    return;
+  }
+  toast(`ADR-${res.body.number} proposed: an owner accepts it to put it in force`, "ok");
+  $<HTMLFormElement>("adr-form").reset();
+  $("adr-rules").replaceChildren(ruleRow());
+  await renderBrain(repo);
+}
+
+async function recheck(repo: string): Promise<void> {
+  const out = $("recheck-result");
+  out.replaceChildren(el("span", { class: "field-hint" }, "Checking…"));
+  const res = await call<RecheckView>("GET", `/repos/${repo}/brain/recheck`);
+  if (res.status !== 200 || res.body === undefined) {
+    out.replaceChildren(el("span", { class: "field-hint" }, messageOf(res.body, `the server answered ${res.status}`)));
+    return;
+  }
+  const r = res.body;
+  const summary = el("p", { class: "field-hint" }, `${plural(r.checkedFiles, "file")} at #${r.head} checked against brain v${r.version}.`);
+  if (r.violations.length === 0 && r.queue.length === 0) {
+    out.replaceChildren(summary, el("p", { class: "clean" }, "Everything at head follows the accepted rules."));
+    return;
+  }
+  out.replaceChildren(
+    summary,
+    ...r.violations.map((v) =>
+      el("div", { class: "violation" }, el("strong", {}, `ADR-${v.adr} ${v.title}`), el("div", { class: "mono" }, `${v.file}:${v.line}`), el("div", { class: "field-hint" }, v.detail ?? v.rule)),
+    ),
+    ...r.queue.map((q) =>
+      el("div", { class: "queued" }, `#${q.lsn} "${q.intent}" by ${q.author.agent} passed brain v${q.brainVersion}, before ADR-${q.adrs.join(", ADR-")}: ${q.files.join(", ")}`),
+    ),
+  );
+}
+
 // --- account: personal tokens --------------------------------------------------------------------
 
 interface TokenRow {
@@ -1561,6 +1813,16 @@ async function signOut(): Promise<void> {
 }
 
 function setup(): void {
+  // The Brain tab: the rules builder starts with one row; propose and re-check act on the repository shown.
+  $("adr-rules").replaceChildren(ruleRow());
+  $("adr-add-rule").addEventListener("click", () => $("adr-rules").append(ruleRow()));
+  $<HTMLFormElement>("adr-form").addEventListener("submit", (ev) => {
+    if (current.view === "repo") void proposeAdr(ev, current.repo);
+    else ev.preventDefault();
+  });
+  $("recheck-btn").addEventListener("click", () => {
+    if (current.view === "repo") void recheck(current.repo);
+  });
   $<HTMLFormElement>("token-form").addEventListener("submit", (ev) => {
     ev.preventDefault();
     const input = $<HTMLInputElement>("token");
