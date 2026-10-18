@@ -3,64 +3,293 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <meta name="theme-color" content="#0b0d12" />
+    <meta name="description" content="Pitstop: version control for teams whose code is written by AI agents. One ordered log, live checkouts, and a teammate who decides on the conflicts git cannot see." />
     <title>Pitstop</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%235d6ff5'/%3E%3Crect x='8' y='9' width='16' height='3' rx='1.5' fill='%23fff' opacity='.55'/%3E%3Crect x='8' y='14.5' width='16' height='3' rx='1.5' fill='%23fff' opacity='.8'/%3E%3Crect x='8' y='20' width='10' height='3' rx='1.5' fill='%23fff'/%3E%3Ccircle cx='22.5' cy='21.5' r='2.5' fill='%233ccf8e'/%3E%3C/svg%3E" />
     <link rel="stylesheet" href="style.css" />
   </head>
   <body>
-    <header>
-      <h1><a href="#/">Pitstop</a></h1>
-      <nav>
-        <a href="#/">Repositories</a>
+    <a class="skip-link" href="#content">Skip to content</a>
+    <header class="topbar">
+      <a class="brand" href="#/" aria-label="Pitstop home">
+        <svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true">
+          <rect width="32" height="32" rx="8" fill="var(--accent-strong)" />
+          <rect x="8" y="9" width="16" height="3" rx="1.5" fill="#fff" opacity=".55" />
+          <rect x="8" y="14.5" width="16" height="3" rx="1.5" fill="#fff" opacity=".8" />
+          <rect x="8" y="20" width="10" height="3" rx="1.5" fill="#fff" />
+          <circle cx="22.5" cy="21.5" r="2.5" fill="var(--ok)" />
+        </svg>
+        <span class="brand-name">Pitstop</span>
+      </a>
+      <nav class="topnav" aria-label="Main">
+        <a href="#/" id="nav-repos" hidden>Repositories</a>
         <a href="#/account" id="nav-account" hidden>Account</a>
       </nav>
-      <span id="repo-title" class="pill" hidden></span>
-      <span id="head" class="pill" hidden>head —</span>
-      <span id="conn" class="pill off" title="stream" hidden>offline</span>
       <span class="spacer"></span>
-      <span id="who"></span>
-      <form id="token-form" hidden>
-        <input id="token" type="password" placeholder="server token" autocomplete="off" />
-        <button type="submit">use</button>
+      <form id="token-form" class="token-form" hidden>
+        <label class="visually-hidden" for="token">Server token</label>
+        <input id="token" class="input input-sm" type="password" placeholder="Server token" autocomplete="off" />
+        <button type="submit" class="btn btn-secondary btn-sm">Use token</button>
       </form>
-      <span id="version" class="dim"></span>
+      <span id="who" class="who"></span>
     </header>
 
+    <div id="content">
     <section id="view-home" class="view" hidden>
-      <div id="home-out" class="hero" hidden>
-        <h2 class="big">Version control for teams whose code is written by agents</h2>
-        <p>
-          One server keeps every change in order. Each developer's checkout follows it live, each agent task is a
-          transaction, and when one agent's change breaks what another relied on, a member of your repository decides
-          before it lands.
-        </p>
-        <p><a class="button" href="/auth/github">Sign in with GitHub</a></p>
-        <p id="home-token-hint" class="dim" hidden>This server has no sign-in yet: paste its token at the top right.</p>
+      <div id="home-out" class="landing" hidden>
+        <section class="hero">
+          <div class="hero-copy">
+            <p class="eyebrow"><span class="eyebrow-dot" aria-hidden="true"></span>Version control for teams of AI agents</p>
+            <h1 class="display">Pitstop is version control for teams whose code is written by AI agents.</h1>
+            <p class="lede">
+              Git merges text, so two agents can each make a clean change and still break each other: one rewrites a
+              function the other was relying on. The merge is green, and nobody notices until the build or a customer does.
+            </p>
+            <div class="hero-actions">
+              <a id="sign-in-hero" class="btn btn-primary btn-lg" href="/auth/github">
+                <svg class="icon" viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+                Sign in with GitHub
+              </a>
+              <button id="see-how" type="button" class="btn btn-ghost btn-lg">How it works</button>
+            </div>
+            <p id="home-token-hint" class="callout callout-info" hidden>
+              This server has no GitHub sign-in. Paste its server token in the field at the top of the page to continue.
+            </p>
+          </div>
+
+          <figure class="hero-diagram">
+            <svg class="diagram" viewBox="0 0 600 384" role="img" aria-labelledby="diagram-title diagram-desc">
+              <title id="diagram-title">How Pitstop works</title>
+              <desc id="diagram-desc">Agents commit as transactions into one ordered log on the server. Every checkout is a live replica of that log. A commit with write skew waits for a teammate, the resolver, who lets it through or sends it back.</desc>
+              <defs>
+                <marker id="d-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 1 L9 5 L0 9 z" class="d-arrowhead" /></marker>
+                <marker id="d-arrow-warn" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 1 L9 5 L0 9 z" class="d-arrowhead-warn" /></marker>
+                <marker id="d-arrow-ok" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 1 L9 5 L0 9 z" class="d-arrowhead-ok" /></marker>
+              </defs>
+
+              <text x="20" y="18" class="d-cap">Agents · each task is a transaction</text>
+              <g class="d-agent" style="--h: 205">
+                <rect x="20" y="30" width="150" height="46" rx="10" />
+                <circle cx="38" cy="53" r="5" class="d-agent-dot" />
+                <text x="52" y="50" class="d-strong">agent-a</text>
+                <text x="52" y="66" class="d-sub">intent → commit</text>
+              </g>
+              <g class="d-agent" style="--h: 150">
+                <rect x="190" y="30" width="150" height="46" rx="10" />
+                <circle cx="208" cy="53" r="5" class="d-agent-dot" />
+                <text x="222" y="50" class="d-strong">agent-b</text>
+                <text x="222" y="66" class="d-sub">intent → commit</text>
+              </g>
+              <g class="d-agent" style="--h: 30">
+                <rect x="430" y="30" width="150" height="46" rx="10" />
+                <circle cx="448" cy="53" r="5" class="d-agent-dot" />
+                <text x="462" y="50" class="d-strong">agent-c</text>
+                <text x="462" y="66" class="d-sub">read old code</text>
+              </g>
+
+              <line x1="95" y1="78" x2="95" y2="124" class="d-line" marker-end="url(#d-arrow)" />
+              <line x1="265" y1="78" x2="265" y2="124" class="d-line" marker-end="url(#d-arrow)" />
+              <line x1="505" y1="78" x2="505" y2="122" class="d-line d-line-warn" marker-end="url(#d-arrow-warn)" />
+
+              <rect x="20" y="128" width="392" height="86" rx="12" class="d-log" />
+              <text x="36" y="150" class="d-cap">Server · one ordered log</text>
+              <g class="d-cells">
+                <rect x="34" y="162" width="46" height="38" rx="7" /><text x="57" y="186" class="d-mono">#1</text>
+                <rect x="86" y="162" width="46" height="38" rx="7" /><text x="109" y="186" class="d-mono">#2</text>
+                <rect x="138" y="162" width="46" height="38" rx="7" /><text x="161" y="186" class="d-mono">#3</text>
+                <rect x="190" y="162" width="46" height="38" rx="7" /><text x="213" y="186" class="d-mono">#4</text>
+                <rect x="242" y="162" width="46" height="38" rx="7" /><text x="265" y="186" class="d-mono">#5</text>
+              </g>
+              <rect x="294" y="162" width="46" height="38" rx="7" class="d-cell-new" />
+              <text x="317" y="186" class="d-mono d-mono-new">#6</text>
+              <rect x="346" y="162" width="52" height="38" rx="7" class="d-cell-next" />
+              <text x="372" y="186" class="d-mono d-mono-next">next</text>
+
+              <g class="d-parked">
+                <rect x="430" y="126" width="150" height="48" rx="10" />
+                <text x="446" y="147" class="d-strong d-warn">write skew</text>
+                <text x="446" y="163" class="d-sub">it waits, unmerged</text>
+              </g>
+              <line x1="505" y1="176" x2="505" y2="198" class="d-line d-line-warn" marker-end="url(#d-arrow-warn)" />
+              <g class="d-resolver">
+                <rect x="430" y="202" width="150" height="54" rx="10" />
+                <circle cx="454" cy="229" r="12" class="d-avatar" />
+                <text x="454" y="233.5" class="d-avatar-text">R</text>
+                <text x="474" y="225" class="d-strong">resolver</text>
+                <text x="474" y="242" class="d-sub">a human decides</text>
+              </g>
+              <path d="M430 229 C 418 229, 414 196, 402 186" class="d-line d-line-ok" marker-end="url(#d-arrow-ok)" />
+              <text x="436" y="274" class="d-sub d-ok">let through or send back</text>
+
+              <line x1="85" y1="216" x2="85" y2="288" class="d-line d-flow" marker-end="url(#d-arrow)" />
+              <line x1="235" y1="216" x2="235" y2="288" class="d-line d-flow" marker-end="url(#d-arrow)" />
+              <line x1="385" y1="216" x2="385" y2="288" class="d-line d-flow" marker-end="url(#d-arrow)" />
+              <text x="96" y="256" class="d-sub">streamed live</text>
+
+              <g class="d-checkout">
+                <rect x="20" y="292" width="130" height="56" rx="10" />
+                <text x="34" y="315" class="d-strong">alice's checkout</text>
+                <circle cx="38" cy="333" r="4" class="d-dot-ok" />
+                <text x="48" y="337" class="d-sub">replica at #6</text>
+              </g>
+              <g class="d-checkout">
+                <rect x="170" y="292" width="130" height="56" rx="10" />
+                <text x="184" y="315" class="d-strong">bob's checkout</text>
+                <circle cx="188" cy="333" r="4" class="d-dot-ok" />
+                <text x="198" y="337" class="d-sub">replica at #6</text>
+              </g>
+              <g class="d-checkout">
+                <rect x="320" y="292" width="130" height="56" rx="10" />
+                <text x="334" y="315" class="d-strong">carol's checkout</text>
+                <circle cx="338" cy="333" r="4" class="d-dot-warn" />
+                <text x="348" y="337" class="d-sub">applying #6</text>
+              </g>
+              <text x="20" y="374" class="d-cap">Checkouts · live replicas, kept in sync with jj</text>
+            </svg>
+          </figure>
+        </section>
+
+        <section id="how" class="features" aria-label="What Pitstop does">
+          <article class="feature">
+            <span class="feature-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12Z" /><circle cx="12" cy="12" r="3" /></svg>
+            </span>
+            <h2>Catches what git cannot see</h2>
+            <p>
+              Every commit says what its agent read and what it wrote. When one change alters a function another change
+              relied on, Pitstop flags the write skew before it lands, even when the text merged cleanly.
+            </p>
+          </article>
+          <article class="feature">
+            <span class="feature-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24"><circle cx="9" cy="8" r="4" /><path d="M2 21c0-3.9 3.1-7 7-7 1.6 0 3 .5 4.2 1.4" /><path d="m15.5 18 2 2 4.5-4.5" /></svg>
+            </span>
+            <h2>A teammate decides, not an AI</h2>
+            <p>
+              The commit waits for your repository's resolver, with its intent, its files and what moved underneath it.
+              Let it through, or send it back with a note and the agent adapts and commits again.
+            </p>
+          </article>
+          <article class="feature">
+            <span class="feature-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24"><rect x="2.5" y="4" width="19" height="16" rx="2.5" /><path d="m7 10 3 2.5L7 15" /><path d="M12.5 15H17" /></svg>
+            </span>
+            <h2>Works with Claude Code in one prompt</h2>
+            <p>
+              Create a repository and paste one prompt into Claude Code. It installs the client, connects your checkout,
+              wires in the Pitstop tools and keeps the checkout in sync while you work.
+            </p>
+          </article>
+        </section>
+
+        <section class="steps-strip" aria-label="Getting started">
+          <ol>
+            <li><span class="step-num">1</span><span><strong>Sign in</strong> with GitHub</span></li>
+            <li><span class="step-num">2</span><span><strong>Create</strong> a repository</span></li>
+            <li><span class="step-num">3</span><span><strong>Paste</strong> one prompt into Claude Code</span></li>
+            <li><span class="step-num">4</span><span><strong>Watch</strong> your agents land live</span></li>
+          </ol>
+        </section>
       </div>
-      <div id="home-in" class="columns" hidden>
-        <article>
-          <h2>Your repositories</h2>
-          <ul id="repos" class="list"></ul>
-          <p id="no-repos" class="dim">None yet. Create one, or ask an owner to invite your GitHub login.</p>
-        </article>
-        <article>
-          <h2>New repository</h2>
-          <form id="new-repo" class="stack">
-            <label class="inline"><span id="new-owner" class="dim"></span><input id="new-name" required autocomplete="off" placeholder="name" /></label>
-            <button type="submit">Create</button>
-          </form>
-          <p id="new-repo-msg" class="msg"></p>
-          <p class="dim">Then open it and go to <em>Set up Claude</em> for the prompt that connects your checkout.</p>
-        </article>
+
+      <div id="home-in" class="page" hidden>
+        <div class="page-head">
+          <div>
+            <h1 class="page-title">Repositories</h1>
+            <p class="page-sub">Each repository is one ordered log. Every checkout follows it live.</p>
+          </div>
+          <button id="new-repo-jump" type="button" class="btn btn-primary">
+            <svg class="icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 3v10M3 8h10" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" fill="none" /></svg>
+            New repository
+          </button>
+        </div>
+        <div class="home-grid">
+          <section aria-label="Your repositories">
+            <ul id="repos" class="repo-grid"></ul>
+            <div id="no-repos" class="empty-state" hidden>
+              <span class="empty-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="3" /><path d="M7 9h10M7 13h6" /></svg>
+              </span>
+              <h2>No repositories yet</h2>
+              <p>Create your first one with <strong>New repository</strong>, then open <strong>Set up Claude</strong> for the prompt that connects your checkout.</p>
+              <p class="empty-aside">Joining a team instead? Ask an owner to invite your GitHub login; their repositories show up here once you sign in.</p>
+            </div>
+          </section>
+          <aside class="card new-repo-card" aria-labelledby="new-repo-title">
+            <h2 id="new-repo-title" class="card-title">New repository</h2>
+            <form id="new-repo" class="form">
+              <div class="field">
+                <label class="field-label" for="new-name">Name</label>
+                <div class="input-group">
+                  <span id="new-owner" class="input-prefix"></span>
+                  <input id="new-name" class="input" required autocomplete="off" spellcheck="false" placeholder="name" />
+                </div>
+                <p class="field-hint">Lowercase letters, digits, dots and dashes.</p>
+              </div>
+              <button type="submit" class="btn btn-primary btn-block">Create repository</button>
+            </form>
+            <p id="new-repo-msg" class="msg" role="status"></p>
+            <p class="hint">Next, <strong>Set up Claude</strong> gives you the prompt that connects your checkout.</p>
+          </aside>
+        </div>
       </div>
     </section>
 
     <section id="view-repo" class="view" hidden>
-      <nav class="tabs">
-        <a id="tab-live">Live</a>
-        <a id="tab-conflicts">Conflicts <span id="conflict-count" class="badge warn" hidden></span></a>
-        <a id="tab-members">Members</a>
-        <a id="tab-setup">Set up Claude</a>
-      </nav>
+      <div class="repo-head">
+        <div class="repo-head-row">
+          <div class="repo-id">
+            <a href="#/" class="crumb">Repositories</a>
+            <span class="crumb-sep" aria-hidden="true">/</span>
+            <h1 id="repo-title" class="repo-title"></h1>
+          </div>
+          <div class="repo-status">
+            <span id="head" class="pill pill-head">head —</span>
+            <span id="conn" class="pill off" title="stream">offline</span>
+          </div>
+        </div>
+        <nav class="tabs" aria-label="Repository">
+          <a id="tab-live">Live</a>
+          <a id="tab-conflicts">Conflicts <span id="conflict-count" class="badge warn" hidden></span></a>
+          <a id="tab-members">Members</a>
+          <a id="tab-setup">Set up Claude</a>
+        </nav>
+      </div>
+
+      <section id="onboarding" class="onboarding" aria-labelledby="onboarding-title" hidden>
+        <div class="onboarding-head">
+          <div>
+            <h2 id="onboarding-title">Get this repository going</h2>
+            <p class="onboarding-sub">Three steps, and your team's agents commit through Pitstop.</p>
+          </div>
+          <span id="onboarding-progress" class="badge accent">0 of 3</span>
+        </div>
+        <ol class="checklist">
+          <li id="ob-setup">
+            <span class="check" aria-hidden="true"></span>
+            <div>
+              <a id="ob-setup-link" class="checklist-title">Set up Claude in your checkout</a>
+              <p>Paste one prompt into Claude Code. The first setup imports your code as entry #1.</p>
+            </div>
+          </li>
+          <li id="ob-invite">
+            <span class="check" aria-hidden="true"></span>
+            <div>
+              <a id="ob-invite-link" class="checklist-title">Invite a teammate</a>
+              <p>By GitHub login. They join the first time they sign in here.</p>
+            </div>
+          </li>
+          <li id="ob-resolver">
+            <span class="check" aria-hidden="true"></span>
+            <div>
+              <a id="ob-resolver-link" class="checklist-title">Mark the resolver</a>
+              <p>The member who decides when one agent's change breaks what another relied on.</p>
+            </div>
+          </li>
+        </ol>
+      </section>
 
       <main id="pane-live">
         <section id="log-panel">
@@ -91,82 +320,180 @@
       </main>
 
       <section id="pane-conflicts" class="pane" hidden>
-        <article>
-          <h2>Conflicts</h2>
-          <p class="dim">
-            A commit waits here when it relied on something another change altered after its agent read it (write skew).
-            The repository's resolver decides: <strong>let it through</strong> as it is, or <strong>send it back</strong> with
-            a note, and the author's agent adapts and commits again.
+        <div class="pane-head">
+          <h2 class="pane-title">Conflicts</h2>
+          <p class="pane-sub">
+            A commit waits here when its agent relied on something another change altered after it read it (write skew).
+            The repository's resolver decides: <strong>let it through</strong> as it is, or <strong>send it back</strong>
+            with a note, and the author's agent adapts and commits again.
           </p>
-          <p id="conflicts-msg" class="msg"></p>
-          <ul id="conflicts" class="cards"></ul>
-          <p id="no-conflicts" class="dim">Nothing is waiting.</p>
-        </article>
+        </div>
+        <p id="conflicts-msg" class="msg" role="status"></p>
+        <ul id="conflicts" class="conflict-list"></ul>
+        <div id="no-conflicts" class="empty-state" hidden>
+          <span class="empty-icon empty-icon-ok" aria-hidden="true">
+            <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9" /><path d="m8 12.5 2.8 2.8L16.5 9.5" /></svg>
+          </span>
+          <h2>Nothing is waiting</h2>
+          <p>When an agent's commit relies on code another change just altered, it stops here instead of merging silently.</p>
+        </div>
       </section>
 
       <section id="pane-members" class="pane" hidden>
-        <article>
-          <h2>Members</h2>
-          <ul id="members" class="list"></ul>
-          <p class="dim">A member marked <strong>resolver</strong> decides when a commit would break what another change relied on. With none marked, the owners decide.</p>
-          <p id="members-msg" class="msg"></p>
-        </article>
-        <article id="invite-box" hidden>
-          <h2>Invite</h2>
-          <form id="invite" class="stack">
-            <input id="invite-login" required autocomplete="off" placeholder="GitHub login" />
-            <select id="invite-role">
-              <option value="writer">writer</option>
-              <option value="reader">reader</option>
-              <option value="owner">owner</option>
-            </select>
-            <button type="submit">Invite</button>
-          </form>
-          <p class="dim">Someone who has not signed in yet joins the first time they sign in with that GitHub login. Send them this site's address.</p>
-        </article>
+        <div class="pane-head">
+          <h2 class="pane-title">Members</h2>
+          <p class="pane-sub">
+            Owners manage members, writers commit, readers watch. A member marked <strong>resolver</strong> decides when a
+            commit would break what another change relied on; with none marked, the owners decide.
+          </p>
+        </div>
+        <div class="members-layout">
+          <section class="card card-flush" aria-label="Members">
+            <ul id="members" class="member-list"></ul>
+            <p id="members-msg" class="msg msg-pad" role="status"></p>
+          </section>
+          <aside id="invite-box" class="card" aria-labelledby="invite-title" hidden>
+            <h3 id="invite-title" class="card-title">Invite a teammate</h3>
+            <form id="invite" class="form">
+              <div class="field">
+                <label class="field-label" for="invite-login">GitHub login</label>
+                <input id="invite-login" class="input" required autocomplete="off" spellcheck="false" placeholder="octocat" />
+              </div>
+              <div class="field">
+                <label class="field-label" for="invite-role">Role</label>
+                <select id="invite-role" class="select">
+                  <option value="writer">Writer: commits through their agents</option>
+                  <option value="reader">Reader: watches the log</option>
+                  <option value="owner">Owner: also manages members</option>
+                </select>
+              </div>
+              <button type="submit" class="btn btn-primary btn-block">Send invite</button>
+            </form>
+            <p class="hint">Someone who has not signed in yet joins the first time they sign in here with that GitHub login. Send them this site's address.</p>
+          </aside>
+        </div>
       </section>
 
       <section id="pane-setup" class="pane" hidden>
-        <article>
-          <h2>Set up your Claude for <span id="setup-repo"></span></h2>
-          <p id="setup-state"></p>
-          <p>
-            Paste the prompt below into Claude Code on your computer. It installs the Pitstop client, connects a checkout
-            of this repository, wires the Pitstop tools into Claude Code and starts the background daemon. It contains a
-            personal token for you: do not share it.
-          </p>
-          <p><button id="make-prompt" type="button">Create a token and write the prompt</button></p>
-          <p id="setup-msg" class="msg"></p>
-          <div id="prompt-box" hidden>
-            <pre id="prompt"></pre>
-            <button id="copy-prompt" type="button">Copy</button>
+        <div class="pane-head">
+          <h2 class="pane-title">Set up Claude for <span id="setup-repo" class="mono"></span></h2>
+          <p id="setup-state" class="pane-sub"></p>
+        </div>
+        <ol class="stepper">
+          <li class="step">
+            <span class="step-num">1</span>
+            <div class="step-body">
+              <h3>Have Node.js, git and jj</h3>
+              <p>Node.js 22 or newer, git, and jj (Jujutsu), which keeps your checkout in sync. Claude installs whatever is missing, or you can:</p>
+              <dl class="os-list">
+                <dt>Windows</dt>
+                <dd class="cmds"><code>winget install OpenJS.NodeJS.LTS</code> <code>winget install Git.Git</code> <code>winget install jj-vcs.jj</code></dd>
+                <dt>macOS</dt>
+                <dd><code>brew install node git jj</code></dd>
+                <dt>Linux</dt>
+                <dd>Node.js and git from your package manager; jj from its GitHub releases.</dd>
+              </dl>
+            </div>
+          </li>
+          <li class="step">
+            <span class="step-num">2</span>
+            <div class="step-body">
+              <h3>Paste this prompt into Claude Code</h3>
+              <p>It installs the Pitstop client, connects a checkout of this repository, wires the Pitstop tools into Claude Code and starts the background daemon.</p>
+              <p><button id="make-prompt" type="button" class="btn btn-primary">Create a token and write the prompt</button></p>
+              <p id="setup-msg" class="msg" role="status"></p>
+              <div id="prompt-box" class="codeblock" hidden>
+                <div class="codeblock-bar">
+                  <span>Prompt for Claude Code</span>
+                  <button id="copy-prompt" type="button" class="btn btn-secondary btn-sm">Copy prompt</button>
+                </div>
+                <pre id="prompt"></pre>
+              </div>
+              <p class="callout callout-warn">
+                The prompt carries a <strong>personal token</strong> made for you just now: keep it out of files you commit and
+                out of anything you share. Revoke it under <a href="#/account">Account</a> when that computer is gone.
+              </p>
+            </div>
+          </li>
+          <li class="step">
+            <span class="step-num">3</span>
+            <div class="step-body">
+              <h3>Open Claude Code in the checkout</h3>
+              <p>The Pitstop tools load there. Every task your agent finishes lands in <strong>Live</strong> as the next entry, and every teammate's checkout picks it up.</p>
+            </div>
+          </li>
+        </ol>
+        <details class="manual">
+          <summary>Prefer a terminal? The same in two commands</summary>
+          <div class="codeblock">
+            <div class="codeblock-bar">
+              <span>Terminal</span>
+              <button id="copy-manual" type="button" class="btn btn-secondary btn-sm">Copy commands</button>
+            </div>
+            <pre id="manual-cmds"></pre>
           </div>
-        </article>
+          <p class="hint">Run the second command in the folder that holds your project (an empty repository imports it), or where the new checkout should go.</p>
+        </details>
       </section>
     </section>
 
     <section id="view-account" class="view" hidden>
-      <div class="columns">
-        <article>
-          <h2>Personal tokens</h2>
-          <p class="dim">A token stands for you on one computer: the daemon and the Pitstop tools send it. Revoke it when the computer is gone.</p>
-          <ul id="tokens" class="list"></ul>
-          <form id="new-token" class="stack">
-            <input id="new-token-name" required autocomplete="off" placeholder="laptop" maxlength="80" />
-            <button type="submit">Create token</button>
-          </form>
-          <div id="new-token-box" hidden>
-            <p>Shown once. Put it in <code>PITSTOP_TOKEN</code> or pass it to <code>pitstop setup --token</code>.</p>
-            <pre id="new-token-secret"></pre>
+      <div class="page">
+        <div class="page-head">
+          <div>
+            <h1 class="page-title">Account</h1>
+            <p class="page-sub">Your identity on this server and the tokens that stand for you.</p>
           </div>
-        </article>
-        <article>
-          <h2>You</h2>
-          <p id="account-who"></p>
-          <p><button id="sign-out" type="button">Sign out</button></p>
-        </article>
+        </div>
+        <div class="account-grid">
+          <section class="card" aria-labelledby="tokens-title">
+            <h2 id="tokens-title" class="card-title">Personal tokens</h2>
+            <p class="card-sub">A token stands for you on one computer: the daemon and the Pitstop tools send it. Revoke it when the computer is gone.</p>
+            <form id="new-token" class="inline-form">
+              <div class="field grow">
+                <label class="field-label" for="new-token-name">Token name</label>
+                <input id="new-token-name" class="input" required autocomplete="off" placeholder="work laptop" maxlength="80" />
+              </div>
+              <button type="submit" class="btn btn-primary">Create token</button>
+            </form>
+            <div id="new-token-box" class="secret-box" hidden>
+              <p><strong>Copy it now: it is shown only once.</strong> Put it in <code>PITSTOP_TOKEN</code> or pass it to <code>pitstop setup --token</code>.</p>
+              <div class="copy-row">
+                <pre id="new-token-secret"></pre>
+                <button id="copy-token" type="button" class="btn btn-secondary btn-sm">Copy</button>
+              </div>
+            </div>
+            <ul id="tokens" class="token-list"></ul>
+            <p id="no-tokens" class="hint" hidden>No tokens yet. Set up Claude makes one for you, or create one here.</p>
+          </section>
+          <aside class="card profile-card" aria-label="You">
+            <div id="account-avatar" class="avatar avatar-lg" aria-hidden="true"></div>
+            <p id="account-who" class="profile-name"></p>
+            <p id="account-sub" class="hint"></p>
+            <button id="sign-out" type="button" class="btn btn-secondary btn-block">Sign out</button>
+          </aside>
+        </div>
       </div>
     </section>
+    </div>
+
+    <footer class="footer">
+      <span>Pitstop · one ordered log, live checkouts, agents as transactions</span>
+      <span id="version" class="mono"></span>
+    </footer>
+
+    <div id="toasts" class="toasts" role="status" aria-live="polite"></div>
+
+    <dialog id="confirm-dialog" class="modal" aria-labelledby="confirm-title">
+      <form method="dialog">
+        <h2 id="confirm-title" class="modal-title"></h2>
+        <p id="confirm-body" class="modal-body"></p>
+        <div class="modal-actions">
+          <button value="cancel" class="btn btn-ghost" type="submit">Cancel</button>
+          <button id="confirm-ok" value="ok" class="btn btn-danger" type="submit">Confirm</button>
+        </div>
+      </form>
+    </dialog>
 
     <script type="module" src="app.js"></script>
   </body>
