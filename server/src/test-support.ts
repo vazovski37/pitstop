@@ -72,6 +72,16 @@ export function brainStoreSuite(store: () => Store): void {
     await expect(s.proposeAdr({ repo: "no/such", title: "t", decision: "d", createdBy: "x" })).rejects.toThrow(/unknown repo/);
   });
 
+  it("accepts an ADR once when two owners decide at the same moment", async () => {
+    const s = store();
+    const repo = await freshRepo(s);
+    await s.proposeAdr({ repo, title: "t", decision: "d", createdBy: "a" });
+    const answers = await Promise.all([s.decideAdr(repo, 1, "accepted", "a"), s.decideAdr(repo, 1, "accepted", "b")]);
+    expect(answers.map((a) => a.ok).sort()).toEqual([false, true]);
+    expect(await s.brainVersion(repo)).toBe(1);
+    expect((await s.adrsInForce(repo, 1)).map((a) => a.number)).toEqual([1]);
+  });
+
   it("records the brain version a commit was validated against", async () => {
     const s = store();
     const repo = await freshRepo(s);
@@ -103,7 +113,9 @@ export function brainStoreSuite(store: () => Store): void {
     expect(taken).toMatchObject({ granted: true, renewed: false, lease: { holder: bob } });
     expect(taken.expired.map((l) => [l.holder.agent, l.status])).toEqual([["agent-a", "expired"]]);
 
-    expect(await s.releaseLease(repo, symbol)).toMatchObject({ holder: bob, status: "released" });
+    // Released only for the holder named: a lease someone took since is not.
+    expect(await s.releaseLease(repo, symbol, at(201), alice)).toBeUndefined();
+    expect(await s.releaseLease(repo, symbol, at(201), bob)).toMatchObject({ holder: bob, status: "released" });
     expect(await s.releaseLease(repo, symbol)).toBeUndefined();
     expect(await s.liveLeases(repo, at(201))).toEqual([]);
   });
@@ -120,7 +132,7 @@ export function brainStoreSuite(store: () => Store): void {
     for (const g of grants) if (!g.granted && winner?.granted) expect(g.holder.holder).toEqual(winner.lease.holder);
   });
 
-  it("ties leases to an open intent: refused for a closed one, renewed by its heartbeat, released with it", async () => {
+  it("ties leases to an open intent: refused for a closed one or another's, held by that intent, renewed only by asking again, released with it", async () => {
     const s = store();
     const repo = await freshRepo(s);
     const intent = await s.openIntent({ repo, author: alice, baseLsn: 0, text: "fix auth", declaredSymbols: ["src/a.ts#a"] });
@@ -128,9 +140,19 @@ export function brainStoreSuite(store: () => Store): void {
     const grant = await s.acquireLease({ repo, symbol: "src/a.ts#a", holder: alice, intentId: intent.id, reason: "", ttlSeconds: 60 }, earlier);
     expect(grant).toMatchObject({ granted: true, lease: { intentId: intent.id } });
     const before = grant.granted ? Date.parse(grant.lease.expiresAt) : 0;
+    // A heartbeat, which any reader of the stream may send, renews nothing.
     await s.heartbeat(repo, intent.id);
+    expect((await s.liveLeases(repo))[0]?.expiresAt).toBe(new Date(before).toISOString());
+    // The same person's other checkout (same author, another intent) is not the holder.
+    const elsewhere = await s.openIntent({ repo, author: alice, baseLsn: 0, text: "other checkout", declaredSymbols: [] });
+    expect(await s.acquireLease({ repo, symbol: "src/a.ts#a", holder: alice, intentId: elsewhere.id, reason: "", ttlSeconds: 60 })).toMatchObject({ granted: false, holder: { intentId: intent.id } });
+    expect(await s.acquireLease({ repo, symbol: "src/a.ts#a", holder: alice, reason: "", ttlSeconds: 60 })).toMatchObject({ granted: false });
+    // Its holder renews it by asking again.
+    expect(await s.acquireLease({ repo, symbol: "src/a.ts#a", holder: alice, intentId: intent.id, reason: "", ttlSeconds: 60 })).toMatchObject({ granted: true, renewed: true });
     const [live] = await s.liveLeases(repo);
     expect(Date.parse(live?.expiresAt ?? "")).toBeGreaterThan(before + 40_000);
+    // Someone else's intent cannot carry a lease.
+    await expect(s.acquireLease({ repo, symbol: "src/z.ts#z", holder: bob, intentId: intent.id, reason: "", ttlSeconds: 60 })).rejects.toThrow(/not agent-b's/);
     await s.acquireLease({ repo, symbol: "src/b.ts#b", holder: alice, intentId: intent.id, reason: "", ttlSeconds: 60 });
     await s.acquireLease({ repo, symbol: "src/c.ts#c", holder: bob, reason: "", ttlSeconds: 60 });
 
@@ -189,9 +211,26 @@ export function brainStoreSuite(store: () => Store): void {
     expect(lsns(await s.findEntries(repo, { touches: "src/*/session.ts", limit: 1 }))).toEqual([1]);
     expect(lsns(await s.findEntries(repo, { paths: ["src/pages/Profile.tsx"], newestFirst: true, limit: 10 }))).toEqual([4, 3]);
     expect(await s.findEntries(repo, { touches: "lib/**", limit: 10 })).toEqual([]);
+    // Contents only when asked for: the query API never needs them.
     const [entry] = await s.findEntries(repo, { paths: ["src/auth/session.ts"], limit: 1 });
-    expect(entry).toMatchObject({ lsn: 1, intent: "change auth", files: [{ path: "src/auth/session.ts", content: "export function getCurrentUser() {}\n" }] });
+    expect(entry).toMatchObject({ lsn: 1, intent: "change auth", files: [{ path: "src/auth/session.ts", op: "add" }] });
+    expect(entry?.files[0]?.content).toBeUndefined();
     expect(entry?.intentId).toBeUndefined();
+    const [full] = await s.findEntries(repo, { paths: ["src/auth/session.ts"], limit: 1, contents: true });
+    expect(full?.files[0]?.content).toBe("export function getCurrentUser() {}\n");
+    // Pages below an LSN, and entries validated before a brain version.
+    expect(lsns(await s.findEntries(repo, { touches: "src/**", newestFirst: true, before: 3, limit: 10 }))).toEqual([2, 1]);
+    expect(lsns(await s.findEntries(repo, { touches: "src/**", brainBefore: 1, limit: 10 }))).toEqual([1, 2, 3, 4]);
+    expect(await s.findEntries(repo, { touches: "src/**", brainBefore: 0, limit: 10 })).toEqual([]);
+    // Globs with braces and a trailing slash.
+    expect(lsns(await s.findEntries(repo, { touches: "src/{auth,pages}/*.{ts,tsx}", limit: 10 }))).toEqual([1, 2, 3, 4]);
+    expect(lsns(await s.findEntries(repo, { touches: "src/pages/", limit: 10 }))).toEqual([3, 4]);
+    // The tree, read in part: by path or glob, and its paths alone.
+    expect([...(await s.filesAt(repo, 4, { paths: ["src/auth/session.ts"] })).entries()]).toEqual([["src/auth/session.ts", "export function getCurrentUser(x: number) {}\n"]]);
+    expect([...(await s.filesAt(repo, 4, { globs: ["src/pages/**"] })).keys()]).toEqual(["src/pages/Me.tsx"]);
+    expect([...(await s.filesAt(repo, 3, { globs: ["src/pages/**"] })).keys()]).toEqual(["src/pages/Profile.tsx"]);
+    expect((await s.filesAt(repo, 4, {})).size).toBe(0);
+    expect(await s.pathsAt(repo, 4)).toEqual(["src/auth/session.ts", "src/pages/Me.tsx"]);
 
     const states = await s.symbolStates(repo, "src/", 10);
     expect(states.map((x) => [x.symbol, x.lsn, x.signature, x.intentId ?? null])).toEqual([

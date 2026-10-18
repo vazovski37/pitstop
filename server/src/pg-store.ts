@@ -21,9 +21,11 @@ import {
   ADR_TRANSITIONS,
   GAP_LIMIT,
   gapStart,
+  holdsLease,
   InvalidCommit,
   movesBrain,
   newIntentId,
+  notTheirIntent,
   repoOf,
   sameAuthor,
   SKIPPED_CHECKS,
@@ -240,6 +242,19 @@ const intentOf = (row: IntentRow): Intent => ({
   heartbeatAt: row.heartbeat_at.toISOString(),
 });
 
+/**
+ * `latest`: the last change per path of repository $1 up to LSN $2, for the paths `where` keeps
+ * (a condition on `path`); a rename also ends its old path there. Callers keep `op <> 'delete'`.
+ */
+const LATEST_FILES = (where: string): string =>
+  `with changes as (
+     select path, lsn, op, blob_hash from changeset_files where repo = $1 and lsn <= $2
+     union all
+     select from_path as path, lsn, 'delete' as op, null as blob_hash
+     from changeset_files where repo = $1 and lsn <= $2 and from_path is not null
+   ),
+   latest as (select distinct on (path) path, op, blob_hash from changes where ${where} order by path, lsn desc)`;
+
 interface ChangesetRow {
   repo: string;
   lsn: number;
@@ -316,7 +331,8 @@ export class PgStore implements Store {
 
       // The validator runs here, under the lock, so nothing lands between its look at the gap and this append.
       const gap = decide ? await this.read(client, repo, gapStart(req), GAP_LIMIT + 1) : [];
-      const decision = decide ? await decide(gap, lsn - 1) : {};
+      // Leases are read here, through this connection, under the lock acquireLease also takes.
+      const decision = decide ? await decide(gap, lsn - 1, { leases: (now) => this.leasesIn(client, repo, now) }) : {};
       // The repository's brain version the commit was checked against (9.2): the decision says, else the current one.
       const brainVersion = decision.brainVersion ?? (await this.brainVersionIn(client, repo));
 
@@ -363,8 +379,11 @@ export class PgStore implements Store {
         );
       }
       if (req.intentId !== undefined) {
-        // A stale intent whose agent came back and committed is closed too.
-        await client.query("update intents set status = 'committed' where id = $1 and repo = $2 and status in ('open', 'stale')", [req.intentId, repo]);
+        // A stale intent whose agent came back and committed is closed too; only by its own author.
+        await client.query(
+          "update intents set status = 'committed' where id = $1 and repo = $2 and status in ('open', 'stale') and developer = $3 and agent = $4",
+          [req.intentId, repo, req.author.developer, req.author.agent],
+        );
       }
 
       const [changeset] = await this.read(client, repo, lsn - 1, 1);
@@ -388,19 +407,29 @@ export class PgStore implements Store {
   }
 
   async treeAt(repo: RepoId, lsn: Lsn): Promise<Tree> {
-    // The latest change per path up to `lsn`; a rename also ends its old path there.
+    return this.tree(repo, lsn, "true", []);
+  }
+
+  async filesAt(repo: RepoId, lsn: Lsn, which: { paths?: string[]; globs?: string[] }): Promise<Tree> {
+    const paths = which.paths ?? [];
+    const globs = (which.globs ?? []).map(globToRegExpSource);
+    if (paths.length === 0 && globs.length === 0) return new Map();
+    return this.tree(repo, lsn, "(path = any($3::text[]) or path ~ any($4::text[]))", [paths, globs]);
+  }
+
+  async pathsAt(repo: RepoId, lsn: Lsn): Promise<string[]> {
+    const rows = await this.pool.query<{ path: string }>(`${LATEST_FILES("true")} select path from latest where op <> 'delete' and blob_hash is not null order by path`, [repo, lsn]);
+    return rows.rows.map((r) => r.path);
+  }
+
+  /** The tree at `lsn`, only the paths `where` keeps (a condition on `path`, parameters from $3). */
+  private async tree(repo: RepoId, lsn: Lsn, where: string, params: unknown[]): Promise<Tree> {
     const rows = await this.pool.query<{ path: string; content: string }>(
-      `with changes as (
-         select path, lsn, op, blob_hash from changeset_files where repo = $1 and lsn <= $2
-         union all
-         select from_path as path, lsn, 'delete' as op, null as blob_hash
-         from changeset_files where repo = $1 and lsn <= $2 and from_path is not null
-       ),
-       latest as (select distinct on (path) path, op, blob_hash from changes order by path, lsn desc)
+      `${LATEST_FILES(where)}
        select l.path, convert_from(b.bytes, 'UTF8') as content
        from latest l join blobs b on b.hash = l.blob_hash
        where l.op <> 'delete' order by l.path`,
-      [repo, lsn],
+      [repo, lsn, ...params],
     );
     return new Map(rows.rows.map((r) => [r.path, r.content]));
   }
@@ -472,15 +501,8 @@ export class PgStore implements Store {
   }
 
   async heartbeat(repo: RepoId, intentId: string): Promise<void> {
-    // One statement: the intent's heartbeat, and its unexpired leases renewed by their own time to live.
-    await this.pool.query(
-      `with alive as (
-         update intents set heartbeat_at = $3::timestamptz where id = $1 and repo = $2 and status = 'open' returning id
-       )
-       update repo_leases set expires_at = greatest(expires_at, $3::timestamptz + ttl_seconds * interval '1 second')
-       where repo = $2 and status = 'held' and expires_at > $3::timestamptz and intent_id in (select id from alive)`,
-      [intentId, repo, new Date()],
-    );
+    // The intent only: leases are renewed by their holder asking again (acquireLease), never by a heartbeat anyone may send.
+    await this.pool.query("update intents set heartbeat_at = now() where id = $1 and repo = $2 and status = 'open'", [intentId, repo]);
   }
 
   async markStaleIntents(before: Date): Promise<Intent[]> {
@@ -570,13 +592,21 @@ export class PgStore implements Store {
 
   async acquireLease(req: LeaseRequest, now = new Date()): Promise<LeaseGrant> {
     return this.tx(async (db): Promise<LeaseGrant> => {
+      // The append's own lock: a grant waits for a commit in flight on this repository, whose lease
+      // check (under that lock) then saw every lease granted before it, and none granted during it.
+      await db.query("select pg_advisory_xact_lock(hashtext($1)::bigint)", [req.repo]);
       const known = await db.query("select 1 from repos where id = $1", [req.repo]);
       if ((known.rowCount ?? 0) === 0) throw unknownRepo(req.repo);
       if (req.intentId !== undefined) {
-        const intent = await db.query<{ status: string }>("select status from intents where id = $1 and repo = $2", [req.intentId, req.repo]);
-        const status = intent.rows[0]?.status;
-        if (status === undefined) throw new InvalidCommit(`unknown intent ${req.intentId}`);
-        if (status !== "open") throw new InvalidCommit(`intent ${req.intentId} is ${status}, not open`);
+        const intent = await db.query<{ status: string; developer: string; agent: string }>("select status, developer, agent from intents where id = $1 and repo = $2", [
+          req.intentId,
+          req.repo,
+        ]);
+        const row = intent.rows[0];
+        if (row === undefined) throw new InvalidCommit(`unknown intent ${req.intentId}`);
+        if (row.status !== "open") throw new InvalidCommit(`intent ${req.intentId} is ${row.status}, not open`);
+        const owner = { developer: row.developer, agent: row.agent };
+        if (!sameAuthor(owner, req.holder)) throw new InvalidCommit(notTheirIntent(req.intentId, owner, req.holder));
       }
       const expired = (
         await db.query<LeaseRow>(
@@ -605,7 +635,7 @@ export class PgStore implements Store {
         const heldRow = held.rows[0];
         if (heldRow === undefined) continue;
         const lease = leaseOf(heldRow);
-        if (!sameAuthor(lease.holder, req.holder)) return { granted: false, holder: lease, expired };
+        if (!holdsLease(lease, req.holder, req.intentId)) return { granted: false, holder: lease, expired };
         const renewed = await db.query<LeaseRow>(
           `update repo_leases set expires_at = $3, reason = $4, ttl_seconds = $5, intent_id = coalesce($6, intent_id)
            where repo = $1 and symbol = $2 and status = 'held' returning ${LEASE_COLUMNS}`,
@@ -617,10 +647,11 @@ export class PgStore implements Store {
     });
   }
 
-  async releaseLease(repo: RepoId, symbol: SymbolId, now = new Date()): Promise<Lease | undefined> {
+  async releaseLease(repo: RepoId, symbol: SymbolId, now = new Date(), holder?: Author): Promise<Lease | undefined> {
     const res = await this.pool.query<LeaseRow>(
-      `update repo_leases set status = 'released', ended_at = $3 where repo = $1 and symbol = $2 and status = 'held' returning ${LEASE_COLUMNS}`,
-      [repo, symbol, now],
+      `update repo_leases set status = 'released', ended_at = $3
+       where repo = $1 and symbol = $2 and status = 'held' and ($4::text is null or (developer = $4 and agent = $5)) returning ${LEASE_COLUMNS}`,
+      [repo, symbol, now, holder?.developer ?? null, holder?.agent ?? null],
     );
     const row = res.rows[0];
     return row === undefined ? undefined : leaseOf(row);
@@ -642,8 +673,12 @@ export class PgStore implements Store {
     return res.rows.map(leaseOf);
   }
 
-  async liveLeases(repo: RepoId, now = new Date()): Promise<Lease[]> {
-    const res = await this.pool.query<LeaseRow>(
+  liveLeases(repo: RepoId, now = new Date()): Promise<Lease[]> {
+    return this.leasesIn(this.pool, repo, now);
+  }
+
+  private async leasesIn(db: Queryable, repo: RepoId, now: Date): Promise<Lease[]> {
+    const res = await db.query<LeaseRow>(
       `select ${LEASE_COLUMNS} from repo_leases where repo = $1 and status = 'held' and expires_at > $2 order by symbol collate "C"`,
       [repo, now],
     );
@@ -657,6 +692,8 @@ export class PgStore implements Store {
       params.push(value);
       return `$${params.length}`;
     };
+    if (q.before !== undefined) where.push(`c.lsn < ${param(q.before)}`);
+    if (q.brainBefore !== undefined) where.push(`c.brain_version < ${param(q.brainBefore)}`);
     if (q.writes !== undefined) {
       where.push(`exists (select 1 from changeset_symbols s where s.repo = c.repo and s.lsn = c.lsn and s.symbol_id = ${param(q.writes)} and s.kind <> 'read')`);
     }
@@ -675,7 +712,11 @@ export class PgStore implements Store {
       `select c.lsn::int as lsn from changesets c where ${where.join(" and ")} order by c.lsn ${q.newestFirst ? "desc" : "asc"} limit ${param(q.limit)}`,
       params,
     );
-    return this.load(repo, res.rows.map((r) => r.lsn));
+    return this.load(
+      repo,
+      res.rows.map((r) => r.lsn),
+      q.contents === true,
+    );
   }
 
   async symbolStates(repo: RepoId, prefix: string, limit: number): Promise<SymbolState[]> {
@@ -970,8 +1011,8 @@ export class PgStore implements Store {
     return res.rows[0]?.head ?? 0;
   }
 
-  /** The entries at these LSNs, in the order given, with the intent each closed. */
-  private async load(repo: RepoId, lsns: Lsn[]): Promise<LoggedEntry[]> {
+  /** The entries at these LSNs, in the order given, with the intent each closed; file contents only when asked for. */
+  private async load(repo: RepoId, lsns: Lsn[], contents: boolean): Promise<LoggedEntry[]> {
     if (lsns.length === 0) return [];
     const heads = await this.pool.query<ChangesetRow>(
       `select repo, lsn::int as lsn, base_lsn::int as base_lsn, developer, agent, intent, repairs, checks,
@@ -979,7 +1020,7 @@ export class PgStore implements Store {
        from changesets where repo = $1 and lsn = any($2::bigint[])`,
       [repo, lsns],
     );
-    const byLsn = new Map((await this.hydrate(this.pool, repo, heads.rows)).map((e) => [e.lsn, e]));
+    const byLsn = new Map((await this.hydrate(this.pool, repo, heads.rows, contents)).map((e) => [e.lsn, e]));
     return lsns.flatMap((lsn) => {
       const entry = byLsn.get(lsn);
       return entry === undefined ? [] : [entry];
@@ -996,15 +1037,18 @@ export class PgStore implements Store {
     return this.hydrate(db, repo, heads.rows);
   }
 
-  /** Changesets from their rows: files (with contents) and symbol sets read in two queries. */
-  private async hydrate(db: Queryable, repo: RepoId, rows: ChangesetRow[]): Promise<LoggedEntry[]> {
+  /** Changesets from their rows: files (with contents, unless `contents` is false) and symbol sets read in two queries. */
+  private async hydrate(db: Queryable, repo: RepoId, rows: ChangesetRow[], contents = true): Promise<LoggedEntry[]> {
     if (rows.length === 0) return [];
     const heads = { rows };
     const lsns = heads.rows.map((r) => r.lsn);
     const files = await db.query<FileRow>(
-      `select f.lsn::int as lsn, f.path, f.op, f.blob_hash, f.from_path, convert_from(b.bytes, 'UTF8') as content
-       from changeset_files f left join blobs b on b.hash = f.blob_hash
-       where f.repo = $1 and f.lsn = any($2::bigint[]) order by f.lsn, f.path`,
+      contents
+        ? `select f.lsn::int as lsn, f.path, f.op, f.blob_hash, f.from_path, convert_from(b.bytes, 'UTF8') as content
+           from changeset_files f left join blobs b on b.hash = f.blob_hash
+           where f.repo = $1 and f.lsn = any($2::bigint[]) order by f.lsn, f.path`
+        : `select f.lsn::int as lsn, f.path, f.op, f.blob_hash, f.from_path, null::text as content
+           from changeset_files f where f.repo = $1 and f.lsn = any($2::bigint[]) order by f.lsn, f.path`,
       [repo, lsns],
     );
     const symbols = await db.query<SymbolRow>(

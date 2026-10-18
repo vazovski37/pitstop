@@ -43,6 +43,13 @@ export interface Store {
    * as a full import at its first entry.
    */
   treeAt(repo: RepoId, lsn: Lsn): Promise<Tree>;
+  /**
+   * The files of `treeAt(repo, lsn)` that are among `paths` or match one of `globs` (adr-rules.ts),
+   * and only those: what the brain reads instead of the whole tree.
+   */
+  filesAt(repo: RepoId, lsn: Lsn, which: { paths?: string[]; globs?: string[] }): Promise<Tree>;
+  /** The paths of `treeAt(repo, lsn)`, without their contents. */
+  pathsAt(repo: RepoId, lsn: Lsn): Promise<string[]>;
   /** Creates the repository, or returns it when it exists. */
   createRepo(id: RepoId): Promise<{ repo: Repo; created: boolean }>;
   getRepo(id: RepoId): Promise<Repo | undefined>;
@@ -53,8 +60,9 @@ export interface Store {
   openIntents(repo: RepoId): Promise<Intent[]>;
   getIntent(repo: RepoId, id: string): Promise<Intent | undefined>;
   /**
-   * Refreshes an open intent's heartbeat, and renews its held leases by their time to live
-   * (design doc 9.4: a lease lives while its intent does). Unknown or closed intents are ignored.
+   * Refreshes an open intent's heartbeat (9.3). Unknown or closed intents are ignored. It renews
+   * no lease: any reader of the stream may send a heartbeat naming any intent, so a lease is
+   * renewed only by its holder asking again (`acquireLease`), which the daemon does on a timer.
    */
   heartbeat(repo: RepoId, intentId: string): Promise<void>;
   /** Marks every open intent whose last heartbeat is before `before` stale (9.3), in every repository; returns them. */
@@ -76,14 +84,15 @@ export interface Store {
   /** The ADRs that were accepted, and not yet superseded, at brain version `version` (9.2). */
   adrsInForce(repo: RepoId, version: number): Promise<Adr[]>;
   /**
-   * Takes a lease atomically: granted when nobody else holds an unexpired one on the symbol (the
-   * same holder renews it), refused with the holder otherwise. Held leases past their expiry on
-   * the symbol are expired first. An unknown repository, or an intent that is not open, is an
-   * `InvalidCommit`.
+   * Takes a lease atomically: granted when nobody else holds an unexpired one on the symbol (its
+   * holder renews it: see `holdsLease`), refused with the holder otherwise. Held leases past their
+   * expiry on the symbol are expired first. In Postgres it waits for an append in flight on the
+   * repository, so a commit's lease check and a grant never interleave. An unknown repository,
+   * or an intent that is not open or not the holder's, is an `InvalidCommit`.
    */
   acquireLease(request: LeaseRequest, now?: Date): Promise<LeaseGrant>;
-  /** Releases the held lease on the symbol, if there is one. */
-  releaseLease(repo: RepoId, symbol: SymbolId, now?: Date): Promise<Lease | undefined>;
+  /** Releases the held lease on the symbol, if there is one (and, given `holder`, only if it is theirs). */
+  releaseLease(repo: RepoId, symbol: SymbolId, now?: Date, holder?: Author): Promise<Lease | undefined>;
   /** Releases every lease the intent holds (it committed, or went stale). */
   releaseIntentLeases(repo: RepoId, intentId: string, now?: Date): Promise<Lease[]>;
   /** Expires every held lease past its expiry, in every repository; returns them. */
@@ -284,6 +293,18 @@ export const LEASE_TTL = { default: 300, min: 60, max: 1_800 } as const;
 
 export const sameAuthor = (a: Author, b: Author): boolean => a.developer === b.developer && a.agent === b.agent;
 
+/**
+ * Whether `author`, working on `intentId`, is the lease's holder. A lease tied to an intent is
+ * held by that intent: two checkouts of one person share an author (developer and agent name),
+ * and only the one whose task took the lease holds it. A lease without an intent: the author.
+ */
+export const holdsLease = (lease: Pick<Lease, "holder" | "intentId">, author: Author, intentId: string | undefined): boolean =>
+  sameAuthor(lease.holder, author) && (lease.intentId === undefined || lease.intentId === intentId);
+
+/** Why a lease may not be tied to someone else's intent. */
+export const notTheirIntent = (intentId: string, owner: Author, asker: Author): string =>
+  `intent ${intentId} is ${owner.agent}'s (${owner.developer}), not ${asker.agent}'s (${asker.developer}): a lease is tied to its holder's own intent`;
+
 /** Filters for `Store.findEntries`: all given ones must hold. */
 export interface LogQuery {
   /** Entries that wrote this symbol (write or signature write). */
@@ -296,8 +317,14 @@ export interface LogQuery {
   paths?: string[];
   /** Only `lsn > since`. */
   since?: Lsn;
+  /** Only `lsn < before`: the next page of a newest-first answer. */
+  before?: Lsn;
+  /** Only entries validated against a brain version below this one (the re-check queue, 9.2). */
+  brainBefore?: number;
   newestFirst?: boolean;
   limit: number;
+  /** Load the files' contents too; the query API never needs them, so by default they are left out. */
+  contents?: boolean;
 }
 /** A log entry with the intent it closed, when it named one. */
 export type LoggedEntry = Changeset & { intentId?: string };
@@ -322,7 +349,15 @@ export interface Decision {
   /** The repository's brain version the commit was validated against (9.2); default the current one. */
   brainVersion?: number;
 }
-export type Decide = (gap: Changeset[], head: Lsn) => Decision | Promise<Decision>;
+/**
+ * What a decision may read while the append holds the repository's lock, through the append's own
+ * connection (a second pool connection there could wait on a pool the lock's waiters exhausted).
+ */
+export interface AppendReads {
+  /** The repository's held, unexpired leases: exact, since a grant waits for the lock (9.4). */
+  leases(now: Date): Promise<Lease[]>;
+}
+export type Decide = (gap: Changeset[], head: Lsn, reads: AppendReads) => Decision | Promise<Decision>;
 
 /** How far behind head a commit may be before the daemon must rebase first. */
 export const GAP_LIMIT = 500;
@@ -407,7 +442,7 @@ export class MemoryStore implements Store {
   private readonly adrs = new Map<RepoId, Adr[]>();
   /** Each repository's brain version moves, in order. */
   private readonly brainLog = new Map<RepoId, { version: number; adr: number; status: "accepted" | "superseded" }[]>();
-  private readonly leases: { lease: Lease; ttlSeconds: number }[] = [];
+  private readonly leases: { lease: Lease }[] = [];
 
   async append(req: CommitRequest, decide?: Decide): Promise<Changeset> {
     const seen = this.byKey.get(req.idempotencyKey);
@@ -423,7 +458,7 @@ export class MemoryStore implements Store {
     const intent = req.intentId === undefined ? undefined : this.intents.get(req.intentId);
     if (req.intentId !== undefined && (intent === undefined || intent.repo !== repo)) throw new InvalidCommit(`unknown intent ${req.intentId}`);
     const gap = log.filter((e) => e.lsn > gapStart(req)).slice(0, GAP_LIMIT + 1);
-    const decision = decide ? await decide(gap, lsn - 1) : {};
+    const decision = decide ? await decide(gap, lsn - 1, { leases: (now) => this.liveLeases(repo, now) }) : {};
     const changeset: Changeset = {
       repo,
       lsn,
@@ -442,8 +477,10 @@ export class MemoryStore implements Store {
     log.push(changeset);
     this.byKey.set(req.idempotencyKey, changeset);
     if (req.intentId !== undefined) this.entryIntents.set(`${repo}\n${lsn}`, req.intentId);
-    // A stale intent whose agent came back and committed is closed too.
-    if (intent?.status === "open" || intent?.status === "stale") this.intents.set(intent.id, { ...intent, status: "committed" });
+    // A stale intent whose agent came back and committed is closed too; only by its own author.
+    if ((intent?.status === "open" || intent?.status === "stale") && sameAuthor(intent.author, req.author)) {
+      this.intents.set(intent.id, { ...intent, status: "committed" });
+    }
     return changeset;
   }
 
@@ -459,6 +496,18 @@ export class MemoryStore implements Store {
     const tree: Tree = new Map();
     for (const entry of this.logs.get(repo) ?? []) if (entry.lsn <= lsn) applyFiles(tree, entry.files);
     return tree;
+  }
+
+  async filesAt(repo: RepoId, lsn: Lsn, which: { paths?: string[]; globs?: string[] }): Promise<Tree> {
+    const paths = new Set(which.paths ?? []);
+    const globs = (which.globs ?? []).map(globToRegExp);
+    const out: Tree = new Map();
+    for (const [path, content] of await this.treeAt(repo, lsn)) if (paths.has(path) || globs.some((g) => g.test(path))) out.set(path, content);
+    return out;
+  }
+
+  async pathsAt(repo: RepoId, lsn: Lsn): Promise<string[]> {
+    return [...(await this.treeAt(repo, lsn)).keys()].sort();
   }
 
   async createRepo(id: RepoId): Promise<{ repo: Repo; created: boolean }> {
@@ -509,14 +558,7 @@ export class MemoryStore implements Store {
   async heartbeat(repo: RepoId, intentId: string): Promise<void> {
     const intent = this.intents.get(intentId);
     if (intent?.status !== "open" || intent.repo !== repo) return;
-    const now = Date.now();
-    this.intents.set(intentId, { ...intent, heartbeatAt: new Date(now).toISOString() });
-    for (const held of this.leases) {
-      const l = held.lease;
-      if (l.repo !== repo || l.intentId !== intentId || l.status !== "held" || Date.parse(l.expiresAt) <= now) continue;
-      const renewed = now + held.ttlSeconds * 1000;
-      if (renewed > Date.parse(l.expiresAt)) held.lease = { ...l, expiresAt: new Date(renewed).toISOString() };
-    }
+    this.intents.set(intentId, { ...intent, heartbeatAt: new Date().toISOString() });
   }
 
   async markStaleIntents(before: Date): Promise<Intent[]> {
@@ -564,7 +606,8 @@ export class MemoryStore implements Store {
     const adr = list[at];
     if (adr === undefined) return { ok: false, error: "not_found" };
     if (adr.status !== ADR_TRANSITIONS[verdict]) return { ok: false, error: "invalid_transition", adr };
-    let version = await this.brainVersion(repo);
+    // Read and written with no await in between, so two concurrent accepts cannot both pass the check.
+    let version = this.brainLog.get(repo)?.at(-1)?.version ?? 0;
     if (movesBrain(verdict)) {
       version += 1;
       this.brainLog.set(repo, [...(this.brainLog.get(repo) ?? []), { version, adr: number, status: verdict as "accepted" | "superseded" }]);
@@ -590,6 +633,7 @@ export class MemoryStore implements Store {
       const intent = this.intents.get(req.intentId);
       if (intent === undefined || intent.repo !== req.repo) throw new InvalidCommit(`unknown intent ${req.intentId}`);
       if (intent.status !== "open") throw new InvalidCommit(`intent ${req.intentId} is ${intent.status}, not open`);
+      if (!sameAuthor(intent.author, req.holder)) throw new InvalidCommit(notTheirIntent(req.intentId, intent.author, req.holder));
     }
     const expired = this.endLeases(
       (l) => l.repo === req.repo && l.symbol === req.symbol && l.status === "held" && Date.parse(l.expiresAt) <= now.getTime(),
@@ -598,10 +642,9 @@ export class MemoryStore implements Store {
     const expiresAt = new Date(now.getTime() + req.ttlSeconds * 1000).toISOString();
     const held = this.leases.find((h) => h.lease.repo === req.repo && h.lease.symbol === req.symbol && h.lease.status === "held");
     if (held !== undefined) {
-      if (!sameAuthor(held.lease.holder, req.holder)) return { granted: false, holder: held.lease, expired };
+      if (!holdsLease(held.lease, req.holder, req.intentId)) return { granted: false, holder: held.lease, expired };
       const intentId = req.intentId ?? held.lease.intentId;
       held.lease = { ...held.lease, reason: req.reason, expiresAt, ...(intentId === undefined ? {} : { intentId }) };
-      held.ttlSeconds = req.ttlSeconds;
       return { granted: true, lease: held.lease, renewed: true, expired };
     }
     const lease: Lease = {
@@ -614,12 +657,13 @@ export class MemoryStore implements Store {
       expiresAt,
       createdAt: now.toISOString(),
     };
-    this.leases.push({ lease, ttlSeconds: req.ttlSeconds });
+    this.leases.push({ lease });
     return { granted: true, lease, renewed: false, expired };
   }
 
-  async releaseLease(repo: RepoId, symbol: SymbolId): Promise<Lease | undefined> {
-    return this.endLeases((l) => l.repo === repo && l.symbol === symbol && l.status === "held", "released")[0];
+  async releaseLease(repo: RepoId, symbol: SymbolId, _now?: Date, holder?: Author): Promise<Lease | undefined> {
+    const theirs = (l: Lease) => holder === undefined || sameAuthor(l.holder, holder);
+    return this.endLeases((l) => l.repo === repo && l.symbol === symbol && l.status === "held" && theirs(l), "released")[0];
   }
 
   async releaseIntentLeases(repo: RepoId, intentId: string): Promise<Lease[]> {
@@ -654,12 +698,16 @@ export class MemoryStore implements Store {
     const found = (this.logs.get(repo) ?? []).filter(
       (e) =>
         e.lsn > (q.since ?? 0) &&
+        (q.before === undefined || e.lsn < q.before) &&
+        (q.brainBefore === undefined || e.brainVersion < q.brainBefore) &&
         (q.writes === undefined || e.writeSet.includes(q.writes) || e.sigWriteSet.includes(q.writes)) &&
         (q.reads === undefined || e.readSet.includes(q.reads)) &&
         (touches === undefined || e.files.some((f) => fileHit(f, (p) => touches.test(p)))) &&
         (paths === undefined || e.files.some((f) => fileHit(f, (p) => paths.has(p)))),
     );
-    return (q.newestFirst ? found.reverse() : found).slice(0, q.limit).map((e) => this.logged(e));
+    const page = (q.newestFirst ? found.reverse() : found).slice(0, q.limit).map((e) => this.logged(e));
+    // As in PgStore: contents only when asked for.
+    return q.contents === true ? page : page.map((e) => ({ ...e, files: e.files.map(({ content: _content, ...f }) => f) }));
   }
 
   async symbolStates(repo: RepoId, prefix: string, limit: number): Promise<SymbolState[]> {
