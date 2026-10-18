@@ -11,7 +11,7 @@
     <link rel="stylesheet" href="style.css" />
   </head>
   <body>
-    <a class="skip-link" href="#content">Skip to content</a>
+    <a id="skip-link" class="skip-link" href="#content">Skip to content</a>
     <header class="topbar">
       <a class="brand" href="#/" aria-label="Pitstop home">
         <svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true">
@@ -36,16 +36,17 @@
       <span id="who" class="who"></span>
     </header>
 
-    <div id="content">
+    <div id="content" tabindex="-1">
     <section id="view-home" class="view" hidden>
       <div id="home-out" class="landing" hidden>
         <section class="hero">
           <div class="hero-copy">
-            <p class="eyebrow"><span class="eyebrow-dot" aria-hidden="true"></span>Version control for teams of AI agents</p>
+            <p class="eyebrow"><span class="eyebrow-dot" aria-hidden="true"></span>Built on jj · works with Claude Code</p>
             <h1 class="display">Pitstop is version control for teams whose code is written by AI agents.</h1>
             <p class="lede">
               Git merges text, so two agents can each make a clean change and still break each other: one rewrites a
               function the other was relying on. The merge is green, and nobody notices until the build or a customer does.
+              Pitstop catches it before it lands, and a teammate decides whether it goes in.
             </p>
             <div class="hero-actions">
               <a id="sign-in-hero" class="btn btn-primary btn-lg" href="/auth/github">
@@ -70,19 +71,19 @@
               </defs>
 
               <text x="20" y="18" class="d-cap">Agents · each task is a transaction</text>
-              <g class="d-agent" style="--h: 205">
+              <g class="d-agent" style="--h: 185">
                 <rect x="20" y="30" width="150" height="46" rx="10" />
                 <circle cx="38" cy="53" r="5" class="d-agent-dot" />
                 <text x="52" y="50" class="d-strong">agent-a</text>
                 <text x="52" y="66" class="d-sub">intent → commit</text>
               </g>
-              <g class="d-agent" style="--h: 150">
+              <g class="d-agent" style="--h: 310">
                 <rect x="190" y="30" width="150" height="46" rx="10" />
                 <circle cx="208" cy="53" r="5" class="d-agent-dot" />
                 <text x="222" y="50" class="d-strong">agent-b</text>
                 <text x="222" y="66" class="d-sub">intent → commit</text>
               </g>
-              <g class="d-agent" style="--h: 30">
+              <g class="d-agent" style="--h: 95">
                 <rect x="430" y="30" width="150" height="46" rx="10" />
                 <circle cx="448" cy="53" r="5" class="d-agent-dot" />
                 <text x="462" y="50" class="d-strong">agent-c</text>
@@ -329,7 +330,6 @@
           </p>
         </div>
         <p id="conflicts-msg" class="msg" role="status"></p>
-        <ul id="conflicts" class="conflict-list"></ul>
         <div id="no-conflicts" class="empty-state" hidden>
           <span class="empty-icon empty-icon-ok" aria-hidden="true">
             <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9" /><path d="m8 12.5 2.8 2.8L16.5 9.5" /></svg>
@@ -337,6 +337,7 @@
           <h2>Nothing is waiting</h2>
           <p>When an agent's commit relies on code another change just altered, it stops here instead of merging silently.</p>
         </div>
+        <ul id="conflicts" class="conflict-list"></ul>
       </section>
 
       <section id="pane-members" class="pane" hidden>
@@ -361,11 +362,12 @@
               </div>
               <div class="field">
                 <label class="field-label" for="invite-role">Role</label>
-                <select id="invite-role" class="select">
-                  <option value="writer">Writer: commits through their agents</option>
-                  <option value="reader">Reader: watches the log</option>
-                  <option value="owner">Owner: also manages members</option>
+                <select id="invite-role" class="select" aria-describedby="invite-role-hint">
+                  <option value="writer">Writer</option>
+                  <option value="reader">Reader</option>
+                  <option value="owner">Owner</option>
                 </select>
+                <p id="invite-role-hint" class="field-hint">Writers commit through their agents; readers watch; owners also manage members.</p>
               </div>
               <button type="submit" class="btn btn-primary btn-block">Send invite</button>
             </form>
@@ -405,11 +407,14 @@
               <div id="prompt-box" class="codeblock" hidden>
                 <div class="codeblock-bar">
                   <span>Prompt for Claude Code</span>
-                  <button id="copy-prompt" type="button" class="btn btn-secondary btn-sm">Copy prompt</button>
+                  <span class="codeblock-actions">
+                    <button id="reveal-prompt" type="button" class="btn btn-ghost btn-sm reveal-token" hidden>Show token</button>
+                    <button id="copy-prompt" type="button" class="btn btn-secondary btn-sm">Copy prompt</button>
+                  </span>
                 </div>
                 <pre id="prompt"></pre>
               </div>
-              <p class="callout callout-warn">
+              <p id="prompt-warning" class="callout callout-warn" hidden>
                 The prompt carries a <strong>personal token</strong> made for you just now: keep it out of files you commit and
                 out of anything you share. Revoke it under <a href="#/account">Account</a> when that computer is gone.
               </p>
@@ -428,7 +433,10 @@
           <div class="codeblock">
             <div class="codeblock-bar">
               <span>Terminal</span>
-              <button id="copy-manual" type="button" class="btn btn-secondary btn-sm">Copy commands</button>
+              <span class="codeblock-actions">
+                <button id="reveal-manual" type="button" class="btn btn-ghost btn-sm reveal-token" hidden>Show token</button>
+                <button id="copy-manual" type="button" class="btn btn-secondary btn-sm">Copy commands</button>
+              </span>
             </div>
             <pre id="manual-cmds"></pre>
           </div>
@@ -484,7 +492,7 @@
 
     <div id="toasts" class="toasts" role="status" aria-live="polite"></div>
 
-    <dialog id="confirm-dialog" class="modal" aria-labelledby="confirm-title">
+    <dialog id="confirm-dialog" class="modal" aria-labelledby="confirm-title" aria-describedby="confirm-body">
       <form method="dialog">
         <h2 id="confirm-title" class="modal-title"></h2>
         <p id="confirm-body" class="modal-body"></p>
