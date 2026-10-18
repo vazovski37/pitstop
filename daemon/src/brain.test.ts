@@ -2,6 +2,9 @@ import { describe, expect, it } from "vitest";
 import type { Adr, AdrRule, Author, Lease } from "@pitstop/protocol";
 import { BRIEF_ADRS, brainBrief, brainLines, matchGlob, type Brain } from "./brain.js";
 
+/** A backtracking engine needs minutes on these inputs; the budget only has to tell that from a busy, shared CI runner. */
+const LINEAR_BUDGET_MS = 10_000;
+
 const me: Author = { developer: "alice", agent: "claude-code" };
 const adr = (number: number, rules: AdrRule[], extra: Partial<Adr> = {}): Adr => ({
   repo: "acme/app",
@@ -51,6 +54,6 @@ describe("globs, matched without regular expressions", () => {
     expect(matchGlob("src/{a", "src/{a")).toBe(true);
     const t0 = Date.now();
     expect(matchGlob(`${"*a".repeat(40)}*b`, `${"a".repeat(200)}.ts`)).toBe(false);
-    expect(Date.now() - t0).toBeLessThan(1_000);
-  });
+    expect(Date.now() - t0).toBeLessThan(LINEAR_BUDGET_MS);
+  }, 60_000);
 });

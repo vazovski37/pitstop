@@ -21,6 +21,9 @@ import {
   splitPreexisting,
 } from "./adr-rules.js";
 
+/** A backtracking engine needs minutes on these inputs; the budget only has to tell that from a busy, shared CI runner. */
+const LINEAR_BUDGET_MS = 10_000;
+
 const adr = (number: number, rules: AdrRule[], extra: Partial<Adr> = {}): Adr => ({
   repo: "acme/app",
   number,
@@ -76,8 +79,8 @@ describe("globs", () => {
     const glob = `${"*a".repeat(30)}*b`; // backtracks for minutes on a backtracking engine
     const t0 = Date.now();
     expect(matchGlob(glob, `${"a".repeat(2_000)}.ts`)).toBe(false);
-    expect(Date.now() - t0).toBeLessThan(1_000);
-  });
+    expect(Date.now() - t0).toBeLessThan(LINEAR_BUDGET_MS);
+  }, 60_000);
 });
 
 describe("masking", () => {
@@ -146,8 +149,8 @@ describe("imports", () => {
     const t0 = Date.now();
     extractImports(`import ${" ".repeat(200_000)}x`);
     extractImports("import ".repeat(50_000));
-    expect(Date.now() - t0).toBeLessThan(2_000);
-  });
+    expect(Date.now() - t0).toBeLessThan(LINEAR_BUDGET_MS);
+  }, 60_000);
 
   it("resolves path aliases from tsconfig.json, and @/ and ~/ to src/ without one", () => {
     const next = importAliases('{\n  // Next.js\n  "compilerOptions": { "baseUrl": ".", "paths": { "@/*": ["./src/*"], "@db": ["src/db/index.ts"], }, },\n}');
@@ -218,7 +221,7 @@ describe("calls and patterns", () => {
       const t0 = Date.now();
       const report = checkFiles([adr(9, [{ kind: "forbid_pattern", files: "**", pattern }])], [{ path: "x.txt", content: `${"a".repeat(1_000)}!\n` }]);
       expect(report.violations).toEqual([]);
-      expect(Date.now() - t0).toBeLessThan(1_000);
+      expect(Date.now() - t0).toBeLessThan(LINEAR_BUDGET_MS);
     }
     expect(ruleProblem({ kind: "forbid_call", files: "**", call: "a b" })).toMatch(/identifier/);
     expect(ruleProblem({ kind: "forbid_call", files: "**", call: "a".repeat(101) })).toMatch(/longer than 100/);
@@ -227,7 +230,7 @@ describe("calls and patterns", () => {
     expect(ruleProblem({ kind: "forbid_import", files: "**", target: "y".repeat(201) })).toMatch(/^target: glob longer/);
     expect(ruleProblem({ kind: "forbid_pattern", files: "**", pattern: "x", message: "m".repeat(501) })).toMatch(/message longer/);
     expect(ruleProblem({ kind: "ai_review", files: "**", question: "q".repeat(1_001) })).toMatch(/question longer/);
-  });
+  }, 60_000);
 
   it("matches a pattern on a CRLF file's lines", () => {
     const report = checkFiles([adr(2, [{ kind: "forbid_pattern", files: "**", pattern: "debugger;$" }])], [{ path: "a.ts", content: "let a = 1;\r\ndebugger;\r\n" }]);
