@@ -10,6 +10,7 @@ import { GitHubOAuth } from "./auth.js";
 import { GitHubApi } from "./github.js";
 import { GroqClient } from "./groq.js";
 import { modelRepairer, parseRepairMode, type Repairer } from "./repair.js";
+import { modelReviewer } from "./review.js";
 import { MemoryStore, type Store } from "./store.js";
 import { parseValidationMode } from "./validate.js";
 
@@ -47,17 +48,20 @@ if (token === undefined) console.log("pitstop server: PITSTOP_TOKEN is not set, 
 const validation = parseValidationMode(process.env.PITSTOP_VALIDATE);
 const check = process.env.PITSTOP_CHECK === "always" ? "always" : "off";
 const repair = parseRepairMode(process.env.PITSTOP_REPAIR);
+// One Groq client when a key is set: AI repair (PITSTOP_REPAIR=groq) and the brain's advisory ai_review rules.
+const groqKey = process.env.GROQ_API_KEY || undefined;
+const groq = groqKey === undefined ? undefined : new GroqClient({ apiKey: groqKey, model: process.env.GROQ_MODEL || undefined });
 let repairer: Repairer | undefined;
 if (repair === "groq") {
-  const apiKey = process.env.GROQ_API_KEY;
-  if (!apiKey) {
+  if (groq === undefined) {
     console.error("PITSTOP_REPAIR=groq needs GROQ_API_KEY (SETUP.md, \"AI repair\")");
     process.exit(1);
   }
-  const client = new GroqClient({ apiKey, model: process.env.GROQ_MODEL || undefined });
-  repairer = modelRepairer(client);
-  console.log(`pitstop server: AI repair through Groq, model ${client.model}`);
+  repairer = modelRepairer(groq);
+  console.log(`pitstop server: AI repair through Groq, model ${groq.model}`);
 }
+const reviewer = groq === undefined ? undefined : modelReviewer(groq);
+console.log(`pitstop server: ADR ai_review rules ${reviewer === undefined ? "noted, not run (no GROQ_API_KEY)" : `through Groq, model ${groq?.model}`}`);
 console.log(
   `pitstop server: validation ${validation} (PITSTOP_VALIDATE), type-check gate ${check} (PITSTOP_CHECK), repair ${repair} (PITSTOP_REPAIR)`,
 );
@@ -105,6 +109,7 @@ const app = await buildApp({
   check,
   repair,
   repairer,
+  reviewer,
   github,
   webDir: web,
   logger: true,

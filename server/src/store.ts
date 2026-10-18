@@ -280,7 +280,7 @@ export type LeaseGrant =
   | { granted: true; lease: Lease; /** The holder already had it. */ renewed: boolean; /** Held leases on the symbol that had run out. */ expired: Lease[] }
   | { granted: false; /** The live lease someone else holds. */ holder: Lease; expired: Lease[] };
 /** Seconds a lease lives without a heartbeat. */
-export const LEASE_TTL = { default: 300, min: 30, max: 1_800 } as const;
+export const LEASE_TTL = { default: 300, min: 60, max: 1_800 } as const;
 
 export const sameAuthor = (a: Author, b: Author): boolean => a.developer === b.developer && a.agent === b.agent;
 
