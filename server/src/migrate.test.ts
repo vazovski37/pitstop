@@ -16,16 +16,17 @@ describe.skipIf(!url)("migrations against a real Postgres", () => {
     expect(second).toEqual([]);
   });
 
-  it("creates the log, catalog and pgvector", async () => {
+  it("creates the log, the catalog and the brain; no vectors since 008", async () => {
     const tables = await pool.query<{ table_name: string }>(
       "select table_name from information_schema.tables where table_schema = 'public'",
     );
     const names = tables.rows.map((r) => r.table_name);
-    for (const t of ["changesets", "changeset_symbols", "symbols", "intents", "leases", "adrs", "symbol_embeddings"]) {
+    for (const t of ["changesets", "changeset_symbols", "symbols", "intents", "leases", "adrs", "repo_adrs", "repo_brain_versions", "repo_leases"]) {
       expect(names).toContain(t);
     }
+    expect(names).not.toContain("symbol_embeddings");
     const ext = await pool.query("select 1 from pg_extension where extname = 'vector'");
-    expect(ext.rowCount).toBe(1);
+    expect(ext.rowCount).toBe(0);
   });
 
   it("concurrent migrations do not conflict", async () => {
