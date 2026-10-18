@@ -21,6 +21,8 @@ export interface Applier {
   apply(changeset: Changeset): Promise<ApplyResult>;
   /** The agent's unfinished work in `@`, as the file changes a commit request carries. */
   diffAgainstMain(): Promise<FileChange[]>;
+  /** The paths `diffAgainstMain` would name, without reading any file's content (presence wants only these). */
+  changedPaths?(): Promise<string[]>;
   /** Whether `@` holds any change against its parent. */
   hasChanges(): Promise<boolean>;
   /** Every tracked file at `main` or at `@`: posix path relative to the worktree -> text. */
@@ -238,6 +240,13 @@ export class JjWorktree implements Applier {
       else files.push({ path, op: status.startsWith("A") ? "add" : "modify", ...(await this.contentOf(at, path)) });
     }
     return files;
+  }
+
+  async changedPaths(): Promise<string[]> {
+    const at = await this.workingCopyCommit();
+    // -M as in diffAgainstMain, so a rename names its new path only.
+    const out = await this.git(["diff", "--name-only", "-M", "-z", `refs/heads/${this.bookmark}`, at]);
+    return out.split("\0").filter((path) => path !== "" && path !== ".pitstop" && !path.startsWith(".pitstop/"));
   }
 
   private async contentOf(commit: string, path: string): Promise<{ content: string; blob: string }> {

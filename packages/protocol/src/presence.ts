@@ -56,6 +56,8 @@ export type PresenceDoc = Record<string, PresenceEntry>;
 
 const WALL_DIGITS = 15;
 const COUNTER_DIGITS = 6;
+/** The largest counter a stamp holds (COUNTER_DIGITS digits); past it the clock carries into the next millisecond. */
+const COUNTER_MAX = 999_999;
 
 export const stampOf = (wall: number, counter: number, replica: string): PresenceStamp =>
   `${String(Math.max(0, Math.trunc(wall))).padStart(WALL_DIGITS, "0")}.${String(counter).padStart(COUNTER_DIGITS, "0")}.${replica}`;
@@ -69,7 +71,8 @@ export function parseStamp(stamp: PresenceStamp): { wall: number; counter: numbe
 /**
  * A hybrid logical clock (Kulkarni et al.): physical time when it moves forward, a counter when
  * it does not, and it never goes backwards even if the wall clock does or a peer's clock runs
- * ahead (`observe`). Stamps from one clock are strictly increasing.
+ * ahead (`observe`). Stamps from one clock are strictly increasing, and always fit
+ * `PresenceStamp`: a counter past six digits carries into the next millisecond.
  */
 export class HybridClock {
   private wall = 0;
@@ -89,6 +92,7 @@ export class HybridClock {
     } else {
       this.counter += 1;
     }
+    this.carry();
     return stampOf(this.wall, this.counter, this.replica);
   }
 
@@ -102,6 +106,15 @@ export class HybridClock {
     else if (top === seen.wall) this.counter = seen.counter + 1;
     else this.counter = 0;
     this.wall = top;
+    this.carry();
+  }
+
+  /** A counter past its digits moves the wall on by a millisecond, as the server's `nextStamp` does: order is kept. */
+  private carry(): void {
+    if (this.counter > COUNTER_MAX) {
+      this.wall += 1;
+      this.counter = 0;
+    }
   }
 }
 

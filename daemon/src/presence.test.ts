@@ -1,10 +1,10 @@
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, onTestFailed } from "vitest";
-import { parseStamp, stampOf, type Author, type PresenceEntry } from "@pitstop/protocol";
+import { applyPresence, parseStamp, stampOf, type Author, type ClientMessage, type PresenceDoc, type PresenceEntry } from "@pitstop/protocol";
 import { Daemon, type SafePointResult } from "./daemon.js";
 import { startFakeServer, type FakeServer } from "./fake-server.js";
-import { replicaId, type PresenceView } from "./presence.js";
+import { Presence, replicaId, type PresenceView } from "./presence.js";
 import { STATE_DIR, writeState } from "./state.js";
 import { FakeApplier, fixtureCommitFiles, fixtureMessages, removeDir, tempDir, waitFor } from "./test-support.js";
 
@@ -121,6 +121,7 @@ describe("the daemon's presence", () => {
 
     applier.files = [{ path: PROFILE, op: "modify", content: "x" }];
     await safePoint();
+    await waitFor(() => last()?.files.includes(PROFILE) === true); // published in the background
     expect(last()).toMatchObject({ state: "working", intentId: "int_01", files: [PROFILE] });
 
     applier.files = fixtureCommitFiles();
@@ -131,6 +132,7 @@ describe("the daemon's presence", () => {
 
     applier.files = [];
     await safePoint();
+    await waitFor(() => last()?.state === "idle");
     expect(last()).toMatchObject({ state: "idle", files: [] });
 
     await daemon?.close();
@@ -209,7 +211,9 @@ describe("the daemon's presence", () => {
     const ahead = stampOf(Date.now() + 30_000, 4, "w_other");
     server.putPresence({ ...other(0), stamp: ahead });
     await waitFor(async () => (await view()).entries.some((e) => e.replica === "w_other"));
+    applier.files = [{ path: PROFILE, op: "modify", content: "x" }];
     await safePoint();
+    await waitFor(() => last()?.files.includes(PROFILE) === true);
     expect((last()?.stamp ?? "") > ahead).toBe(true);
 
     // A tombstone for this worktree, newer than its last write (a server closing an old socket of ours, late).
@@ -217,8 +221,112 @@ describe("the daemon's presence", () => {
     const tombstone: PresenceEntry = { ...(last() as PresenceEntry), state: "gone", files: [], stamp: stampOf(Date.now() + 40_000, 0, id) };
     server.putPresence(tombstone);
     await waitFor(() => sent().length > before);
-    expect(last()?.state).toBe("idle");
+    expect(last()).toMatchObject({ state: "working", files: [PROFILE] });
     expect((last()?.stamp ?? "") > tombstone.stamp).toBe(true);
-    expect(server.presence()[id]?.state).toBe("idle");
+    expect(server.presence()[id]?.state).toBe("working");
+
+    // A live entry under this worktree's id that it did not write (a copy of the checkout) is not answered.
+    const twin: PresenceEntry = { ...(last() as PresenceEntry), author: { developer: "dev", agent: "agent-copy" }, stamp: stampOf(Date.now() + 50_000, 0, id) };
+    const now = sent().length;
+    server.putPresence(twin);
+    await waitFor(() => log.some((l) => l.includes("another process writes this worktree's replica id")));
+    expect(sent().length).toBe(now);
+  });
+
+  it("sends nothing at a safe point that changed nothing, and answers the safe point without waiting for its diff", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const gated = new FakeApplier();
+    gated.diffAgainstMain = async () => {
+      await gate;
+      return gated.files;
+    };
+    release(); // connect's publish diffs freely
+    await start({ applier: gated });
+    const before = sent().length;
+    await safePoint();
+    await safePoint();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(sent().length).toBe(before); // idle, no files, written just now: nothing to say
+
+    let hold!: () => void;
+    const held = new Promise<void>((resolve) => (hold = resolve));
+    gated.diffAgainstMain = async () => {
+      await held;
+      return gated.files;
+    };
+    gated.files = [{ path: PROFILE, op: "modify", content: "x" }];
+    await safePoint(); // answered while presence's diff is still held
+    expect(sent().length).toBe(before);
+    hold();
+    await waitFor(() => last()?.files.includes(PROFILE) === true);
+    expect(sent().length).toBe(before + 1);
+  });
+
+  it("names a few of the shared files in a note and counts the rest", async () => {
+    const many = Array.from({ length: 8 }, (_, i) => `src/f${i}.ts`);
+    applier.files = many.map((path) => ({ path, op: "modify" as const, content: "x" }));
+    await start();
+    server.putPresence(other(0, { files: many }));
+    await waitFor(async () => (await view()).entries.some((e) => e.replica === "w_other"));
+    const notes = (await safePoint()).notes.filter((n) => n.includes("is also"));
+    expect(notes).toEqual([
+      "agent-a (lbala23) is also editing src/f0.ts, src/f1.ts, src/f2.ts, src/f3.ts, src/f4.ts and 3 more, for 'Show last-seen on the profile page' (call who for the full list)",
+    ]);
+  });
+});
+
+describe("two daemons sharing one replica id (a copied checkout)", () => {
+  let worktree: string;
+  beforeEach(async () => {
+    worktree = await tempDir();
+  });
+  afterEach(async () => removeDir(worktree));
+
+  it("do not answer each other's writes, and the one that stays writes itself back once the other leaves", async () => {
+    // A relay that merges and passes on what changed, as the server does.
+    let doc: PresenceDoc = {};
+    let relayed = 0;
+    const peers: Presence[] = [];
+    const send = (message: ClientMessage): boolean => {
+      if (message.type !== "presence") return true;
+      relayed += 1;
+      const before = doc;
+      doc = applyPresence(doc, message.entry);
+      if (doc !== before) setImmediate(() => peers.forEach((p) => p.receive("local/default", [message.entry])));
+      return true;
+    };
+    const logs: string[] = [];
+    const peer = (agent: string) =>
+      new Presence({
+        worktree,
+        repo: "local/default",
+        author: { developer: "dev", agent },
+        applier: new FakeApplier(),
+        send,
+        appliedLsn: () => 0,
+        intent: async () => undefined,
+        log: (line) => logs.push(line),
+      });
+    const [a, b] = [peer("agent-a"), peer("agent-b")];
+    peers.push(a, b);
+    await a.start();
+    await b.start();
+    expect(a.replica).toBe(b.replica);
+    const replica = a.replica as string;
+
+    await a.publish(true);
+    await b.publish(true);
+    a.keepalive();
+    b.keepalive();
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(relayed).toBeLessThanOrEqual(4); // their own writes only, no exchange of rewrites
+    expect(logs.some((l) => l.includes(`another process writes this worktree's replica id ${replica}`))).toBe(true);
+
+    a.leave();
+    await waitFor(() => doc[replica]?.author.agent === "agent-b" && doc[replica]?.state !== "gone");
+    const settled = relayed;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(relayed).toBe(settled);
   });
 });
