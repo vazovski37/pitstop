@@ -157,7 +157,7 @@ export async function startFakeServer(opts: FakeServerOptions = {}): Promise<Fak
   /** The brain and the query API; undefined when the request is not one of theirs. */
   const brainRoute = async (req: IncomingMessage, res: ServerResponse): Promise<boolean> => {
     const url = new URL(req.url ?? "/", "http://fake");
-    const m = /^\/repos\/([^/]+)\/([^/]+)\/(brain|leases|why|symbols\/([^/]+)\/(history|callers))$/.exec(url.pathname);
+    const m = /^\/repos\/([^/]+)\/([^/]+)\/(brain|leases|why|history|callers|symbols\/([^/]+)\/(history|callers))$/.exec(url.pathname);
     if (m === null) return false;
     const repo = `${m[1]}/${m[2]}`;
     const what = m[3] as string;
@@ -219,9 +219,15 @@ export async function startFakeServer(opts: FakeServerOptions = {}): Promise<Fak
       json(res, 200, { path, entries: touched.map((e) => ({ ...entryView(e), op: e.files.find((f) => f.path === path || f.fromPath === path)?.op ?? "modify" })) });
       return true;
     }
-    if (req.method === "GET" && m[4] !== undefined) {
-      const symbol = decodeURIComponent(m[4]);
-      if (m[5] === "history") {
+    // A symbol's history or callers: in the path, or (as the daemon asks) in `?symbol=`.
+    const symbolQuery = what === "history" || what === "callers";
+    if (req.method === "GET" && (m[4] !== undefined || symbolQuery)) {
+      const symbol = m[4] !== undefined ? decodeURIComponent(m[4]) : (url.searchParams.get("symbol") ?? "");
+      if (!symbol.includes("#")) {
+        json(res, 400, { error: "invalid_request", message: "expected ?symbol=path#name" });
+        return true;
+      }
+      if ((m[5] ?? what) === "history") {
         const wrote = newestFirst(entries.filter((e) => e.writeSet.includes(symbol) || e.sigWriteSet.includes(symbol)));
         const lease = leases.get(symbol);
         json(res, 200, {
